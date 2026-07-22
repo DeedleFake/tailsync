@@ -123,6 +123,47 @@ func TestWinsDeleteTie(t *testing.T) {
 	}
 }
 
+func TestWinsMtimeTie(t *testing.T) {
+	t0 := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	mt0 := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
+	mt1 := mt0.Add(time.Hour)
+	// Same UpdatedAt, hash, mode — only ModTime differs: later mtime wins.
+	older := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt0, UpdatedAt: t0}
+	newer := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt1, UpdatedAt: t0}
+	if !index.Wins(older, newer) {
+		t.Fatal("later ModTime should win at equal UpdatedAt")
+	}
+	if index.Wins(newer, older) {
+		t.Fatal("earlier ModTime must not win at equal UpdatedAt")
+	}
+	// Identical including ModTime: no win.
+	if index.Wins(newer, newer) {
+		t.Fatal("identical entries including ModTime should not win")
+	}
+	// Mtime-only difference still counts as non-identical for Wins equality.
+	sameClockDiffMT := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt0, UpdatedAt: t0}
+	other := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt1, UpdatedAt: t0}
+	if sameClockDiffMT.ModTime.Equal(other.ModTime) {
+		t.Fatal("test setup")
+	}
+	// Higher UpdatedAt still beats mtime order.
+	staleMtime := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt1, UpdatedAt: t0}
+	freshClock := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt0, UpdatedAt: t0.Add(time.Minute)}
+	if !index.Wins(staleMtime, freshClock) {
+		t.Fatal("higher UpdatedAt should win even with older ModTime")
+	}
+	// Mode is ordered before ModTime at equal UpdatedAt/hash.
+	// Higher mode + earlier mtime beats lower mode + later mtime.
+	hiMode := index.Entry{Path: "f", Hash: "abc", Mode: 0o755, ModTime: mt0, UpdatedAt: t0}
+	loModeLaterMT := index.Entry{Path: "f", Hash: "abc", Mode: 0o644, ModTime: mt1, UpdatedAt: t0}
+	if !index.Wins(loModeLaterMT, hiMode) {
+		t.Fatal("higher Mode should win before ModTime is considered")
+	}
+	if index.Wins(hiMode, loModeLaterMT) {
+		t.Fatal("lower Mode must not win even with later ModTime")
+	}
+}
+
 func TestSetIfWins(t *testing.T) {
 	idx := index.New()
 	t0 := time.Now()

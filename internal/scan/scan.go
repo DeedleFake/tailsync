@@ -188,7 +188,13 @@ func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*R
 			return fmt.Errorf("stat %s: %w", abs, err)
 		}
 
-		// Fast path: reuse hash when size and mtime match live index entry.
+		// Fast path: reuse hash when size and mtime match a live index entry.
+		// Intentional: mtime-only (touch) changes miss this path and rehash.
+		// Size alone is not enough — same-size content rewrites always bump
+		// mtime, and skipping the hash there would permanently miss the edit.
+		// Mode-only chmod preserves mtime on common OS filesystems, so those
+		// still hit the fast path; pure metadata after a rehash reuses hash
+		// below when size is unchanged.
 		hash := ""
 		prev, hasPrev := idx.Get(rel)
 		if !opts.forceRehash() && hasPrev && !prev.Deleted &&
@@ -232,11 +238,11 @@ func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*R
 			changes = append(changes, Change{Kind: Added, Path: path, Entry: entry})
 			continue
 		}
-		// Content or metadata (mode) change.
-		if prev.Hash != de.Hash || prev.Size != de.Size || prev.Mode != de.Mode {
+		// Content or metadata (mode / mtime) change.
+		if prev.Hash != de.Hash || prev.Size != de.Size || prev.Mode != de.Mode || !prev.ModTime.Equal(de.ModTime) {
 			entry := de
 			entry.UpdatedAt = stampUpdatedAt(now, de.ModTime, prev.UpdatedAt)
-			// Mode-only: keep existing hash/size, just refresh mode clock.
+			// Metadata-only (mode and/or mtime): keep existing hash/size.
 			if prev.Hash == de.Hash && prev.Size == de.Size {
 				entry.Hash = prev.Hash
 				entry.Size = prev.Size

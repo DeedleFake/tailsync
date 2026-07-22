@@ -805,9 +805,16 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 	}
 
 	if hasLocal && !local.Deleted && local.Hash == remote.Hash {
-		// Same content hash — adopt remote metadata only when its clock is newer or it wins a mode tie.
-		needMeta := remote.UpdatedAt.After(local.UpdatedAt) ||
-			(remote.UpdatedAt.Equal(local.UpdatedAt) && remote.Mode != local.Mode && index.Wins(local, re))
+		// Same content hash — adopt remote metadata (mode/mtime) when remote wins LWW
+		// and metadata actually differs. Higher UpdatedAt always qualifies; equal
+		// UpdatedAt uses Wins total order (mode, then ModTime).
+		// Zero remote ModTime is ignored for "differs" (keep local/disk mtime).
+		// Same-second mtimes are treated as equal so coarse FS truncation after
+		// Chtimes does not re-adopt every sync.
+		mtimeDiffers := !remote.ModTime.IsZero() && mtimesDiffer(remote.ModTime, local.ModTime)
+		metaDiffers := remote.Mode != local.Mode || mtimeDiffers ||
+			remote.UpdatedAt.After(local.UpdatedAt)
+		needMeta := metaDiffers && index.Wins(local, re)
 		if !needMeta {
 			return false, nil
 		}
@@ -819,21 +826,51 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 		if mode == 0 {
 			mode = 0o644
 		}
-		// Apply mode (and mtime) on disk before index so scan does not flip-flop.
 		// If the file is missing, fall through to a content pull instead of committing metadata-only.
-		if err := os.Chmod(metaAbs, mode); err != nil {
+		if _, err := os.Stat(metaAbs); err != nil {
 			if !os.IsNotExist(err) {
-				return false, fmt.Errorf("chmod %s: %w", remote.Path, err)
+				return false, fmt.Errorf("stat %s: %w", remote.Path, err)
 			}
 			d.log.Debug("metadata adopt: local file missing, pulling content", "path", remote.Path)
 			// Fall through to content pull below.
 		} else {
+			// Transactional metadata adopt: on partial failure, restore prior mode/mtime
+			// so disk stays aligned with the index (avoids scan inventing a local LWW win).
+			prevMode := local.Mode
+			if prevMode == 0 {
+				prevMode = 0o644
+			}
+			prevMT := local.ModTime
+
 			if !remote.ModTime.IsZero() {
-				_ = os.Chtimes(metaAbs, remote.ModTime, remote.ModTime)
+				if err := os.Chtimes(metaAbs, remote.ModTime, remote.ModTime); err != nil {
+					return false, fmt.Errorf("chtimes %s: %w", remote.Path, err)
+				}
+			}
+			if err := os.Chmod(metaAbs, mode); err != nil {
+				// Best-effort rollback of mtime applied above.
+				if !remote.ModTime.IsZero() && !prevMT.IsZero() {
+					if rerr := os.Chtimes(metaAbs, prevMT, prevMT); rerr != nil {
+						d.log.Warn("rollback mtime after chmod failure", "path", remote.Path, "err", rerr)
+					}
+				}
+				if rerr := os.Chmod(metaAbs, prevMode); rerr != nil {
+					d.log.Warn("rollback mode after chmod failure", "path", remote.Path, "err", rerr)
+				}
+				return false, fmt.Errorf("chmod %s: %w", remote.Path, err)
+			}
+
+			// Store filesystem-observed mtime/mode so scan equality matches disk
+			// (some FS truncate timestamps; Chtimes success ≠ Stat equality).
+			actualMode, actualMT, err := diskMeta(metaAbs, mode, remote.ModTime, local.ModTime)
+			if err != nil {
+				// Ops succeeded; still commit with best-effort values rather than
+				// rolling back a successful metadata write.
+				d.log.Warn("stat after metadata adopt", "path", remote.Path, "err", err)
 			}
 			local.UpdatedAt = remote.UpdatedAt
-			local.ModTime = remote.ModTime
-			local.Mode = mode
+			local.ModTime = actualMT
+			local.Mode = actualMode
 			d.idx.Set(local)
 			d.appliesSinceSave++
 			return true, nil
@@ -887,14 +924,29 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 	if err := atomicfile.WriteFile(abs, data, mode); err != nil {
 		return false, err
 	}
+	// Always commit content after a successful write so scan cannot promote the
+	// new bytes under a fresh local UpdatedAt (LWW inversion). Chtimes failure
+	// is logged; disk mtime is re-Stat'd and same-hash adopt can retry later.
 	if !remote.ModTime.IsZero() {
-		_ = os.Chtimes(abs, remote.ModTime, remote.ModTime)
+		if err := os.Chtimes(abs, remote.ModTime, remote.ModTime); err != nil {
+			d.log.Warn("chtimes after pull; committing content with disk mtime", "path", remote.Path, "err", err)
+		}
+	}
+	// Prefer filesystem-observed mtime; never install a zero ModTime from a partial peer entry.
+	fallbackMT := remote.ModTime
+	if fallbackMT.IsZero() && hasLocal && !local.Deleted {
+		fallbackMT = local.ModTime
+	}
+	actualMode, actualMT, err := diskMeta(abs, mode, remote.ModTime, fallbackMT)
+	if err != nil {
+		d.log.Warn("stat after pull", "path", remote.Path, "err", err)
 	}
 
 	entry := re
 	entry.Hash = got
 	entry.Size = int64(len(data))
-	entry.Mode = mode
+	entry.Mode = actualMode
+	entry.ModTime = actualMT
 	if entry.UpdatedAt.IsZero() {
 		entry.UpdatedAt = time.Now()
 	}
@@ -905,6 +957,47 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 	d.maybeSaveLocked()
 	d.log.Info("pulled file", "path", remote.Path, "size", len(data), "hash", got[:min(12, len(got))])
 	return true, nil
+}
+
+// diskMeta returns mode and mtime actually present on disk after a metadata or
+// content apply. When remoteMT is zero, keeps fallbackMT (local/disk) instead of
+// committing a zero index mtime. On Stat failure, returns modeWant and a non-zero
+// mtime preference of remoteMT then fallbackMT.
+func diskMeta(abs string, modeWant os.FileMode, remoteMT, fallbackMT time.Time) (os.FileMode, time.Time, error) {
+	fi, err := os.Stat(abs)
+	if err != nil {
+		mt := remoteMT
+		if mt.IsZero() {
+			mt = fallbackMT
+		}
+		return modeWant, mt, err
+	}
+	mode := fi.Mode().Perm()
+	if mode == 0 {
+		mode = modeWant
+	}
+	mt := fi.ModTime()
+	if remoteMT.IsZero() {
+		// Do not let a partial peer entry install zero; prefer prior known mtime
+		// only when Stat returned zero (exotic); otherwise disk is authoritative.
+		if mt.IsZero() && !fallbackMT.IsZero() {
+			mt = fallbackMT
+		}
+	}
+	return mode, mt, nil
+}
+
+// mtimesDiffer reports whether two mtimes should trigger metadata adopt.
+// Equal times, or both non-zero and same Unix second (coarse FS truncation
+// after Chtimes), are treated as not differing.
+func mtimesDiffer(a, b time.Time) bool {
+	if a.Equal(b) {
+		return false
+	}
+	if !a.IsZero() && !b.IsZero() && a.Unix() == b.Unix() {
+		return false
+	}
+	return true
 }
 
 // maybeSaveLocked persists the index every N applies to limit crash windows.

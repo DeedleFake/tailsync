@@ -341,9 +341,14 @@ func (idx *Index) Manifest() []ManifestEntry {
 // Ordering:
 //  1. Higher UpdatedAt wins.
 //  2. On equal UpdatedAt, prefer remote only when the entries differ, using a
-//     stable total order: Deleted (true > false), then Hash (string compare).
-//     Preferring remote always would flip-flop under concurrent mutual sync;
-//     a stable order guarantees both sides converge to the same winner.
+//     stable total order: Deleted (true > false), then Hash (string compare),
+//     then Mode, then ModTime (later mtime wins). Preferring remote always
+//     would flip-flop under concurrent mutual sync; a stable order guarantees
+//     both sides converge to the same winner.
+//
+// Entries that differ only in ModTime are not treated as identical, so a
+// touch-only peer update still participates in LWW (via UpdatedAt first, or
+// the ModTime tie-break when clocks match).
 func Wins(local, remote Entry) bool {
 	if remote.UpdatedAt.After(local.UpdatedAt) {
 		return true
@@ -351,8 +356,9 @@ func Wins(local, remote Entry) bool {
 	if local.UpdatedAt.After(remote.UpdatedAt) {
 		return false
 	}
-	// Equal timestamps: identical content/deletion → no change.
-	if local.Deleted == remote.Deleted && local.Hash == remote.Hash && local.Mode == remote.Mode {
+	// Equal timestamps: identical content/deletion/metadata → no change.
+	if local.Deleted == remote.Deleted && local.Hash == remote.Hash &&
+		local.Mode == remote.Mode && local.ModTime.Equal(remote.ModTime) {
 		return false
 	}
 	// Stable total order for ties.
@@ -360,7 +366,8 @@ func Wins(local, remote Entry) bool {
 }
 
 // compareEntries returns cmp-style ordering for equal-timestamp ties.
-// Deleted sorts above live; then higher Hash string; then higher Mode.
+// Deleted sorts above live; then higher Hash string; then higher Mode;
+// then later ModTime.
 func compareEntries(a, b Entry) int {
 	if a.Deleted != b.Deleted {
 		if a.Deleted {
@@ -371,7 +378,17 @@ func compareEntries(a, b Entry) int {
 	if c := cmp.Compare(a.Hash, b.Hash); c != 0 {
 		return c
 	}
-	return cmp.Compare(uint32(a.Mode), uint32(b.Mode))
+	if c := cmp.Compare(uint32(a.Mode), uint32(b.Mode)); c != 0 {
+		return c
+	}
+	// Later ModTime sorts higher so mtime-only peers converge without flip-flop.
+	if a.ModTime.After(b.ModTime) {
+		return 1
+	}
+	if b.ModTime.After(a.ModTime) {
+		return -1
+	}
+	return 0
 }
 
 // EntryFromManifest converts a ManifestEntry to Entry.

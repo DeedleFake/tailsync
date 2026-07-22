@@ -29,7 +29,9 @@ The daemon joins your tailnet with [tsnet](https://pkg.go.dev/tailscale.com/tsne
 1. Scans the sync directory and reconciles against the on-disk index (adds / modifies / offline deletions)
 2. Connects to online tailnet peers (or `-peers`) and merges remote manifests (last-writer-wins by `updated_at`)
 
-Keep host clocks roughly in sync (NTP). LWW uses wall-clock `updated_at`; equal-timestamp ties use a stable total order (deletion preference, then content hash).
+Keep host clocks roughly in sync (NTP). LWW uses wall-clock `updated_at`; equal-timestamp ties use a stable total order (deletion preference, then content hash, mode, then mtime).
+
+**Metadata synced** for regular files: permission bits (`mode`) and modification time (`mtime`), including touch-only changes. Content hash and size are authoritative for file body. Access time (atime), ownership, xattrs, and ACLs are not synchronized.
 
 ### Flags
 
@@ -82,7 +84,8 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Delta** — Adler-style rolling weak checksums + MD5 strong match per block; full-file SHA-256 is authoritative after apply. Whole-file buffers are used for transfers (default max 64 MiB per file)
 - **Concurrency** — Local reconcile and peer apply share one mutex, including during network transfers (v1 correctness over throughput; a slow peer can delay scans)
 - **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single TCP session
-- **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable hash/deletion order so peers converge
+- **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge
+- **Metadata** — Mode and mtime are synchronized end-to-end (scan detects mode-only and touch-only changes; peers adopt metadata when same content hash wins LWW)
 
 State under the sync tree named `.tailsync` / `.tailsync-*` is ignored by the scanner.
 

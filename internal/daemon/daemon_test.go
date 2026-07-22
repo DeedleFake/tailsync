@@ -126,6 +126,123 @@ func TestTwoNodesPlainTCP(t *testing.T) {
 	<-errB
 }
 
+// TestTwoNodesMtimeOnlySync verifies that a touch (mtime-only) on A propagates to B.
+func TestTwoNodesMtimeOnlySync(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	stateA := t.TempDir()
+	stateB := t.TempDir()
+
+	content := []byte("touch-me")
+	pathA := filepath.Join(dirA, "meta.txt")
+	if err := os.WriteFile(pathA, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	portA := 20010 + (os.Getpid() % 1000)
+	portB := portA + 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfgA := daemon.Config{
+		Dir:          dirA,
+		StateDir:     stateA,
+		Hostname:     "node-a-mtime",
+		Port:         portA,
+		DisableTSNet: true,
+		ListenHost:   "127.0.0.1",
+		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portB)},
+		ScanInterval: 150 * time.Millisecond,
+		SyncInterval: 150 * time.Millisecond,
+	}
+	cfgB := daemon.Config{
+		Dir:          dirB,
+		StateDir:     stateB,
+		Hostname:     "node-b-mtime",
+		Port:         portB,
+		DisableTSNet: true,
+		ListenHost:   "127.0.0.1",
+		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portA)},
+		ScanInterval: 150 * time.Millisecond,
+		SyncInterval: 150 * time.Millisecond,
+	}
+
+	da, err := daemon.New(cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := daemon.New(cfgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() { errA <- da.Run(ctx) }()
+	go func() { errB <- db.Run(ctx) }()
+
+	pathB := filepath.Join(dirB, "meta.txt")
+	waitFile(t, pathB, string(content), 15*time.Second, errA, errB)
+
+	// Record B's mtime after initial sync.
+	fiB, err := os.Stat(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtimeBefore := fiB.ModTime()
+
+	// touch on A: content unchanged, mtime advanced.
+	newMT := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(pathA, newMT, newMT); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until B's mtime matches A's (within filesystem precision).
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			fiB, _ = os.Stat(pathB)
+			t.Fatalf("timeout waiting for mtime sync: B=%v want≈%v (before=%v)", fiB.ModTime(), newMT, mtimeBefore)
+		}
+		for _, ch := range []<-chan error{errA, errB} {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Fatalf("daemon exited: %v", err)
+				}
+			default:
+			}
+		}
+		fiB, err = os.Stat(pathB)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		// Exact match, or second-precision match on coarse filesystems.
+		mtimeOK := fiB.ModTime().Equal(newMT) ||
+			(fiB.ModTime().Truncate(time.Second).Equal(newMT.Truncate(time.Second)) &&
+				!fiB.ModTime().Equal(mtimeBefore))
+		if !mtimeOK {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		// Content must still match on every success path.
+		data, err := os.ReadFile(pathB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != string(content) {
+			t.Fatalf("content changed: %q", data)
+		}
+		break
+	}
+
+	cancel()
+	<-errA
+	<-errB
+}
+
 func TestReconcileOfflineDeleteViaIndex(t *testing.T) {
 	root := t.TempDir()
 	idx := index.New()

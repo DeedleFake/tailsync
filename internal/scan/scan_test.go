@@ -199,6 +199,103 @@ func TestModeOnlyChange(t *testing.T) {
 	}
 }
 
+func TestMtimeOnlyChange(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "t.txt", "same")
+	fixed := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	opts := &scan.Options{Now: func() time.Time { return fixed }}
+	idx := index.New()
+	res, err := scan.Scan(context.Background(), root, idx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan.Apply(idx, res)
+	prev, ok := idx.Get("t.txt")
+	if !ok {
+		t.Fatal("missing entry")
+	}
+
+	// touch: advance mtime without changing content or mode.
+	newMT := prev.ModTime.Add(2 * time.Hour)
+	p := filepath.Join(root, "t.txt")
+	if err := os.Chtimes(p, newMT, newMT); err != nil {
+		t.Fatal(err)
+	}
+
+	later := fixed.Add(time.Minute)
+	opts.Now = func() time.Time { return later }
+	res2, err := scan.Scan(context.Background(), root, idx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res2.Changes) != 1 || res2.Changes[0].Kind != scan.Modified {
+		t.Fatalf("want mtime Modified, got %+v", res2.Changes)
+	}
+	c := res2.Changes[0].Entry
+	if !c.ModTime.Equal(newMT) {
+		t.Fatalf("modtime: got %v want %v", c.ModTime, newMT)
+	}
+	if !c.UpdatedAt.After(prev.UpdatedAt) {
+		t.Fatalf("UpdatedAt should advance: prev=%v got=%v", prev.UpdatedAt, c.UpdatedAt)
+	}
+	if c.Hash != prev.Hash || c.Size != prev.Size {
+		t.Fatalf("hash/size should be reused: got hash=%s size=%d want hash=%s size=%d",
+			c.Hash, c.Size, prev.Hash, prev.Size)
+	}
+	if c.Mode != prev.Mode {
+		t.Fatalf("mode should be unchanged: got %o want %o", c.Mode, prev.Mode)
+	}
+
+	// No-op scan: nothing changed on disk → no changes.
+	scan.Apply(idx, res2)
+	res3, err := scan.Scan(context.Background(), root, idx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res3.Changes) != 0 {
+		t.Fatalf("want no changes when nothing changed, got %+v", res3.Changes)
+	}
+}
+
+func TestModeAndMtimeChange(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "both.txt", "same")
+	idx := index.New()
+	res, err := scan.Scan(context.Background(), root, idx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan.Apply(idx, res)
+	prev, _ := idx.Get("both.txt")
+
+	p := filepath.Join(root, "both.txt")
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newMT := prev.ModTime.Add(3 * time.Hour)
+	if err := os.Chtimes(p, newMT, newMT); err != nil {
+		t.Fatal(err)
+	}
+
+	res2, err := scan.Scan(context.Background(), root, idx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res2.Changes) != 1 || res2.Changes[0].Kind != scan.Modified {
+		t.Fatalf("want Modified, got %+v", res2.Changes)
+	}
+	c := res2.Changes[0].Entry
+	if c.Mode != 0o600 {
+		t.Fatalf("mode=%o", c.Mode)
+	}
+	if !c.ModTime.Equal(newMT) {
+		t.Fatalf("modtime: got %v want %v", c.ModTime, newMT)
+	}
+	if c.Hash != prev.Hash {
+		t.Fatalf("hash should be reused")
+	}
+}
+
 func TestApplyDoesNotClobberNewer(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "f.txt", "v1")
