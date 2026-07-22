@@ -1,0 +1,983 @@
+// Package daemon runs the tailsync synchronization service.
+package daemon
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"tailscale.com/tsnet"
+
+	"deedles.dev/tailsync/internal/atomicfile"
+	"deedles.dev/tailsync/internal/delta"
+	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/proto"
+	"deedles.dev/tailsync/internal/scan"
+)
+
+// DefaultMaxFileBytes is the max single-file size loaded into memory for
+// transfer/delta (v1 keeps whole-file buffers). Wire framing is also capped
+// by proto.MaxMessageSize.
+const DefaultMaxFileBytes = 64 << 20 // 64 MiB
+
+// Config holds daemon configuration.
+type Config struct {
+	// Dir is the directory to synchronize (required).
+	Dir string
+	// StateDir holds the index and tsnet state. Defaults to Dir/.tailsync.
+	StateDir string
+	// Hostname is the tsnet hostname advertised on the tailnet.
+	Hostname string
+	// ServiceName, when non-empty, filters discovered peers to those whose
+	// HostName or DNSName contains this substring (not a path prefix).
+	// Empty means dial all online tailnet peers except self. Ignored when Peers is set.
+	ServiceName string
+	// Port is the TCP port to listen on over the tailnet.
+	Port int
+	// AuthKey is an optional Tailscale auth key (else interactive / existing state).
+	AuthKey string
+	// ScanInterval is how often to rescan the local directory.
+	ScanInterval time.Duration
+	// SyncInterval is how often to reconnect/sync with peers.
+	SyncInterval time.Duration
+	// BlockSize for rsync-style signatures.
+	BlockSize int
+	// MaxFileBytes rejects local files larger than this for serve/pull (0 = default).
+	MaxFileBytes int64
+	// TombstoneTTL drops old deletion tombstones from the index (0 = default 30d).
+	TombstoneTTL time.Duration
+	// Logger defaults to slog.Default().
+	Logger *slog.Logger
+	// DisableTSNet runs on plain TCP localhost (for tests); still binds to Port.
+	// Prefer false in production so traffic stays on the tailnet.
+	DisableTSNet bool
+	// ListenHost is used when DisableTSNet is true (default 127.0.0.1).
+	ListenHost string
+	// Peers is an optional explicit list of peer addresses (host:port). When empty,
+	// peers are discovered from the Tailscale status (online nodes other than self).
+	Peers []string
+}
+
+// Daemon is the synchronization service.
+type Daemon struct {
+	cfg    Config
+	log    *slog.Logger
+	idx    *index.Index
+	server *tsnet.Server
+	ln     net.Listener
+
+	// syncMu serializes local reconcile and remote apply so scan→apply and
+	// peer mutations cannot interleave on the same path/index snapshot.
+	// Held across network pulls in applyRemote (v1 correctness over throughput):
+	// one slow peer or large file can block other applies and local scans until
+	// the connection deadline (up to ~5m). Future work: per-path locks or
+	// release-during-I/O with re-validation before commit.
+	syncMu sync.Mutex
+
+	mu       sync.Mutex
+	nodeID   string
+	peerSeen map[string]time.Time // last successful sync
+
+	// appliesSinceSave counts successful index mutations since last Save.
+	appliesSinceSave int
+}
+
+// New constructs a Daemon from cfg (does not start it).
+func New(cfg Config) (*Daemon, error) {
+	if cfg.Dir == "" {
+		return nil, fmt.Errorf("sync directory is required")
+	}
+	abs, err := filepath.Abs(cfg.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve dir: %w", err)
+	}
+	cfg.Dir = abs
+
+	if cfg.StateDir == "" {
+		cfg.StateDir = filepath.Join(cfg.Dir, ".tailsync")
+	} else {
+		cfg.StateDir, err = filepath.Abs(cfg.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve state dir: %w", err)
+		}
+	}
+	if cfg.Hostname == "" {
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "tailsync"
+		}
+		cfg.Hostname = "tailsync-" + host
+	}
+	// ServiceName stays empty by default: discover all online peers.
+	if cfg.Port == 0 {
+		cfg.Port = 5960
+	}
+	if cfg.ScanInterval <= 0 {
+		cfg.ScanInterval = 30 * time.Second
+	}
+	if cfg.SyncInterval <= 0 {
+		cfg.SyncInterval = 45 * time.Second
+	}
+	if cfg.BlockSize <= 0 {
+		cfg.BlockSize = delta.DefaultBlockSize
+	}
+	if cfg.MaxFileBytes <= 0 {
+		cfg.MaxFileBytes = DefaultMaxFileBytes
+	}
+	if cfg.TombstoneTTL <= 0 {
+		cfg.TombstoneTTL = index.DefaultTombstoneTTL
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	if cfg.ListenHost == "" {
+		cfg.ListenHost = "127.0.0.1"
+	}
+
+	return &Daemon{
+		cfg:      cfg,
+		log:      log,
+		peerSeen: make(map[string]time.Time),
+	}, nil
+}
+
+// Run starts the daemon until ctx is cancelled.
+func (d *Daemon) Run(ctx context.Context) error {
+	if err := os.MkdirAll(d.cfg.StateDir, 0o755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	if err := os.MkdirAll(d.cfg.Dir, 0o755); err != nil {
+		return fmt.Errorf("create sync dir: %w", err)
+	}
+
+	indexPath := filepath.Join(d.cfg.StateDir, "index.json")
+	idx, err := index.Load(indexPath)
+	if err != nil {
+		return fmt.Errorf("load index: %w", err)
+	}
+	d.idx = idx
+	d.nodeID = d.cfg.Hostname
+
+	// Initial reconcile: detect offline deletions and local changes.
+	if err := d.reconcile(ctx); err != nil {
+		return fmt.Errorf("initial reconcile: %w", err)
+	}
+
+	if err := d.listen(ctx); err != nil {
+		return err
+	}
+	defer d.closeListener()
+
+	d.log.Info("tailsync started",
+		"dir", d.cfg.Dir,
+		"state", d.cfg.StateDir,
+		"hostname", d.cfg.Hostname,
+		"port", d.cfg.Port,
+		"index_entries", d.idx.Len(),
+		"max_file_bytes", d.cfg.MaxFileBytes,
+	)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.acceptLoop(ctx)
+	}()
+
+	scanTick := time.NewTicker(d.cfg.ScanInterval)
+	defer scanTick.Stop()
+	syncTick := time.NewTicker(d.cfg.SyncInterval)
+	defer syncTick.Stop()
+
+	// Immediate peer sync attempt.
+	d.syncPeers(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			d.log.Info("shutting down")
+			d.syncMu.Lock()
+			if err := d.idx.Save(); err != nil {
+				d.log.Error("save index on shutdown", "err", err)
+			}
+			d.syncMu.Unlock()
+			return nil
+		case err := <-errCh:
+			if err != nil && ctx.Err() == nil {
+				return err
+			}
+			return nil
+		case <-scanTick.C:
+			if err := d.reconcile(ctx); err != nil {
+				d.log.Error("reconcile", "err", err)
+			}
+		case <-syncTick.C:
+			d.syncPeers(ctx)
+		}
+	}
+}
+
+func (d *Daemon) listen(ctx context.Context) error {
+	addr := fmt.Sprintf(":%d", d.cfg.Port)
+	if d.cfg.DisableTSNet {
+		host := d.cfg.ListenHost
+		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, d.cfg.Port))
+		if err != nil {
+			return fmt.Errorf("listen %s:%d: %w", host, d.cfg.Port, err)
+		}
+		d.ln = ln
+		d.log.Info("listening (plain TCP)", "addr", ln.Addr().String())
+		return nil
+	}
+
+	s := &tsnet.Server{
+		Dir:      filepath.Join(d.cfg.StateDir, "tsnet"),
+		Hostname: d.cfg.Hostname,
+		AuthKey:  d.cfg.AuthKey,
+		Logf: func(format string, args ...any) {
+			d.log.Debug(fmt.Sprintf(format, args...), "component", "tsnet")
+		},
+	}
+	d.server = s
+
+	// Start tsnet early so status/dial work.
+	if _, err := s.Up(ctx); err != nil {
+		return fmt.Errorf("tsnet up: %w", err)
+	}
+
+	ln, err := s.Listen("tcp", addr)
+	if err != nil {
+		_ = s.Close()
+		return fmt.Errorf("tsnet listen %s: %w", addr, err)
+	}
+	d.ln = ln
+	d.log.Info("listening on tailnet", "addr", ln.Addr().String(), "hostname", d.cfg.Hostname)
+	return nil
+}
+
+func (d *Daemon) closeListener() {
+	if d.ln != nil {
+		_ = d.ln.Close()
+	}
+	if d.server != nil {
+		_ = d.server.Close()
+	}
+}
+
+func (d *Daemon) acceptLoop(ctx context.Context) error {
+	for {
+		conn, err := d.ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("accept: %w", err)
+			}
+		}
+		go d.handleConn(ctx, conn)
+	}
+}
+
+func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
+	deadline := time.Now().Add(5 * time.Minute)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+}
+
+func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	d.setConnDeadline(conn, ctx)
+	remote := conn.RemoteAddr().String()
+	d.log.Debug("inbound connection", "remote", remote)
+
+	// Expect Hello first.
+	msg, err := proto.Decode(conn)
+	if err != nil {
+		d.log.Debug("decode hello", "remote", remote, "err", err)
+		return
+	}
+	if msg.Header.Type != proto.TypeHello {
+		_ = proto.Encode(conn, proto.NewError("expected hello"))
+		return
+	}
+	if msg.Header.Version != 0 && msg.Header.Version != proto.Version {
+		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unsupported version %d", msg.Header.Version)))
+		return
+	}
+	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID)); err != nil {
+		return
+	}
+
+	// Serve requests until EOF or fatal error. Recoverable per-request errors
+	// send TypeError and keep the session open so the client can continue.
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		d.setConnDeadline(conn, ctx)
+		msg, err := proto.Decode(conn)
+		if err != nil {
+			if err != io.EOF {
+				d.log.Debug("session ended", "remote", remote, "err", err)
+			}
+			return
+		}
+		if err := d.serveMsg(ctx, conn, msg); err != nil {
+			d.log.Debug("serve message", "remote", remote, "type", msg.Header.Type, "err", err)
+			if encodeErr := proto.Encode(conn, proto.NewError(err.Error())); encodeErr != nil {
+				return
+			}
+			// Keep session open for not-found / validation errors; close on
+			// unexpected protocol types so a confused peer does not loop.
+			if msg.Header.Type == "" || isFatalServeErr(err) {
+				return
+			}
+		}
+	}
+}
+
+func isFatalServeErr(err error) bool {
+	// Unexpected message types are protocol-level; everything else is per-request.
+	return err != nil && strings.HasPrefix(err.Error(), "unexpected message type")
+}
+
+func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	switch msg.Header.Type {
+	case proto.TypePing:
+		return proto.Encode(conn, proto.Message{Header: proto.Header{Type: proto.TypePong}})
+	case proto.TypeManifestReq:
+		return proto.Encode(conn, proto.NewManifest(d.idx.Manifest()))
+	case proto.TypeFileReq:
+		return d.serveFile(ctx, conn, msg.Header.Path)
+	case proto.TypeSigReq:
+		return d.serveSig(ctx, conn, msg.Header.Path, msg.Header.BlockSize)
+	case proto.TypeDeltaReq:
+		return d.serveDelta(ctx, conn, msg.Header.Path, msg.Header.Hash, msg.Header.BlockSize, msg.Payload)
+	default:
+		return fmt.Errorf("unexpected message type %q", msg.Header.Type)
+	}
+}
+
+// absPath validates a relative sync path and returns its absolute location under Dir.
+// Uses filepath.IsLocal so names like "foo..bar" are allowed while ".." segments are not.
+func (d *Daemon) absPath(rel string) (string, error) {
+	rel = filepath.ToSlash(strings.TrimSpace(rel))
+	if rel == "" || strings.HasPrefix(rel, "/") {
+		return "", fmt.Errorf("invalid path %q", rel)
+	}
+	// Normalize and reject ".." segments without banning ".." as a substring of a name.
+	cleaned := pathCleanSlash(rel)
+	if cleaned == "." || cleaned == "" || !fs.ValidPath(cleaned) {
+		return "", fmt.Errorf("invalid path %q", rel)
+	}
+	// filepath.IsLocal rejects "..", absolute, and volume paths on all platforms.
+	fromSlash := filepath.FromSlash(cleaned)
+	if !filepath.IsLocal(fromSlash) {
+		return "", fmt.Errorf("invalid path %q", rel)
+	}
+	abs := filepath.Join(d.cfg.Dir, fromSlash)
+	relCheck, err := filepath.Rel(d.cfg.Dir, abs)
+	if err != nil || !filepath.IsLocal(relCheck) {
+		return "", fmt.Errorf("path escapes root: %q", rel)
+	}
+	return abs, nil
+}
+
+// pathCleanSlash is path.Clean for slash-separated relative paths.
+func pathCleanSlash(p string) string {
+	if p == "" {
+		return ""
+	}
+	// Use filepath.Clean on FromSlash then back, so "a/../b" becomes "b".
+	return filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
+}
+
+func (d *Daemon) checkFileSize(path string, size int64) error {
+	if size > d.cfg.MaxFileBytes {
+		return fmt.Errorf("file %s too large: %d > max %d", path, size, d.cfg.MaxFileBytes)
+	}
+	return nil
+}
+
+// readFileLimited reads a file after checking size against MaxFileBytes.
+func (d *Daemon) readFileLimited(abs, rel string) ([]byte, os.FileInfo, error) {
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := d.checkFileSize(rel, fi.Size()); err != nil {
+		return nil, nil, err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, fi, nil
+}
+
+// serveEntry returns a live index entry after validating path. It refuses the
+// serve (without rehashing) if size/mtime have drifted from the index since the
+// last scan, so clients fail fast instead of transferring stale bytes.
+func (d *Daemon) serveEntry(ctx context.Context, rel string) (index.Entry, string, error) {
+	if _, err := d.absPath(rel); err != nil {
+		return index.Entry{}, "", err
+	}
+	// Normalize path key to cleaned slash form for index lookup.
+	rel = pathCleanSlash(filepath.ToSlash(rel))
+	e, ok := d.idx.Get(rel)
+	if !ok || e.Deleted {
+		return index.Entry{}, "", fmt.Errorf("file not found: %s", rel)
+	}
+	abs, err := d.absPath(rel)
+	if err != nil {
+		return index.Entry{}, "", err
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return index.Entry{}, "", fmt.Errorf("stat %s: %w", rel, err)
+	}
+	if err := d.checkFileSize(rel, fi.Size()); err != nil {
+		return index.Entry{}, "", err
+	}
+	if fi.Size() != e.Size || !fi.ModTime().Equal(e.ModTime) {
+		// Disk drifted since last scan; refuse stale serve so clients do not
+		// transfer bytes that fail hash verification.
+		return index.Entry{}, "", fmt.Errorf("file %s changed since last scan; try again after reconcile", rel)
+	}
+	if err := ctx.Err(); err != nil {
+		return index.Entry{}, "", err
+	}
+	return e, abs, nil
+}
+
+func (d *Daemon) serveFile(ctx context.Context, conn net.Conn, rel string) error {
+	e, abs, err := d.serveEntry(ctx, rel)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", rel, err)
+	}
+	return proto.Encode(conn, proto.NewFileData(pathCleanSlash(filepath.ToSlash(rel)), e, data))
+}
+
+func (d *Daemon) serveSig(ctx context.Context, conn net.Conn, rel string, blockSize int) error {
+	if blockSize <= 0 {
+		blockSize = d.cfg.BlockSize
+	}
+	e, abs, err := d.serveEntry(ctx, rel)
+	if err != nil {
+		return err
+	}
+	_ = e
+	f, err := os.Open(abs)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sig, err := delta.Sign(f, blockSize)
+	if err != nil {
+		return err
+	}
+	raw, err := delta.MarshalSignature(sig)
+	if err != nil {
+		return err
+	}
+	return proto.Encode(conn, proto.NewSig(pathCleanSlash(filepath.ToSlash(rel)), blockSize, raw))
+}
+
+func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel, wantHash string, blockSize int, sigRaw []byte) error {
+	e, abs, err := d.serveEntry(ctx, rel)
+	if err != nil {
+		return err
+	}
+	if wantHash != "" && e.Hash != wantHash {
+		d.log.Debug("delta hash mismatch", "path", rel, "want", wantHash, "have", e.Hash)
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return err
+	}
+	var sig *delta.Signature
+	if len(sigRaw) > 0 {
+		sig, err = delta.UnmarshalSignature(sigRaw)
+		if err != nil {
+			return fmt.Errorf("bad signature: %w", err)
+		}
+		// Prefer the signature's embedded block size; error if header disagrees.
+		if blockSize > 0 && sig.BlockSize > 0 && blockSize != sig.BlockSize {
+			return fmt.Errorf("block size mismatch: header %d signature %d", blockSize, sig.BlockSize)
+		}
+	}
+	del, err := delta.EncodeBytes(data, sig)
+	if err != nil {
+		return err
+	}
+	raw, err := delta.MarshalDelta(del)
+	if err != nil {
+		return err
+	}
+	return proto.Encode(conn, proto.NewDelta(pathCleanSlash(filepath.ToSlash(rel)), e, raw))
+}
+
+func (d *Daemon) reconcile(ctx context.Context) error {
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+
+	res, err := scan.Scan(ctx, d.cfg.Dir, d.idx, nil)
+	if err != nil {
+		return err
+	}
+	applied := 0
+	if len(res.Changes) > 0 {
+		for _, c := range res.Changes {
+			d.log.Info("local change", "kind", c.Kind.String(), "path", c.Path)
+		}
+		applied = scan.Apply(d.idx, res)
+	}
+
+	if n := d.idx.GCTombstones(time.Now(), d.cfg.TombstoneTTL); n > 0 {
+		d.log.Info("gc tombstones", "removed", n)
+		applied += n
+	}
+
+	if applied > 0 || d.appliesSinceSave > 0 {
+		if err := d.idx.Save(); err != nil {
+			return fmt.Errorf("save index: %w", err)
+		}
+		d.appliesSinceSave = 0
+	}
+	return nil
+}
+
+func (d *Daemon) syncPeers(ctx context.Context) {
+	peers, err := d.listPeers(ctx)
+	if err != nil {
+		d.log.Debug("list peers", "err", err)
+		return
+	}
+	for _, addr := range peers {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if err := d.syncWith(ctx, addr); err != nil {
+			d.log.Debug("sync peer", "addr", addr, "err", err)
+			continue
+		}
+		d.mu.Lock()
+		d.peerSeen[addr] = time.Now()
+		d.mu.Unlock()
+	}
+}
+
+func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
+	if len(d.cfg.Peers) > 0 {
+		return append([]string(nil), d.cfg.Peers...), nil
+	}
+	if d.cfg.DisableTSNet || d.server == nil {
+		return nil, nil
+	}
+	lc, err := d.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	st, err := lc.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var addrs []string
+	self := ""
+	if st.Self != nil {
+		self = string(st.Self.ID)
+	}
+	svc := strings.ToLower(d.cfg.ServiceName)
+	for _, p := range st.Peer {
+		if p == nil || !p.Online {
+			continue
+		}
+		if string(p.ID) == self {
+			continue
+		}
+		// Prefer DNSName (MagicDNS); strip trailing dot.
+		host := strings.TrimSuffix(p.DNSName, ".")
+		if host == "" && len(p.TailscaleIPs) > 0 {
+			host = p.TailscaleIPs[0].String()
+		}
+		if host == "" {
+			continue
+		}
+		// Skip ourselves by hostname too.
+		if strings.EqualFold(p.HostName, d.cfg.Hostname) || strings.HasPrefix(host, d.cfg.Hostname+".") {
+			continue
+		}
+		// Filter by service name substring when discovering (avoids dialing unrelated nodes).
+		if svc != "" {
+			hn := strings.ToLower(p.HostName)
+			dn := strings.ToLower(host)
+			if !strings.Contains(hn, svc) && !strings.Contains(dn, svc) {
+				continue
+			}
+		}
+		addrs = append(addrs, fmt.Sprintf("%s:%d", host, d.cfg.Port))
+	}
+	return addrs, nil
+}
+
+func (d *Daemon) dial(ctx context.Context, addr string) (net.Conn, error) {
+	if d.cfg.DisableTSNet || d.server == nil {
+		var nd net.Dialer
+		return nd.DialContext(ctx, "tcp", addr)
+	}
+	return d.server.Dial(ctx, "tcp", addr)
+}
+
+func (d *Daemon) syncWith(ctx context.Context, addr string) error {
+	conn, err := d.dial(ctx, addr)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	d.setConnDeadline(conn, ctx)
+
+	if err := proto.Encode(conn, proto.NewHello(d.nodeID)); err != nil {
+		return err
+	}
+	resp, err := proto.Decode(conn)
+	if err != nil {
+		return fmt.Errorf("hello response: %w", err)
+	}
+	if resp.Header.Type == proto.TypeError {
+		return fmt.Errorf("hello error: %s", resp.Header.Error)
+	}
+	if resp.Header.Type != proto.TypeHelloOK {
+		return fmt.Errorf("unexpected hello response %q", resp.Header.Type)
+	}
+	if resp.Header.NodeID == d.nodeID {
+		return fmt.Errorf("connected to self")
+	}
+
+	if err := proto.Encode(conn, proto.NewManifestReq()); err != nil {
+		return err
+	}
+	man, err := proto.Decode(conn)
+	if err != nil {
+		return fmt.Errorf("manifest: %w", err)
+	}
+	if man.Header.Type == proto.TypeError {
+		return fmt.Errorf("manifest error: %s", man.Header.Error)
+	}
+	if man.Header.Type != proto.TypeManifest {
+		return fmt.Errorf("expected manifest, got %q", man.Header.Type)
+	}
+
+	changed := false
+	var transportErr error
+	for _, remote := range man.Header.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.setConnDeadline(conn, ctx)
+		did, err := d.applyRemote(ctx, conn, remote)
+		if err != nil {
+			// Per-entry logical errors: continue. Transport/decode failures abort.
+			if isTransportErr(err) {
+				transportErr = err
+				d.log.Warn("peer transport error, aborting peer sync", "addr", addr, "err", err)
+				break
+			}
+			d.log.Warn("apply remote entry", "path", remote.Path, "err", err)
+			continue
+		}
+		if did {
+			changed = true
+		}
+	}
+	if changed {
+		d.syncMu.Lock()
+		if err := d.idx.Save(); err != nil {
+			d.syncMu.Unlock()
+			return fmt.Errorf("save index: %w", err)
+		}
+		d.appliesSinceSave = 0
+		d.syncMu.Unlock()
+	}
+	if transportErr != nil {
+		return transportErr
+	}
+	d.log.Info("synced peer", "addr", addr, "remote_node", resp.Header.NodeID, "entries", len(man.Header.Entries))
+	return nil
+}
+
+// errTransport marks framing / connection failures that invalidate the session.
+// errPeerLogical marks TypeError responses and other per-entry logical failures
+// that should not abort the rest of a peer sync.
+var (
+	errTransport   = errors.New("transport error")
+	errPeerLogical = errors.New("peer logical error")
+)
+
+func isTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errTransport) || errors.Is(err, io.EOF)
+}
+
+func peerLogical(msg string) error {
+	return fmt.Errorf("%w: %s", errPeerLogical, msg)
+}
+
+// applyRemote reconciles one remote manifest entry. Returns true if local state changed.
+func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.ManifestEntry) (bool, error) {
+	// Validate path before any index mutation.
+	if _, err := d.absPath(remote.Path); err != nil {
+		return false, fmt.Errorf("reject path: %w", err)
+	}
+	remote.Path = pathCleanSlash(filepath.ToSlash(remote.Path))
+
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+
+	// Re-check cancellation under lock so we do not start a long pull after cancel.
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	local, hasLocal := d.idx.Get(remote.Path)
+	re := index.EntryFromManifest(remote)
+
+	if remote.Deleted {
+		if !hasLocal {
+			if d.idx.SetIfWins(re) {
+				d.appliesSinceSave++
+				return true, nil
+			}
+			return false, nil
+		}
+		if local.Deleted {
+			if d.idx.SetIfWins(re) {
+				d.appliesSinceSave++
+				return true, nil
+			}
+			return false, nil
+		}
+		// Remote deleted, we have live file: delete if remote wins LWW.
+		if !index.Wins(local, re) {
+			return false, nil
+		}
+		abs, err := d.absPath(remote.Path)
+		if err != nil {
+			return false, err
+		}
+		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("delete %s: %w", remote.Path, err)
+		}
+		// Re-check LWW before commit in case another apply raced (we hold syncMu).
+		if !d.idx.SetIfWins(re) {
+			return false, nil
+		}
+		d.appliesSinceSave++
+		d.log.Info("deleted from peer", "path", remote.Path)
+		d.maybeSaveLocked()
+		return true, nil
+	}
+
+	// Remote has live file — require a content hash for integrity.
+	if remote.Hash == "" {
+		return false, peerLogical(fmt.Sprintf("live entry %q missing content hash", remote.Path))
+	}
+
+	if hasLocal && !local.Deleted && local.Hash == remote.Hash {
+		// Same content hash — adopt remote metadata only when its clock is newer or it wins a mode tie.
+		needMeta := remote.UpdatedAt.After(local.UpdatedAt) ||
+			(remote.UpdatedAt.Equal(local.UpdatedAt) && remote.Mode != local.Mode && index.Wins(local, re))
+		if !needMeta {
+			return false, nil
+		}
+		metaAbs, err := d.absPath(remote.Path)
+		if err != nil {
+			return false, err
+		}
+		mode := remote.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		// Apply mode (and mtime) on disk before index so scan does not flip-flop.
+		// If the file is missing, fall through to a content pull instead of committing metadata-only.
+		if err := os.Chmod(metaAbs, mode); err != nil {
+			if !os.IsNotExist(err) {
+				return false, fmt.Errorf("chmod %s: %w", remote.Path, err)
+			}
+			d.log.Debug("metadata adopt: local file missing, pulling content", "path", remote.Path)
+			// Fall through to content pull below.
+		} else {
+			if !remote.ModTime.IsZero() {
+				_ = os.Chtimes(metaAbs, remote.ModTime, remote.ModTime)
+			}
+			local.UpdatedAt = remote.UpdatedAt
+			local.ModTime = remote.ModTime
+			local.Mode = mode
+			d.idx.Set(local)
+			d.appliesSinceSave++
+			return true, nil
+		}
+	} else if hasLocal && !index.Wins(local, re) {
+		return false, nil
+	}
+
+	abs, err := d.absPath(remote.Path)
+	if err != nil {
+		return false, err
+	}
+
+	// Network I/O while holding syncMu (see field comment): serializes applies.
+	var data []byte
+	if hasLocal && !local.Deleted {
+		data, err = d.pullDelta(ctx, conn, remote, abs)
+		if err != nil {
+			if isTransportErr(err) {
+				d.log.Debug("delta pull failed, aborting peer apply (transport)", "path", remote.Path, "err", err)
+				return false, err
+			}
+			d.log.Debug("delta pull failed, falling back to full", "path", remote.Path, "err", err)
+			data, err = d.pullFull(ctx, conn, remote)
+		}
+	} else {
+		data, err = d.pullFull(ctx, conn, remote)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if got != remote.Hash {
+		return false, peerLogical(fmt.Sprintf("hash mismatch for %s: got %s want %s", remote.Path, got, remote.Hash))
+	}
+	if err := d.checkFileSize(remote.Path, int64(len(data))); err != nil {
+		return false, err
+	}
+
+	// Final LWW check after transfer under syncMu — index cannot change under us.
+	if cur, ok := d.idx.Get(remote.Path); ok && !index.Wins(cur, re) {
+		return false, nil
+	}
+
+	mode := remote.Mode
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := atomicfile.WriteFile(abs, data, mode); err != nil {
+		return false, err
+	}
+	if !remote.ModTime.IsZero() {
+		_ = os.Chtimes(abs, remote.ModTime, remote.ModTime)
+	}
+
+	entry := re
+	entry.Hash = got
+	entry.Size = int64(len(data))
+	entry.Mode = mode
+	if entry.UpdatedAt.IsZero() {
+		entry.UpdatedAt = time.Now()
+	}
+	// Under syncMu we already re-validated LWW; Set cannot lose a concurrent race.
+	// Avoid SetIfWins here: identical-content Wins false would skip the commit after a write.
+	d.idx.Set(entry)
+	d.appliesSinceSave++
+	d.maybeSaveLocked()
+	d.log.Info("pulled file", "path", remote.Path, "size", len(data), "hash", got[:min(12, len(got))])
+	return true, nil
+}
+
+// maybeSaveLocked persists the index every N applies to limit crash windows.
+// Caller must hold syncMu.
+func (d *Daemon) maybeSaveLocked() {
+	const every = 8
+	if d.appliesSinceSave >= every {
+		if err := d.idx.Save(); err != nil {
+			d.log.Error("mid-sync index save", "err", err)
+			return
+		}
+		d.appliesSinceSave = 0
+	}
+}
+
+func (d *Daemon) pullFull(ctx context.Context, conn net.Conn, remote index.ManifestEntry) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := proto.Encode(conn, proto.NewFileReq(remote.Path, remote.Hash)); err != nil {
+		return nil, fmt.Errorf("%w: encode file_req: %w", errTransport, err)
+	}
+	msg, err := proto.Decode(conn)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode file response: %w", errTransport, err)
+	}
+	if msg.Header.Type == proto.TypeError {
+		return nil, peerLogical(msg.Header.Error)
+	}
+	if msg.Header.Type != proto.TypeFileData {
+		return nil, fmt.Errorf("%w: expected file_data, got %q", errTransport, msg.Header.Type)
+	}
+	return msg.Payload, nil
+}
+
+func (d *Daemon) pullDelta(ctx context.Context, conn net.Conn, remote index.ManifestEntry, abs string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	basis, fi, err := d.readFileLimited(abs, remote.Path)
+	if err != nil {
+		// Local basis missing/unreadable is a logical failure for this path.
+		return nil, peerLogical(err.Error())
+	}
+	_ = fi
+	sig, err := delta.SignBytes(basis, d.cfg.BlockSize)
+	if err != nil {
+		return nil, peerLogical(err.Error())
+	}
+	sigRaw, err := delta.MarshalSignature(sig)
+	if err != nil {
+		return nil, peerLogical(err.Error())
+	}
+	if err := proto.Encode(conn, proto.NewDeltaReq(remote.Path, remote.Hash, d.cfg.BlockSize, sigRaw)); err != nil {
+		return nil, fmt.Errorf("%w: encode delta_req: %w", errTransport, err)
+	}
+	msg, err := proto.Decode(conn)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode delta response: %w", errTransport, err)
+	}
+	if msg.Header.Type == proto.TypeError {
+		return nil, peerLogical(msg.Header.Error)
+	}
+	if msg.Header.Type != proto.TypeDelta {
+		return nil, fmt.Errorf("%w: expected delta, got %q", errTransport, msg.Header.Type)
+	}
+	del, err := delta.UnmarshalDelta(msg.Payload)
+	if err != nil {
+		return nil, peerLogical(fmt.Sprintf("bad delta: %v", err))
+	}
+	out, err := delta.Apply(basis, del)
+	if err != nil {
+		return nil, peerLogical(fmt.Sprintf("apply delta: %v", err))
+	}
+	return out, nil
+}
