@@ -266,7 +266,7 @@ func TestReconcileOfflineDeleteViaIndex(t *testing.T) {
 // TestRunCancelAcceptLoopRace starts a plain daemon, waits until listening,
 // then cancels — repeated to exercise acceptLoop vs listener close (race clean).
 func TestRunCancelAcceptLoopRace(t *testing.T) {
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		dir := t.TempDir()
 		state := t.TempDir()
 		ln, err := net.Listen("tcp", "127.0.0.1:0")

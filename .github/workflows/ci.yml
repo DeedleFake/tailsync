@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy (check)
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: go test -vet=all
+        run: go test -vet=all ./...
+
+      - name: modernize
+        run: go tool modernize ./...
+
+      - name: staticcheck
+        run: go tool staticcheck ./...

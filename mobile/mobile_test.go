@@ -167,7 +167,7 @@ func TestConcurrentStartOnlyOneSucceeds(t *testing.T) {
 	)
 	start := make(chan struct{})
 	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			<-start

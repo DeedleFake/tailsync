@@ -189,7 +189,6 @@ func Encode(r io.Reader, sig *Signature) (*Delta, error) {
 			}
 			if !matched {
 				lit = append(lit, target[i:]...)
-				i = len(target)
 			}
 			break
 		}
@@ -284,10 +283,7 @@ func Apply(basis []byte, d *Delta) ([]byte, error) {
 			if start > len(basis) {
 				return nil, fmt.Errorf("copy block %d out of range", op.BlockIndex)
 			}
-			end := start + bs
-			if end > len(basis) {
-				end = len(basis)
-			}
+			end := min(start+bs, len(basis))
 			out = append(out, basis[start:end]...)
 		default:
 			return nil, fmt.Errorf("unknown op kind %d", op.Kind)

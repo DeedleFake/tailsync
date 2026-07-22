@@ -517,7 +517,6 @@ func (n *Node) Stop() (err error) {
 
 	n.mu.Lock()
 	phase := n.phase
-	cancel := n.cancel
 	finished := n.finished
 	n.mu.Unlock()
 
@@ -537,7 +536,7 @@ func (n *Node) Stop() (err error) {
 	if n.phase == phaseStarting || n.phase == phaseRunning {
 		n.phase = phaseStopping
 	}
-	cancel = n.cancel
+	cancel := n.cancel
 	finished = n.finished
 	n.mu.Unlock()
 
@@ -578,13 +577,13 @@ func (n *Node) waitFinished(finished chan struct{}) error {
 
 func validateConfig(cfg *Config) error {
 	if cfg.Dir == "" {
-		return errors.New("Dir is required")
+		return errors.New("dir is required")
 	}
 	if !filepath.IsAbs(cfg.Dir) {
-		return fmt.Errorf("Dir must be an absolute path: %q", cfg.Dir)
+		return fmt.Errorf("dir must be an absolute path: %q", cfg.Dir)
 	}
 	if cfg.StateDir != "" && !filepath.IsAbs(cfg.StateDir) {
-		return fmt.Errorf("StateDir must be an absolute path: %q", cfg.StateDir)
+		return fmt.Errorf("state dir must be an absolute path: %q", cfg.StateDir)
 	}
 	mode := effectiveNetMode(cfg.NetMode)
 	switch mode {
@@ -651,7 +650,7 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func()) (daemon.Confi
 
 	var peers []string
 	if cfg.Peers != "" {
-		for _, p := range strings.Split(cfg.Peers, ",") {
+		for p := range strings.SplitSeq(cfg.Peers, ",") {
 			p = strings.TrimSpace(p)
 			if p != "" {
 				peers = append(peers, p)

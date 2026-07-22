@@ -184,14 +184,14 @@ func (m *multiListener) loop(ln net.Listener) {
 			if closed || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// Retry temporary Accept errors (same idea as net/http.Server).
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			// Retry timeout Accept errors (net.Error.Temporary is deprecated).
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
 					tempDelay *= 2
 				}
-				if max := time.Second; tempDelay > max {
+				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
 				select {
@@ -436,13 +436,6 @@ func (d *Daemon) closeNetworkBackend() {
 		d.server = nil
 	}
 	d.local = nil
-}
-
-// closeListener closes the listener and backend. Prefer the split helpers from
-// Run so acceptLoop can exit before backend teardown; this remains for tests.
-func (d *Daemon) closeListener() {
-	d.closeNetListener()
-	d.closeNetworkBackend()
 }
 
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {

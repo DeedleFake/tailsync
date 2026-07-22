@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,7 +34,7 @@ type Entry struct {
 	// Deleted is true when this entry is a deletion tombstone.
 	Deleted bool `json:"deleted,omitempty"`
 	// DeletedAt is when the deletion was recorded (zero if not deleted).
-	DeletedAt time.Time `json:"deleted_at,omitempty"`
+	DeletedAt time.Time `json:"deleted_at"`
 	// UpdatedAt is when this entry last changed; used for LWW among peers.
 	// Callers should keep wall clocks roughly in sync (NTP); ties use a stable
 	// total order (see Wins).
@@ -123,9 +124,7 @@ func (idx *Index) Save() error {
 	path := idx.path
 	version := idx.version
 	files := make(map[string]Entry, len(idx.files))
-	for k, v := range idx.files {
-		files[k] = v
-	}
+	maps.Copy(files, idx.files)
 	idx.mu.RUnlock()
 	return writeIndexFile(path, version, files)
 }
@@ -234,9 +233,7 @@ func (idx *Index) All() map[string]Entry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	out := make(map[string]Entry, len(idx.files))
-	for k, v := range idx.files {
-		out[k] = v
-	}
+	maps.Copy(out, idx.files)
 	return out
 }
 
@@ -266,9 +263,7 @@ func (idx *Index) Clone() *Index {
 	defer idx.mu.RUnlock()
 	c := New()
 	c.version = idx.version
-	for k, v := range idx.files {
-		c.files[k] = v
-	}
+	maps.Copy(c.files, idx.files)
 	return c
 }
 
@@ -312,7 +307,7 @@ type ManifestEntry struct {
 	Mode      os.FileMode `json:"mode"`
 	Hash      string      `json:"hash,omitempty"`
 	Deleted   bool        `json:"deleted,omitempty"`
-	DeletedAt time.Time   `json:"deleted_at,omitempty"`
+	DeletedAt time.Time   `json:"deleted_at"`
 	UpdatedAt time.Time   `json:"updated_at"`
 }
 
@@ -322,16 +317,7 @@ func (idx *Index) Manifest() []ManifestEntry {
 	defer idx.mu.RUnlock()
 	out := make([]ManifestEntry, 0, len(idx.files))
 	for _, e := range idx.files {
-		out = append(out, ManifestEntry{
-			Path:      e.Path,
-			Size:      e.Size,
-			ModTime:   e.ModTime,
-			Mode:      e.Mode,
-			Hash:      e.Hash,
-			Deleted:   e.Deleted,
-			DeletedAt: e.DeletedAt,
-			UpdatedAt: e.UpdatedAt,
-		})
+		out = append(out, ManifestEntry(e))
 	}
 	return out
 }
@@ -393,14 +379,5 @@ func compareEntries(a, b Entry) int {
 
 // EntryFromManifest converts a ManifestEntry to Entry.
 func EntryFromManifest(m ManifestEntry) Entry {
-	return Entry{
-		Path:      m.Path,
-		Size:      m.Size,
-		ModTime:   m.ModTime,
-		Mode:      m.Mode,
-		Hash:      m.Hash,
-		Deleted:   m.Deleted,
-		DeletedAt: m.DeletedAt,
-		UpdatedAt: m.UpdatedAt,
-	}
+	return Entry(m)
 }

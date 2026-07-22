@@ -49,7 +49,7 @@ func TestConcurrentStartWithLeftoverFinished(t *testing.T) {
 	)
 	startGate := make(chan struct{})
 	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			<-startGate
@@ -171,14 +171,14 @@ func TestStartStopStartRace(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < rounds; i++ {
+		for range rounds {
 			_ = n.Start()
 			time.Sleep(time.Millisecond)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < rounds; i++ {
+		for range rounds {
 			_ = n.Stop()
 			time.Sleep(time.Millisecond)
 		}

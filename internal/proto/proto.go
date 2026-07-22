@@ -50,9 +50,9 @@ type Header struct {
 	Size    int64  `json:"size,omitempty"`
 	Error   string `json:"error,omitempty"`
 	// File metadata for transfers.
-	ModTime   time.Time `json:"mod_time,omitempty"`
+	ModTime   time.Time `json:"mod_time"`
 	Mode      uint32    `json:"mode,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 	Deleted   bool      `json:"deleted,omitempty"`
 	// Manifest entries (for TypeManifest).
 	Entries []index.ManifestEntry `json:"entries,omitempty"`

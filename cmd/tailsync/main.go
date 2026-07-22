@@ -69,7 +69,7 @@ func main() {
 
 	var peerList []string
 	if *peers != "" {
-		for _, p := range strings.Split(*peers, ",") {
+		for p := range strings.SplitSeq(*peers, ",") {
 			p = strings.TrimSpace(p)
 			if p != "" {
 				peerList = append(peerList, p)
