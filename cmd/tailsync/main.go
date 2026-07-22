@@ -17,18 +17,19 @@ import (
 
 func main() {
 	var (
-		dir          = flag.String("dir", "", "directory to synchronize (required)")
-		stateDir     = flag.String("state", "", "state directory for index and tsnet (default: <dir>/.tailsync)")
-		hostname     = flag.String("hostname", "", "tsnet hostname (default: tailsync-<os-hostname>)")
-		service      = flag.String("service", "", "optional discovery filter: only dial hosts whose name contains this substring (empty = all online peers)")
-		port         = flag.Int("port", 5960, "TCP port on the tailnet")
-		authKey      = flag.String("authkey", "", "Tailscale auth key (or set TS_AUTHKEY)")
-		scanEvery    = flag.Duration("scan-interval", 30*time.Second, "how often to rescan the local directory")
-		syncEvery    = flag.Duration("sync-interval", 45*time.Second, "how often to sync with peers")
-		blockSize    = flag.Int("block-size", 4096, "rsync-style block size for delta transfers")
-		peers        = flag.String("peers", "", "comma-separated peer addresses host:port (optional; default: discover via Tailscale)")
-		disableTSNet = flag.Bool("plain", false, "use plain TCP on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
-		verbose      = flag.Bool("v", false, "verbose debug logging")
+		dir       = flag.String("dir", "", "directory to synchronize (required)")
+		stateDir  = flag.String("state", "", "state directory for index (and tsnet state when -tsnet); default: <dir>/.tailsync")
+		hostname  = flag.String("hostname", "", "tsnet hostname when -tsnet (default: tailsync-<os-hostname>); ignored for protocol identity in host mode")
+		service   = flag.String("service", "", "optional discovery filter: only dial hosts whose name contains this substring (empty = all online peers)")
+		port      = flag.Int("port", 5960, "TCP port on the tailnet (or localhost with -plain)")
+		authKey   = flag.String("authkey", "", "Tailscale auth key for -tsnet (or set TS_AUTHKEY); unused in host mode")
+		scanEvery = flag.Duration("scan-interval", 30*time.Second, "how often to rescan the local directory")
+		syncEvery = flag.Duration("sync-interval", 45*time.Second, "how often to sync with peers")
+		blockSize = flag.Int("block-size", 4096, "rsync-style block size for delta transfers")
+		peers     = flag.String("peers", "", "comma-separated peer addresses host:port (optional; default: discover via Tailscale)")
+		useTSNet  = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
+		plain     = flag.Bool("plain", false, "use plain TCP on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
+		verbose   = flag.Bool("v", false, "verbose debug logging")
 	)
 	flag.Parse()
 
@@ -38,9 +39,21 @@ func main() {
 		os.Exit(2)
 	}
 
-	if *disableTSNet && os.Getenv("TAILSYNC_TESTING") != "1" {
+	if *plain && *useTSNet {
+		fmt.Fprintln(os.Stderr, "error: -plain and -tsnet are mutually exclusive")
+		os.Exit(2)
+	}
+	if *plain && os.Getenv("TAILSYNC_TESTING") != "1" {
 		fmt.Fprintln(os.Stderr, "error: -plain requires TAILSYNC_TESTING=1 (testing only)")
 		os.Exit(2)
+	}
+
+	mode := daemon.NetModeHost
+	switch {
+	case *plain:
+		mode = daemon.NetModePlain
+	case *useTSNet:
+		mode = daemon.NetModeTSNet
 	}
 
 	level := slog.LevelInfo
@@ -75,7 +88,7 @@ func main() {
 		SyncInterval: *syncEvery,
 		BlockSize:    *blockSize,
 		Logger:       log,
-		DisableTSNet: *disableTSNet,
+		NetMode:      mode,
 		Peers:        peerList,
 	}
 

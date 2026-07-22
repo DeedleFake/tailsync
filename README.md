@@ -18,13 +18,13 @@ go build -o tailsync ./cmd/tailsync
 
 ## Usage
 
-On each machine:
+On each machine (with [Tailscale](https://tailscale.com/) already running):
 
 ```bash
 tailsync -dir /path/to/shared
 ```
 
-The daemon joins your tailnet with [tsnet](https://pkg.go.dev/tailscale.com/tsnet) (hostname `tailsync-<os-hostname>` by default), listens on TCP port `5960`, and periodically:
+**By default**, tailsync uses the **host `tailscaled`** (LocalAPI). It does **not** register a separate machine in the admin console; it is just a process on the existing node. It binds TCP port `5960` on the host’s Tailscale IP(s) and periodically:
 
 1. Scans the sync directory and reconciles against the on-disk index (adds / modifies / offline deletions)
 2. Connects to online tailnet peers (or `-peers`) and merges remote manifests (last-writer-wins by `updated_at`)
@@ -33,38 +33,63 @@ Keep host clocks roughly in sync (NTP). LWW uses wall-clock `updated_at`; equal-
 
 **Metadata synced** for regular files: permission bits (`mode`) and modification time (`mtime`), including touch-only changes. Content hash and size are authoritative for file body. Access time (atime), ownership, xattrs, and ACLs are not synchronized.
 
+### Network modes
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| **host** (default) | *(none)* | Use system Tailscale daemon. Listen on host Tailscale IP(s) (IPv4 and IPv6 when bindable; failed address families are skipped). Dial peers by Tailscale IP (MagicDNS only if no IP is known). No auth key. Requires `tailscaled` running and logged in. |
+| **tsnet** | `-tsnet` | Embedded [tsnet](https://pkg.go.dev/tailscale.com/tsnet) node: registers a **separate** machine on the tailnet. Useful in containers without host Tailscale. Supports `-hostname` / `-authkey`. |
+| **plain** | `-plain` | Localhost TCP only (testing). Requires `TAILSYNC_TESTING=1`. |
+
 ### Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-dir` | (required) | Directory to synchronize |
-| `-state` | `<dir>/.tailsync` | Index + tsnet state directory |
-| `-hostname` | `tailsync-<os-hostname>` | tsnet hostname on the tailnet |
-| `-service` | (empty) | Optional discovery filter: only dial peers whose hostname/DNS **contains** this substring; empty means all online peers |
+| `-state` | `<dir>/.tailsync` | Index directory (also holds tsnet state when `-tsnet`) |
+| `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname on the tailnet; in host mode identity comes from LocalAPI Self |
+| `-service` | (empty) | Optional discovery filter: only dial peers whose hostname/DNS **contains** this substring; empty means **all** online tailnet peers (see note below) |
 | `-port` | `5960` | TCP port for peer connections |
-| `-authkey` | `$TS_AUTHKEY` | Tailscale auth key (optional if state already exists) |
+| `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
 | `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery) |
 | `-scan-interval` | `30s` | Local directory rescan period |
 | `-sync-interval` | `45s` | Peer sync period |
 | `-block-size` | `4096` | Delta block size |
+| `-tsnet` | `false` | Use embedded tsnet node instead of host tailscaled |
 | `-plain` | `false` | Plain TCP on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
 | `-v` | `false` | Debug logging |
+
+`-plain` and `-tsnet` are mutually exclusive.
 
 ### Example (two machines on a tailnet)
 
 ```bash
-# machine a
-tailsync -dir ~/shared -hostname tailsync-a
+# machine a (uses that host's Tailscale identity)
+tailsync -dir ~/shared
 
 # machine b
-tailsync -dir ~/shared -hostname tailsync-b
+tailsync -dir ~/shared
 ```
 
-Peers are dialed via MagicDNS / Tailscale IPs on `-port`. By default every online tailnet peer is considered; set `-service tailsync` to only dial names containing that substring (useful if default hostnames are `tailsync-*`). Custom `-hostname` values do not need a service filter unless you want one. To pin addresses:
+Peers are dialed on `-port` using Tailscale IPs from LocalAPI status (falls back to MagicDNS names when a peer has no IP in status). By default **every online tailnet peer** is dialed each sync interval—including phones, TVs, and unrelated servers. That is fine on small personal tailnets; on larger ones prefer:
+
+- `-service <substring>` to only dial hosts whose Tailscale hostname/DNS contains that string (e.g. `-service tailsync` with `-tsnet` names `tailsync-*`), or
+- `-peers host:port,...` to pin exact addresses and skip discovery entirely.
 
 ```bash
-tailsync -dir ~/shared -peers tailsync-a:5960,100.x.y.z:5960
+tailsync -dir ~/shared -peers other-host:5960,100.x.y.z:5960
 ```
+
+### Embedded tsnet (optional)
+
+When the host has no Tailscale daemon (e.g. some containers):
+
+```bash
+tailsync -tsnet -dir ~/shared -hostname tailsync-a
+# optional: -authkey $TS_AUTHKEY
+```
+
+This registers a separate node named with `-hostname` (default `tailsync-<os-hostname>`).
 
 ### Local testing without Tailscale
 
@@ -86,6 +111,7 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single TCP session
 - **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge
 - **Metadata** — Mode and mtime are synchronized end-to-end (scan detects mode-only and touch-only changes; peers adopt metadata when same content hash wins LWW)
+- **Networking** — Default host mode binds only to Tailscale addresses (not `0.0.0.0`), discovers peers via LocalAPI status, and dials with the host network stack (routed by tailscaled)
 
 State under the sync tree named `.tailsync` / `.tailsync-*` is ignored by the scanner.
 

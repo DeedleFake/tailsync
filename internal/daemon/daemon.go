@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
 	"deedles.dev/tailsync/internal/atomicfile"
@@ -35,17 +36,24 @@ const DefaultMaxFileBytes = 64 << 20 // 64 MiB
 type Config struct {
 	// Dir is the directory to synchronize (required).
 	Dir string
-	// StateDir holds the index and tsnet state. Defaults to Dir/.tailsync.
+	// StateDir holds the index and, when NetMode is NetModeTSNet, tsnet state.
+	// Defaults to Dir/.tailsync.
 	StateDir string
-	// Hostname is the tsnet hostname advertised on the tailnet.
+	// Hostname is the protocol / tsnet node name.
+	//   - NetModeTSNet: advertised tsnet hostname (default tailsync-<os-hostname>).
+	//   - NetModeHost: always overwritten from LocalAPI Self (MagicDNS → HostName →
+	//     StableID); any configured value is ignored for protocol identity.
+	//   - NetModePlain: wire-protocol node id when set.
 	Hostname string
 	// ServiceName, when non-empty, filters discovered peers to those whose
 	// HostName or DNSName contains this substring (not a path prefix).
-	// Empty means dial all online tailnet peers except self. Ignored when Peers is set.
+	// Empty means dial all online tailnet peers except self (on large tailnets
+	// prefer setting this or -peers). Ignored when Peers is set.
 	ServiceName string
-	// Port is the TCP port to listen on over the tailnet.
+	// Port is the TCP port to listen on over the tailnet (or localhost in plain mode).
 	Port int
-	// AuthKey is an optional Tailscale auth key (else interactive / existing state).
+	// AuthKey is an optional Tailscale auth key for NetModeTSNet
+	// (else interactive login / existing tsnet state). Unused in host mode.
 	AuthKey string
 	// ScanInterval is how often to rescan the local directory.
 	ScanInterval time.Duration
@@ -59,13 +67,12 @@ type Config struct {
 	TombstoneTTL time.Duration
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
-	// DisableTSNet runs on plain TCP localhost (for tests); still binds to Port.
-	// Prefer false in production so traffic stays on the tailnet.
-	DisableTSNet bool
-	// ListenHost is used when DisableTSNet is true (default 127.0.0.1).
+	// NetMode selects networking: host (default), tsnet, or plain. See NetMode constants.
+	NetMode NetMode
+	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port). When empty,
-	// peers are discovered from the Tailscale status (online nodes other than self).
+	// peers are discovered from Tailscale status (online nodes other than self).
 	Peers []string
 }
 
@@ -74,7 +81,8 @@ type Daemon struct {
 	cfg    Config
 	log    *slog.Logger
 	idx    *index.Index
-	server *tsnet.Server
+	server *tsnet.Server // NetModeTSNet only
+	local  *local.Client // NetModeHost
 	ln     net.Listener
 
 	// syncMu serializes local reconcile and remote apply so scan→apply and
@@ -112,12 +120,18 @@ func New(cfg Config) (*Daemon, error) {
 			return nil, fmt.Errorf("resolve state dir: %w", err)
 		}
 	}
-	if cfg.Hostname == "" {
+	// Hostname defaults for tsnet (advertised name) and plain (protocol id).
+	// Host mode fills identity from LocalAPI during listen when empty.
+	if cfg.Hostname == "" && cfg.NetMode != NetModeHost {
 		host, _ := os.Hostname()
 		if host == "" {
 			host = "tailsync"
 		}
-		cfg.Hostname = "tailsync-" + host
+		if cfg.NetMode == NetModeTSNet {
+			cfg.Hostname = "tailsync-" + host
+		} else {
+			cfg.Hostname = host
+		}
 	}
 	// ServiceName stays empty by default: discover all online peers.
 	if cfg.Port == 0 {
@@ -168,6 +182,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("load index: %w", err)
 	}
 	d.idx = idx
+	// nodeID may be refined during listen (host mode uses LocalAPI Self).
 	d.nodeID = d.cfg.Hostname
 
 	// Initial reconcile: detect offline deletions and local changes.
@@ -183,8 +198,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.log.Info("tailsync started",
 		"dir", d.cfg.Dir,
 		"state", d.cfg.StateDir,
-		"hostname", d.cfg.Hostname,
+		"hostname", d.nodeID,
 		"port", d.cfg.Port,
+		"net_mode", d.cfg.NetMode.String(),
 		"index_entries", d.idx.Len(),
 		"max_file_bytes", d.cfg.MaxFileBytes,
 	)
@@ -224,53 +240,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-syncTick.C:
 			d.syncPeers(ctx)
 		}
-	}
-}
-
-func (d *Daemon) listen(ctx context.Context) error {
-	addr := fmt.Sprintf(":%d", d.cfg.Port)
-	if d.cfg.DisableTSNet {
-		host := d.cfg.ListenHost
-		ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, d.cfg.Port))
-		if err != nil {
-			return fmt.Errorf("listen %s:%d: %w", host, d.cfg.Port, err)
-		}
-		d.ln = ln
-		d.log.Info("listening (plain TCP)", "addr", ln.Addr().String())
-		return nil
-	}
-
-	s := &tsnet.Server{
-		Dir:      filepath.Join(d.cfg.StateDir, "tsnet"),
-		Hostname: d.cfg.Hostname,
-		AuthKey:  d.cfg.AuthKey,
-		Logf: func(format string, args ...any) {
-			d.log.Debug(fmt.Sprintf(format, args...), "component", "tsnet")
-		},
-	}
-	d.server = s
-
-	// Start tsnet early so status/dial work.
-	if _, err := s.Up(ctx); err != nil {
-		return fmt.Errorf("tsnet up: %w", err)
-	}
-
-	ln, err := s.Listen("tcp", addr)
-	if err != nil {
-		_ = s.Close()
-		return fmt.Errorf("tsnet listen %s: %w", addr, err)
-	}
-	d.ln = ln
-	d.log.Info("listening on tailnet", "addr", ln.Addr().String(), "hostname", d.cfg.Hostname)
-	return nil
-}
-
-func (d *Daemon) closeListener() {
-	if d.ln != nil {
-		_ = d.ln.Close()
-	}
-	if d.server != nil {
-		_ = d.server.Close()
 	}
 }
 
@@ -585,67 +554,6 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 		d.peerSeen[addr] = time.Now()
 		d.mu.Unlock()
 	}
-}
-
-func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
-	if len(d.cfg.Peers) > 0 {
-		return append([]string(nil), d.cfg.Peers...), nil
-	}
-	if d.cfg.DisableTSNet || d.server == nil {
-		return nil, nil
-	}
-	lc, err := d.server.LocalClient()
-	if err != nil {
-		return nil, err
-	}
-	st, err := lc.Status(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var addrs []string
-	self := ""
-	if st.Self != nil {
-		self = string(st.Self.ID)
-	}
-	svc := strings.ToLower(d.cfg.ServiceName)
-	for _, p := range st.Peer {
-		if p == nil || !p.Online {
-			continue
-		}
-		if string(p.ID) == self {
-			continue
-		}
-		// Prefer DNSName (MagicDNS); strip trailing dot.
-		host := strings.TrimSuffix(p.DNSName, ".")
-		if host == "" && len(p.TailscaleIPs) > 0 {
-			host = p.TailscaleIPs[0].String()
-		}
-		if host == "" {
-			continue
-		}
-		// Skip ourselves by hostname too.
-		if strings.EqualFold(p.HostName, d.cfg.Hostname) || strings.HasPrefix(host, d.cfg.Hostname+".") {
-			continue
-		}
-		// Filter by service name substring when discovering (avoids dialing unrelated nodes).
-		if svc != "" {
-			hn := strings.ToLower(p.HostName)
-			dn := strings.ToLower(host)
-			if !strings.Contains(hn, svc) && !strings.Contains(dn, svc) {
-				continue
-			}
-		}
-		addrs = append(addrs, fmt.Sprintf("%s:%d", host, d.cfg.Port))
-	}
-	return addrs, nil
-}
-
-func (d *Daemon) dial(ctx context.Context, addr string) (net.Conn, error) {
-	if d.cfg.DisableTSNet || d.server == nil {
-		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
-	}
-	return d.server.Dial(ctx, "tcp", addr)
 }
 
 func (d *Daemon) syncWith(ctx context.Context, addr string) error {
