@@ -418,16 +418,31 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	return nil
 }
 
-func (d *Daemon) closeListener() {
+// closeNetListener closes the TCP listener so Accept unblocks. Idempotent.
+// Does not nil d.ln until closeNetworkBackend so a late field read is non-nil
+// if any code still observes it; acceptLoop uses a captured listener value.
+func (d *Daemon) closeNetListener() {
 	if d.ln != nil {
 		_ = d.ln.Close()
-		d.ln = nil
 	}
+}
+
+// closeNetworkBackend tears down tsnet/local clients and clears listener state.
+// Call only after acceptLoop has exited (so no concurrent Accept on d.ln).
+func (d *Daemon) closeNetworkBackend() {
+	d.ln = nil
 	if d.server != nil {
 		_ = d.server.Close()
 		d.server = nil
 	}
 	d.local = nil
+}
+
+// closeListener closes the listener and backend. Prefer the split helpers from
+// Run so acceptLoop can exit before backend teardown; this remains for tests.
+func (d *Daemon) closeListener() {
+	d.closeNetListener()
+	d.closeNetworkBackend()
 }
 
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {

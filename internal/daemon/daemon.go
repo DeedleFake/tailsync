@@ -74,6 +74,10 @@ type Config struct {
 	// Peers is an optional explicit list of peer addresses (host:port). When empty,
 	// peers are discovered from Tailscale status (online nodes other than self).
 	Peers []string
+	// OnReady, if non-nil, is called once after the daemon is listening and before
+	// the main loop. Used by library wrappers (e.g. mobile) so Start can wait for
+	// listen success or a fast failure. Must not block indefinitely.
+	OnReady func()
 }
 
 // Daemon is the synchronization service.
@@ -193,7 +197,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.listen(ctx); err != nil {
 		return err
 	}
-	defer d.closeListener()
+
+	// Capture listener for acceptLoop so Close/nil of d.ln cannot race Accept.
+	ln := d.ln
+	acceptDone := make(chan struct{})
+	var acceptErr error
+	go func() {
+		defer close(acceptDone)
+		acceptErr = d.acceptLoop(ctx, ln)
+	}()
+
+	// On every exit path: close the listener to unblock Accept, wait for the
+	// accept goroutine to finish, then tear down tsnet/local client state.
+	// Never nil d.ln while acceptLoop may still call Accept on a shared field.
+	defer func() {
+		d.closeNetListener()
+		<-acceptDone
+		d.closeNetworkBackend()
+	}()
 
 	d.log.Info("tailsync started",
 		"dir", d.cfg.Dir,
@@ -204,11 +225,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"index_entries", d.idx.Len(),
 		"max_file_bytes", d.cfg.MaxFileBytes,
 	)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.acceptLoop(ctx)
-	}()
+	if d.cfg.OnReady != nil {
+		d.cfg.OnReady()
+	}
 
 	scanTick := time.NewTicker(d.cfg.ScanInterval)
 	defer scanTick.Stop()
@@ -228,9 +247,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			d.syncMu.Unlock()
 			return nil
-		case err := <-errCh:
-			if err != nil && ctx.Err() == nil {
-				return err
+		case <-acceptDone:
+			if acceptErr != nil && ctx.Err() == nil {
+				return acceptErr
 			}
 			return nil
 		case <-scanTick.C:
@@ -243,19 +262,39 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-func (d *Daemon) acceptLoop(ctx context.Context) error {
+// acceptLoop accepts connections on ln until ln is closed or a fatal Accept
+// error occurs. ln must be non-nil and remain valid for the duration (caller
+// closes it to unblock, then waits for this function to return).
+func (d *Daemon) acceptLoop(ctx context.Context, ln net.Listener) error {
+	if ln == nil {
+		return nil
+	}
 	for {
-		conn, err := d.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			// Closed listener and/or cancelled context are normal shutdown.
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
-			default:
-				return fmt.Errorf("accept: %w", err)
 			}
+			// Some platforms wrap closed-listener errors without net.ErrClosed.
+			if isListenerClosedErr(err) {
+				return nil
+			}
+			return fmt.Errorf("accept: %w", err)
 		}
 		go d.handleConn(ctx, conn)
 	}
+}
+
+func isListenerClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net.ErrClosed and "use of closed network connection" variants.
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "listener closed") ||
+		strings.Contains(msg, "server closed")
 }
 
 func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {

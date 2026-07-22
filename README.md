@@ -115,6 +115,93 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 
 State under the sync tree named `.tailsync` / `.tailsync-*` is ignored by the scanner.
 
+## Android / gomobile
+
+The desktop CLI (`cmd/tailsync`) is unchanged. Android apps should embed tailsync via **gomobile** using the bindable package `deedles.dev/tailsync/mobile`.
+
+Mobile defaults to **tsnet** (embedded Tailscale node). Host LocalAPI mode is desktop-oriented and not typical on Android. The Kotlin app owns lifecycle (Start/Stop), usually from a foreground service, and must pass **absolute, writable** paths (e.g. app-private storage).
+
+### Bind (AAR)
+
+Requires [gomobile](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile) and an Android NDK/SDK. Not required for `go test`.
+
+```bash
+# once per machine
+go install golang.org/x/mobile/cmd/gomobile@latest
+gomobile init
+
+# from a checkout of this module (or with the module on GOPATH/module cache)
+gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
+```
+
+Optional verify when the Android toolchain is present:
+
+```bash
+gomobile bind -target=android -o /tmp/tailsync.aar deedles.dev/tailsync/mobile
+```
+
+### API sketch
+
+| Go | Role |
+|----|------|
+| `Config` | Bindable fields: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `BlockSize`, `NetMode` |
+| `NewNode(cfg)` | Validate config; returns a stopped `Node` |
+| `Node.Start()` / `Stop()` / `IsRunning()` | Lifecycle; Start blocks until listen succeeds or fails. Call off the main thread. |
+| `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs + status); **must be non-blocking** |
+| `Node.StatusJSON()` | Snapshot for UI (never includes `AuthKey`; zeros shown as effective defaults; includes `phase`) |
+| `Version()` | Module/build version string |
+
+`NetMode`: `"tsnet"` (default), `"host"` (desktop), `"plain"` (**testing only**, localhost TCP).
+
+`IsRunning()` is true while starting, serving, or stopping (resources may still be held after a timed-out `Stop`). `StatusJSON.running` is true only while serving after a successful Start. `phase` is `idle` \| `starting` \| `running` \| `stopping`.
+
+### Kotlin usage (sketch)
+
+```kotlin
+// After adding tailsync.aar to the Android app module.
+val cfg = Config().apply {
+    dir = context.filesDir.resolve("sync").absolutePath
+    stateDir = context.filesDir.resolve("tailsync-state").absolutePath
+    hostname = "tailsync-phone"
+    authKey = BuildConfig.TS_AUTHKEY // prefer a reusable auth key
+    // netMode defaults to "tsnet"
+}
+val node = Mobile.newNode(cfg)
+val mainHandler = Handler(Looper.getMainLooper())
+node.setListener(EventListener { eventJSON ->
+    // Called from a Go background thread — keep this fast (no network/disk/UI).
+    // Hop to main only if you need to update UI.
+    mainHandler.post {
+        // parse JSON: type=log|status|error
+        Log.i("tailsync", eventJSON)
+    }
+})
+
+// From a foreground service — never call start() on the Android main thread
+// (tsnet bring-up can block long enough to ANR).
+serviceScope.launch(Dispatchers.IO) {
+    try {
+        node.start() // blocks until listening or failure
+    } catch (e: Exception) {
+        Log.e("tailsync", "start failed", e)
+    }
+}
+// ...
+serviceScope.launch(Dispatchers.IO) {
+    node.stop() // no-op if already stopped; safe from onDestroy
+}
+```
+
+**Notes**
+
+- Requires a Tailscale **auth key** (or existing tsnet state under `StateDir`) for first registration.
+- Paths must be absolute and writable by the app process.
+- The app owns Start/Stop; call `Stop` when the service is destroyed so the embedded node and goroutines exit.
+- **Threading:** `start()` / `stop()` off the main thread; `OnEvent` non-blocking (post to main for UI only).
+- Do not log or ship auth keys; mobile events redact secret-like **attribute keys** (free-text log messages are not scrubbed).
+- Zero `Port` / interval / `BlockSize` mean daemon defaults; `StatusJSON` reports effective values (e.g. port 5960).
+- `go test ./...` does not need the Android SDK; plain-mode tests exercise the mobile API on localhost.
+
 ## Development
 
 ```bash

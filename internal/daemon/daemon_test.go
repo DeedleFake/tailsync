@@ -2,9 +2,11 @@ package daemon_test
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,5 +260,63 @@ func TestReconcileOfflineDeleteViaIndex(t *testing.T) {
 	}
 	if len(res.Changes) != 1 || res.Changes[0].Kind != scan.Deleted {
 		t.Fatalf("%+v", res.Changes)
+	}
+}
+
+// TestRunCancelAcceptLoopRace starts a plain daemon, waits until listening,
+// then cancels — repeated to exercise acceptLoop vs listener close (race clean).
+func TestRunCancelAcceptLoopRace(t *testing.T) {
+	for i := 0; i < 30; i++ {
+		dir := t.TempDir()
+		state := t.TempDir()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+
+		ready := make(chan struct{})
+		var readyOnce sync.Once
+		d, err := daemon.New(daemon.Config{
+			Dir:          dir,
+			StateDir:     state,
+			Hostname:     "race-" + strconv.Itoa(i),
+			Port:         port,
+			NetMode:      daemon.NetModePlain,
+			ListenHost:   "127.0.0.1",
+			ScanInterval: time.Hour,
+			SyncInterval: time.Hour,
+			OnReady: func() {
+				readyOnce.Do(func() { close(ready) })
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() { errCh <- d.Run(ctx) }()
+
+		select {
+		case <-ready:
+		case err := <-errCh:
+			cancel()
+			t.Fatalf("iter %d: Run exited before ready: %v", i, err)
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("iter %d: timeout waiting for ready", i)
+		}
+
+		cancel()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("iter %d: Run after cancel: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d: Run did not exit after cancel", i)
+		}
 	}
 }
