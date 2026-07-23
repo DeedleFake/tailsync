@@ -30,3 +30,10 @@ func TestIsTransportErr(t *testing.T) {
 		t.Fatal("plain string with read must not be transport")
 	}
 }
+
+func TestUnexpectedMsgType(t *testing.T) {
+	err := fmt.Errorf("%w %q", errUnexpectedMsgType, "sig_req")
+	if !errors.Is(err, errUnexpectedMsgType) {
+		t.Fatal("want errors.Is unexpected message type")
+	}
+}

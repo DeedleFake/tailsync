@@ -10,10 +10,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/pathutil"
 )
 
 // ChangeKind classifies a local filesystem change relative to the index.
@@ -168,10 +168,9 @@ func Scan(ctx context.Context, root *os.Root, idx *index.Index, opts *Options) (
 		// fs.WalkDir paths are slash-separated and relative to the FS root.
 		rel = filepath.ToSlash(rel)
 
-		// Skip hidden state directories at the root of the sync tree.
+		// Skip reserved state directories anywhere in the sync tree.
 		if d.IsDir() {
-			base := filepath.Base(rel)
-			if base == ".tailsync" || strings.HasPrefix(base, ".tailsync-") {
+			if pathutil.IsReservedComponent(filepath.Base(rel)) {
 				return fs.SkipDir
 			}
 			return nil

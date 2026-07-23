@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
+
+	"deedles.dev/tailsync/internal/atomicfile"
 )
 
 // Version is the on-disk schema version.
@@ -42,6 +43,13 @@ type Entry struct {
 }
 
 // Index is a thread-safe map of relative path → Entry, backed by a JSON file.
+//
+// Locking: Index uses its own RWMutex for all map access. The daemon holds a
+// separate syncMu around multi-step reconcile/apply so scan→apply and
+// pull→commit stay atomic relative to each other. Holding the daemon lock does
+// not replace Index.mu; methods here still lock. Callers that need a frozen
+// multi-step view relative to disk must serialize at a higher layer (daemon
+// syncMu) in addition to relying on these internal locks.
 type Index struct {
 	mu      sync.RWMutex
 	version int
@@ -140,37 +148,9 @@ func writeIndexFile(path string, version int, files map[string]Entry) error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create index dir: %w", err)
+	if err := atomicfile.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write index: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".tailsync-index-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp index: %w", err)
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp index: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temp index: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp index: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename index: %w", err)
-	}
-	cleanup = false
 	return nil
 }
 
@@ -299,17 +279,9 @@ func (idx *Index) GCTombstones(now time.Time, ttl time.Duration) int {
 	return n
 }
 
-// ManifestEntry is a compact view exchanged with peers.
-type ManifestEntry struct {
-	Path      string      `json:"path"`
-	Size      int64       `json:"size"`
-	ModTime   time.Time   `json:"mod_time"`
-	Mode      os.FileMode `json:"mode"`
-	Hash      string      `json:"hash,omitempty"`
-	Deleted   bool        `json:"deleted,omitempty"`
-	DeletedAt time.Time   `json:"deleted_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-}
+// ManifestEntry is the wire/peer view of an index entry. It is a type alias of
+// Entry so JSON field names stay identical on the wire.
+type ManifestEntry = Entry
 
 // Manifest returns all entries as a list suitable for peer exchange.
 func (idx *Index) Manifest() []ManifestEntry {
@@ -317,7 +289,7 @@ func (idx *Index) Manifest() []ManifestEntry {
 	defer idx.mu.RUnlock()
 	out := make([]ManifestEntry, 0, len(idx.files))
 	for _, e := range idx.files {
-		out = append(out, ManifestEntry(e))
+		out = append(out, e)
 	}
 	return out
 }
@@ -377,7 +349,7 @@ func compareEntries(a, b Entry) int {
 	return 0
 }
 
-// EntryFromManifest converts a ManifestEntry to Entry.
+// EntryFromManifest converts a ManifestEntry to Entry (identity; kept for call sites).
 func EntryFromManifest(m ManifestEntry) Entry {
-	return Entry(m)
+	return m
 }

@@ -1,4 +1,4 @@
-// Package atomicfile writes files atomically via temp file + renames under an [os.Root].
+// Package atomicfile writes files atomically via temp file + rename.
 package atomicfile
 
 import (
@@ -10,6 +10,53 @@ import (
 	"path"
 	"path/filepath"
 )
+
+// WriteFile writes data to path using a temporary file in the same directory
+// then renaming into place. Parent directories are created as needed. mode is
+// applied to the final file (default 0o644 if zero).
+//
+// Prefer [WriteFileRoot] for paths under a sync tree; this helper is for
+// absolute paths outside an [os.Root] (for example the index under StateDir).
+func WriteFile(name string, data []byte, mode os.FileMode) error {
+	if mode == 0 {
+		mode = 0o644
+	}
+	dir := filepath.Dir(name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".tailsync-write-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, name); err != nil {
+		return fmt.Errorf("rename temp to %s: %w", name, err)
+	}
+	cleanup = false
+	return nil
+}
 
 // WriteFileRoot writes data to a path relative to root using a temporary file
 // in the same directory then renaming into place. Parent directories are created

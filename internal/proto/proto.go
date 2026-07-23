@@ -28,17 +28,18 @@ const (
 	TypeManifestReq Type = "manifest_req"
 	TypeFileReq     Type = "file_req"
 	TypeFileData    Type = "file_data"
-	TypeSigReq      Type = "sig_req"   // request signature of remote's file (for delta)
-	TypeSig         Type = "sig"       // signature payload
-	TypeDeltaReq    Type = "delta_req" // request delta given our signature
-	TypeDelta       Type = "delta"     // delta payload
-	TypeError       Type = "error"
-	TypePing        Type = "ping"
-	TypePong        Type = "pong"
+	// Delta path: client sends its local block signature; server returns a delta.
+	// (Older TypeSigReq/TypeSig half of the protocol was removed; clients never
+	// requested the peer's signature — only TypeDeltaReq is used.)
+	TypeDeltaReq Type = "delta_req"
+	TypeDelta    Type = "delta"
+	TypeError    Type = "error"
+	TypePing     Type = "ping"
+	TypePong     Type = "pong"
 )
 
 // Header is the JSON envelope for every message. Binary payload follows when
-// PayloadLen > 0 (FileData, Sig, Delta).
+// PayloadLen > 0 (FileData, Delta).
 type Header struct {
 	Type       Type `json:"type"`
 	PayloadLen int  `json:"payload_len,omitempty"`
@@ -186,27 +187,6 @@ func NewFileData(path string, e index.Entry, data []byte) Message {
 			UpdatedAt: e.UpdatedAt,
 		},
 		Payload: data,
-	}
-}
-
-// NewSigReq requests a block signature for path from the peer.
-func NewSigReq(path string, blockSize int) Message {
-	return Message{Header: Header{
-		Type:      TypeSigReq,
-		Path:      path,
-		BlockSize: blockSize,
-	}}
-}
-
-// NewSig sends a signature payload.
-func NewSig(path string, blockSize int, sig []byte) Message {
-	return Message{
-		Header: Header{
-			Type:      TypeSig,
-			Path:      path,
-			BlockSize: blockSize,
-		},
-		Payload: sig,
 	}
 }
 

@@ -38,31 +38,11 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"deedles.dev/tailsync/internal/daemon"
 	"deedles.dev/tailsync/internal/delta"
 )
-
-// stopTimeout is how long Stop waits for the daemon goroutine to exit.
-const stopTimeout = 30 * time.Second
-
-// Daemon defaults mirrored for StatusJSON when config fields are zero.
-// Keep in sync with internal/daemon.New defaults.
-const (
-	defaultPort           = 5960
-	defaultScanIntervalMs = 30_000
-	defaultSyncIntervalMs = 45_000
-)
-
-// afterStartClaim is an optional test hook invoked after Start claims exclusive
-// ownership (phaseStarting + cancel/finished installed) and before daemon
-// construction. Production code leaves this nil.
-var afterStartClaim func()
-
-// errStartAborted is used when Stop (or ownership loss) aborts Start before ready.
-var errStartAborted = errors.New("start aborted")
 
 // Config holds bindable configuration. All exported fields use types gomobile
 // can bind (string, bool, int, int64).
@@ -71,8 +51,7 @@ var errStartAborted = errors.New("start aborted")
 // be absolute; otherwise it defaults to Dir/.tailsync (resolved by the daemon).
 //
 // Zero values for Port, ScanIntervalMs, SyncIntervalMs, and BlockSize mean
-// “use daemon defaults” (5960, 30s, 45s, delta default block size). StatusJSON
-// reports those effective defaults.
+// “use daemon defaults”. StatusJSON reports those effective defaults.
 type Config struct {
 	// Dir is the absolute path to the sync root (required).
 	Dir string
@@ -82,15 +61,15 @@ type Config struct {
 	Hostname string
 	// AuthKey is a Tailscale auth key for tsnet registration.
 	AuthKey string
-	// Port is the TCP listen/dial port (0 = daemon default 5960).
+	// Port is the TCP listen/dial port (0 = daemon default).
 	Port int
 	// Peers is a comma-separated list of host:port peers (optional; empty = discovery).
 	Peers string
 	// ServiceName filters discovered peers by hostname/DNS substring.
 	ServiceName string
-	// ScanIntervalMs is the local rescan period in milliseconds (0 = default 30000).
+	// ScanIntervalMs is the local rescan period in milliseconds (0 = default).
 	ScanIntervalMs int64
-	// SyncIntervalMs is the peer sync period in milliseconds (0 = default 45000).
+	// SyncIntervalMs is the peer sync period in milliseconds (0 = default).
 	SyncIntervalMs int64
 	// BlockSize is the delta block size (0 = default).
 	BlockSize int
@@ -113,39 +92,10 @@ type EventListener interface {
 	OnEvent(eventJSON string)
 }
 
-// nodePhase is the lifecycle state of a Node.
-type nodePhase int
-
-const (
-	phaseIdle nodePhase = iota
-	phaseStarting
-	phaseRunning
-	phaseStopping
-)
-
-func (p nodePhase) String() string {
-	switch p {
-	case phaseIdle:
-		return "idle"
-	case phaseStarting:
-		return "starting"
-	case phaseRunning:
-		return "running"
-	case phaseStopping:
-		return "stopping"
-	default:
-		return fmt.Sprintf("phase(%d)", int(p))
-	}
-}
-
 // Node is a long-lived sync instance. Construct with NewNode, then Start/Stop
 // from the app lifecycle (e.g. a foreground service).
 //
-// Ownership invariant: when phase is starting, running, or stopping, cancel,
-// ctx, and finished are non-nil for that run. finished is closed exactly once
-// when the run ends; cancel/finished/ctx are cleared under mu in the same
-// critical section as phase→idle. There is never a phaseIdle window with a
-// live daemon that Stop cannot cancel.
+// See lifecycle.go for ownership invariants (generation counter + phase machine).
 type Node struct {
 	cfg Config
 
@@ -153,10 +103,13 @@ type Node struct {
 	phase    nodePhase
 	listener EventListener
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	finished chan struct{} // closed when the active run ends
-	runErr   error         // set before finished is closed
+	// gen is incremented on each claimStart; finish only clears matching gen.
+	gen        uint64
+	ctx        context.Context
+	cancel     context.CancelFunc
+	finished   chan struct{} // closed when ownership ends (per generation)
+	workerDone chan struct{} // closed when Run/abort fully done (per generation)
+	runErr     error         // set before finished is closed
 }
 
 // Version returns the module version from build info when available.
@@ -253,328 +206,6 @@ func (n *Node) StatusJSON() (string, error) {
 	return string(b), nil
 }
 
-// Start starts the daemon and blocks until the node is listening or startup
-// fails. Concurrent or double Start returns an error. After a successful Stop
-// (or daemon exit), Start may be called again.
-//
-// For NetMode "tsnet", this may take a while (tailnet bring-up / auth). Call
-// off the main thread on Android.
-func (n *Node) Start() (err error) {
-	if n == nil {
-		return errors.New("nil node")
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("start panic: %v", r)
-		}
-	}()
-
-	ctx, finished, cfg, err := n.claimStart()
-	if err != nil {
-		return err
-	}
-
-	// finish ends this run exactly once: clears ownership under mu and closes
-	// finished so Stop/waiters unblock.
-	var finishOnce sync.Once
-	finish := func(runErr error, wasReady bool) {
-		finishOnce.Do(func() {
-			n.mu.Lock()
-			if n.finished == finished {
-				n.runErr = runErr
-				n.ctx = nil
-				n.cancel = nil
-				n.finished = nil
-				n.phase = phaseIdle
-			}
-			n.mu.Unlock()
-			close(finished)
-
-			if wasReady {
-				if runErr != nil && !errors.Is(runErr, context.Canceled) {
-					n.emitEvent(map[string]any{
-						"type":  "error",
-						"msg":   runErr.Error(),
-						"phase": "run",
-					})
-				}
-				n.emitEvent(map[string]any{
-					"type":    "status",
-					"running": false,
-					"msg":     "stopped",
-				})
-			}
-		})
-	}
-
-	if afterStartClaim != nil {
-		afterStartClaim()
-	}
-
-	if !n.ownsStart(finished) {
-		finish(errStartAborted, false)
-		return errStartAborted
-	}
-
-	log := slog.New(newEventHandler(n))
-	ready := make(chan struct{})
-	var readyOnce sync.Once
-	var reachedReady atomic.Bool
-	onReady := func() {
-		readyOnce.Do(func() {
-			reachedReady.Store(true)
-			close(ready)
-		})
-	}
-
-	dc, err := toDaemonConfig(&cfg, log, onReady)
-	if err != nil {
-		finish(err, false)
-		return err
-	}
-	d, err := daemon.New(dc)
-	if err != nil {
-		finish(err, false)
-		return err
-	}
-
-	if !n.ownsStart(finished) {
-		finish(errStartAborted, false)
-		return errStartAborted
-	}
-
-	// Always launch while we own finished so Stop's wait is satisfied.
-	go func() {
-		var runErr error
-		defer func() {
-			if r := recover(); r != nil {
-				runErr = fmt.Errorf("daemon panic: %v", r)
-			}
-			finish(runErr, reachedReady.Load())
-		}()
-		if err := ctx.Err(); err != nil {
-			runErr = err
-			return
-		}
-		runErr = d.Run(ctx)
-	}()
-
-	select {
-	case <-ready:
-		n.mu.Lock()
-		select {
-		case <-finished:
-			err := n.runErr
-			n.mu.Unlock()
-			if err == nil {
-				err = errors.New("daemon exited immediately after ready")
-			}
-			if errors.Is(err, context.Canceled) || errors.Is(err, errStartAborted) {
-				return errStartAborted
-			}
-			return err
-		default:
-		}
-		if n.finished != finished {
-			n.mu.Unlock()
-			return errStartAborted
-		}
-		// Promote starting→running only; leave stopping as-is.
-		if n.phase == phaseStarting {
-			n.phase = phaseRunning
-		}
-		n.mu.Unlock()
-		n.emitEvent(map[string]any{
-			"type":    "status",
-			"running": true,
-			"msg":     "started",
-		})
-		return nil
-	case <-finished:
-		n.mu.Lock()
-		err := n.runErr
-		n.mu.Unlock()
-		if err == nil {
-			err = errors.New("daemon exited before ready")
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, errStartAborted) {
-			n.emitEvent(map[string]any{
-				"type":  "error",
-				"msg":   errStartAborted.Error(),
-				"phase": "start",
-			})
-			return errStartAborted
-		}
-		n.emitEvent(map[string]any{
-			"type":  "error",
-			"msg":   err.Error(),
-			"phase": "start",
-		})
-		return err
-	}
-}
-
-// claimStart acquires exclusive starting ownership under mu: sets phaseStarting
-// and installs ctx/cancel/finished in the same critical section so Stop can
-// always cancel. Concurrent Starts never both succeed.
-func (n *Node) claimStart() (context.Context, chan struct{}, Config, error) {
-	for {
-		n.mu.Lock()
-		switch n.phase {
-		case phaseStarting, phaseRunning:
-			n.mu.Unlock()
-			return nil, nil, Config{}, errors.New("already running")
-
-		case phaseStopping:
-			finished := n.finished
-			n.mu.Unlock()
-			if finished == nil {
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			timer := time.NewTimer(stopTimeout)
-			select {
-			case <-finished:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			case <-timer.C:
-				return nil, nil, Config{}, errors.New("previous run still stopping")
-			}
-
-		case phaseIdle:
-			// Drain a closed leftover finished without releasing mu so two
-			// concurrent Starts cannot both pass this path and double-launch.
-			if n.finished != nil {
-				select {
-				case <-n.finished:
-					n.finished = nil
-					n.cancel = nil
-					n.ctx = nil
-				default:
-					// Open finished while idle is unexpected; wait outside.
-					finished := n.finished
-					n.mu.Unlock()
-					timer := time.NewTimer(stopTimeout)
-					select {
-					case <-finished:
-						if !timer.Stop() {
-							select {
-							case <-timer.C:
-							default:
-							}
-						}
-					case <-timer.C:
-						return nil, nil, Config{}, errors.New("previous run still stopping")
-					}
-					continue
-				}
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			finished := make(chan struct{})
-			n.phase = phaseStarting
-			n.ctx = ctx
-			n.cancel = cancel
-			n.finished = finished
-			n.runErr = nil
-			cfg := n.cfg
-			n.mu.Unlock()
-			return ctx, finished, cfg, nil
-
-		default:
-			n.mu.Unlock()
-			return nil, nil, Config{}, fmt.Errorf("invalid phase %v", n.phase)
-		}
-	}
-}
-
-// ownsStart reports whether finished is still the active run and Start may
-// proceed with setup/launch. False when Stop moved phase to stopping (or the
-// run slot was cleared) so Start should finish(aborted) without starting Run.
-func (n *Node) ownsStart(finished chan struct{}) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.finished == finished && n.phase == phaseStarting
-}
-
-// Stop cancels the daemon and waits for it to exit (with a timeout).
-// Stop when not running (idle, or already exited) is a no-op and returns nil.
-// A timed-out Stop leaves the node in "stopping" until the goroutine exits;
-// IsRunning remains true and a later Start waits for wind-down.
-func (n *Node) Stop() (err error) {
-	if n == nil {
-		return nil
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("stop panic: %v", r)
-		}
-	}()
-
-	n.mu.Lock()
-	phase := n.phase
-	finished := n.finished
-	n.mu.Unlock()
-
-	if phase == phaseIdle {
-		return nil
-	}
-
-	// Already stopping: wait for the in-flight stop / exit.
-	if phase == phaseStopping {
-		return n.waitFinished(finished)
-	}
-
-	// phaseStarting or phaseRunning: request cancel and wait.
-	// cancel/finished are always installed with phaseStarting (claimStart),
-	// so Stop can always cancel even mid-setup.
-	n.mu.Lock()
-	if n.phase == phaseStarting || n.phase == phaseRunning {
-		n.phase = phaseStopping
-	}
-	cancel := n.cancel
-	finished = n.finished
-	n.mu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if finished == nil {
-		// Should not happen under the ownership invariant.
-		n.mu.Lock()
-		if n.phase == phaseStopping {
-			n.phase = phaseIdle
-		}
-		n.mu.Unlock()
-		return nil
-	}
-	return n.waitFinished(finished)
-}
-
-func (n *Node) waitFinished(finished chan struct{}) error {
-	if finished == nil {
-		return nil
-	}
-	timer := time.NewTimer(stopTimeout)
-	defer timer.Stop()
-	select {
-	case <-finished:
-		// finish() already cleared ownership and set phaseIdle.
-		return nil
-	case <-timer.C:
-		n.mu.Lock()
-		if n.phase != phaseIdle {
-			n.phase = phaseStopping
-		}
-		n.mu.Unlock()
-		return fmt.Errorf("stop timed out after %s (daemon may still be running; IsRunning stays true until exit)", stopTimeout)
-	}
-}
-
 func validateConfig(cfg *Config) error {
 	if cfg.Dir == "" {
 		return errors.New("dir is required")
@@ -617,15 +248,15 @@ func effectiveNetMode(mode string) string {
 func effectiveDisplay(cfg Config) (port int, scanMs, syncMs int64, block int) {
 	port = cfg.Port
 	if port == 0 {
-		port = defaultPort
+		port = daemon.DefaultPort
 	}
 	scanMs = cfg.ScanIntervalMs
 	if scanMs == 0 {
-		scanMs = defaultScanIntervalMs
+		scanMs = daemon.DefaultScanInterval.Milliseconds()
 	}
 	syncMs = cfg.SyncIntervalMs
 	if syncMs == 0 {
-		syncMs = defaultSyncIntervalMs
+		syncMs = daemon.DefaultSyncInterval.Milliseconds()
 	}
 	block = cfg.BlockSize
 	if block == 0 {
