@@ -19,7 +19,7 @@ func main() {
 		dir           = flag.String("dir", "", "directory to synchronize (required)")
 		stateDir      = flag.String("state", "", "state directory for index (and tsnet state when -tsnet); default: <dir>/.tailsync")
 		hostname      = flag.String("hostname", "", "tsnet hostname when -tsnet (default: tailsync-<os-hostname>); ignored for protocol identity in host mode")
-		service       = flag.String("service", "", "optional discovery filter: only dial hosts whose name contains this substring (empty = all online peers)")
+		service       = flag.String("service", "", "discovery filter: only dial hosts whose name contains this substring; empty dials all online peers (use with -peers on large tailnets; non-tailsync nodes waste dial time)")
 		port          = flag.Int("port", daemon.DefaultPort, "TCP port on the tailnet (or localhost with -plain)")
 		authKey       = flag.String("authkey", "", "Tailscale auth key for -tsnet (or set TS_AUTHKEY); unused in host mode")
 		scanEvery     = flag.Duration("scan-interval", daemon.DefaultScanInterval, "safety-net full rescan period (FS watch handles most local edits)")
@@ -27,7 +27,8 @@ func main() {
 		watchDebounce = flag.Duration("watch-debounce", 0, "debounce wait after FS events before reconcile (0 = default)")
 		noWatch       = flag.Bool("no-watch", false, "disable filesystem watching; rely on -scan-interval only")
 		blockSize     = flag.Int("block-size", 0, "rsync-style block size for delta transfers (0 = daemon default)")
-		peers         = flag.String("peers", "", "comma-separated peer addresses host:port (optional; default: discover via Tailscale)")
+		dialTimeout   = flag.Duration("dial-timeout", 0, fmt.Sprintf("timeout for outbound peer dials (0 = default %s); caps waits on nodes not running tailsync", daemon.DefaultDialTimeout))
+		peers         = flag.String("peers", "", "comma-separated peer addresses host:port; when empty, discovery dials all online tailnet peers (prefer explicit list or -service if some nodes lack tailsync)")
 		useTSNet      = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
 		plain         = flag.Bool("plain", false, "use plain TCP on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
 		verbose       = flag.Bool("v", false, "verbose debug logging")
@@ -90,6 +91,7 @@ func main() {
 		WatchDebounce: *watchDebounce,
 		DisableWatch:  *noWatch,
 		BlockSize:     *blockSize,
+		DialTimeout:   *dialTimeout,
 		Logger:        log,
 		NetMode:       mode,
 		Peers:         peerList,

@@ -75,8 +75,9 @@ import (
 // Dir is required and must be an absolute path. StateDir, when set, must also
 // be absolute; otherwise it defaults to Dir/.tailsync (resolved by the daemon).
 //
-// Zero values for Port, ScanIntervalMs, SyncIntervalMs, WatchDebounceMs, and
-// BlockSize mean “use daemon defaults”. StatusJSON reports those effective defaults.
+// Zero values for Port, ScanIntervalMs, SyncIntervalMs, WatchDebounceMs,
+// BlockSize, and DialTimeoutMs mean “use daemon defaults”. StatusJSON reports
+// those effective defaults.
 type Config struct {
 	// Dir is the absolute path to the sync root (required).
 	Dir string
@@ -90,9 +91,11 @@ type Config struct {
 	AuthKey string
 	// Port is the TCP listen/dial port (0 = daemon default).
 	Port int
-	// Peers is a comma-separated list of host:port peers (optional; empty = discovery).
+	// Peers is a comma-separated list of host:port peers (optional; empty = discovery
+	// of all online tailnet peers — prefer an explicit list when many devices are online).
 	Peers string
 	// ServiceName filters discovered peers by hostname/DNS substring.
+	// Empty with empty Peers dials every online peer; set this or Peers on large tailnets.
 	ServiceName string
 	// ScanIntervalMs is the safety-net full rescan period in milliseconds (0 = default).
 	ScanIntervalMs int64
@@ -105,6 +108,9 @@ type Config struct {
 	DisableWatch bool
 	// BlockSize is the delta block size (0 = default).
 	BlockSize int
+	// DialTimeoutMs is the outbound peer dial timeout in milliseconds (0 = default).
+	// Caps hangs against online nodes that are not running tailsync.
+	DialTimeoutMs int64
 	// NetMode selects networking: "tsnet" (default for mobile), "host", or "plain".
 	// Android apps should use "tsnet". "plain" is for testing only (localhost TCP).
 	// "host" requires a system tailscaled (not typical on Android).
@@ -231,7 +237,7 @@ func (n *Node) StatusJSON() (string, error) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	port, scanMs, syncMs, watchMs, block := effectiveDisplay(n.cfg)
+	port, scanMs, syncMs, watchMs, dialMs, block := effectiveDisplay(n.cfg)
 	st := statusSnapshot{
 		Type:         "status",
 		Running:      n.phase == phaseRunning,
@@ -246,6 +252,7 @@ func (n *Node) StatusJSON() (string, error) {
 		ScanMs:       scanMs,
 		SyncMs:       syncMs,
 		WatchMs:      watchMs,
+		DialMs:       dialMs,
 		DisableWatch: n.cfg.DisableWatch,
 		BlockSize:    block,
 		Version:      Version(),
@@ -290,6 +297,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.BlockSize < 0 {
 		return errors.New("BlockSize must be >= 0")
 	}
+	if cfg.DialTimeoutMs < 0 {
+		return errors.New("DialTimeoutMs must be >= 0")
+	}
 	return nil
 }
 
@@ -301,7 +311,7 @@ func effectiveNetMode(mode string) string {
 	return mode
 }
 
-func effectiveDisplay(cfg Config) (port int, scanMs, syncMs, watchMs int64, block int) {
+func effectiveDisplay(cfg Config) (port int, scanMs, syncMs, watchMs, dialMs int64, block int) {
 	port = cfg.Port
 	if port == 0 {
 		port = daemon.DefaultPort
@@ -318,11 +328,15 @@ func effectiveDisplay(cfg Config) (port int, scanMs, syncMs, watchMs int64, bloc
 	if watchMs == 0 {
 		watchMs = daemon.DefaultWatchDebounce.Milliseconds()
 	}
+	dialMs = cfg.DialTimeoutMs
+	if dialMs == 0 {
+		dialMs = daemon.DefaultDialTimeout.Milliseconds()
+	}
 	block = cfg.BlockSize
 	if block == 0 {
 		block = delta.DefaultBlockSize
 	}
-	return port, scanMs, syncMs, watchMs, block
+	return port, scanMs, syncMs, watchMs, dialMs, block
 }
 
 func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL func(string)) (daemon.Config, error) {
@@ -349,7 +363,7 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL fun
 		}
 	}
 
-	var scanEvery, syncEvery, watchDebounce time.Duration
+	var scanEvery, syncEvery, watchDebounce, dialTimeout time.Duration
 	if cfg.ScanIntervalMs > 0 {
 		scanEvery = time.Duration(cfg.ScanIntervalMs) * time.Millisecond
 	}
@@ -358,6 +372,9 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL fun
 	}
 	if cfg.WatchDebounceMs > 0 {
 		watchDebounce = time.Duration(cfg.WatchDebounceMs) * time.Millisecond
+	}
+	if cfg.DialTimeoutMs > 0 {
+		dialTimeout = time.Duration(cfg.DialTimeoutMs) * time.Millisecond
 	}
 
 	return daemon.Config{
@@ -372,6 +389,7 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL fun
 		WatchDebounce: watchDebounce,
 		DisableWatch:  cfg.DisableWatch,
 		BlockSize:     cfg.BlockSize,
+		DialTimeout:   dialTimeout,
 		Logger:        log,
 		NetMode:       netMode,
 		Peers:         peers,
@@ -394,6 +412,7 @@ type statusSnapshot struct {
 	ScanMs       int64  `json:"scan_interval_ms"`
 	SyncMs       int64  `json:"sync_interval_ms"`
 	WatchMs      int64  `json:"watch_debounce_ms"`
+	DialMs       int64  `json:"dial_timeout_ms"`
 	DisableWatch bool   `json:"disable_watch,omitempty"`
 	BlockSize    int    `json:"block_size"`
 	Version      string `json:"version"`

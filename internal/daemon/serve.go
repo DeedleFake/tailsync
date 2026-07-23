@@ -54,6 +54,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unsupported version %d", msg.Header.Version)))
 		return
 	}
+	remoteNode := msg.Header.NodeID
 	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID)); err != nil {
 		return
 	}
@@ -90,14 +91,16 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 
 	// Phase 2: reverse-pull dialer's state so their local changes land here
 	// without waiting for our SyncInterval.
-	if _, err := d.pullFromConn(ctx, conn); err != nil {
-		d.log.Debug("reverse pull", "remote", remote, "err", err)
+	n, err := d.pullFromConn(ctx, conn)
+	if err != nil {
+		d.log.Warn("inbound reverse pull", "remote", remote, "remote_node", remoteNode, "err", err)
 		return
 	}
 	if err := proto.Encode(conn, proto.NewSyncDone()); err != nil {
-		d.log.Debug("sync_done", "remote", remote, "err", err)
+		d.log.Warn("inbound sync_done", "remote", remote, "remote_node", remoteNode, "err", err)
 		return
 	}
+	d.log.Info("inbound sync", "remote", remote, "remote_node", remoteNode, "pulled_entries", n)
 }
 
 func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message) error {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"deedles.dev/tailsync/internal/atomicfile"
@@ -106,15 +107,34 @@ func decideApply(local index.Entry, hasLocal bool, remote index.Entry, diskPrese
 func (d *Daemon) syncPeers(ctx context.Context) {
 	peers, err := d.listPeers(ctx)
 	if err != nil {
-		d.log.Debug("list peers", "err", err)
+		d.log.Warn("list peers", "err", err)
 		return
 	}
 	if len(peers) == 0 {
 		return
 	}
 
+	// Empty Peers + ServiceName means discovery dials every online tailnet node.
+	// On larger tailnets that includes devices not running tailsync (dials fail
+	// fast via DialTimeout but still add batch latency).
+	if len(d.cfg.Peers) == 0 && d.cfg.ServiceName == "" && len(peers) > manyPeersWarnThreshold {
+		if d.manyPeersWarned.CompareAndSwap(false, true) {
+			d.log.Warn("discovered many peers without -peers or -service; dialing all online nodes wastes dial attempts and can delay outbound sync batches on hosts not running tailsync",
+				"count", len(peers),
+				"hint", "set -peers host:port,... or -service <name-substring>",
+			)
+		}
+	}
+	d.log.Debug("sync peers", "count", len(peers))
+
 	sem := make(chan struct{}, maxParallelPeerSyncs)
-	var wg sync.WaitGroup
+	var (
+		wg         sync.WaitGroup
+		softMu     sync.Mutex
+		softCount  int
+		softSample []string
+	)
+	const softSampleMax = 3
 	for _, addr := range peers {
 		if err := ctx.Err(); err != nil {
 			break
@@ -127,11 +147,68 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 				return
 			}
 			if err := d.syncWith(ctx, addr); err != nil {
-				d.log.Debug("sync peer", "addr", addr, "err", err)
+				// Dial soft-fails (timeout/refused/unreachable) are expected when
+				// discovery includes non-tailsync nodes: per-peer Debug + batch Info.
+				// Mid-session failures stay Warn.
+				if isDialSoftFail(err) {
+					d.log.Debug("sync peer", "addr", addr, "err", err)
+					softMu.Lock()
+					softCount++
+					if len(softSample) < softSampleMax {
+						softSample = append(softSample, addr)
+					}
+					softMu.Unlock()
+					return
+				}
+				d.log.Warn("sync peer", "addr", addr, "err", err)
 			}
 		})
 	}
 	wg.Wait()
+	if softCount > 0 {
+		d.log.Info("peer dial soft-fails", "count", softCount, "sample", softSample)
+	}
+}
+
+// errDial marks failures from the outbound dial phase of syncWith (not mid-session I/O).
+var errDial = errors.New("dial")
+
+// isDialSoftFail reports dial-phase failures that are expected when discovery
+// includes nodes not running tailsync (timeout, refused, unreachable).
+// Mid-session timeouts/errors are not soft-fails even if they unwrap to the
+// same network conditions.
+func isDialSoftFail(err error) bool {
+	if err == nil || !errors.Is(err, errDial) {
+		return false
+	}
+	return isSoftDialNetworkErr(err)
+}
+
+// isSoftDialNetworkErr reports network conditions typical of dialing a node that
+// is online on the tailnet but not accepting tailsync (or not reachable).
+func isSoftDialNetworkErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Parent cancel is not a "soft" unreachable peer; leave at Warn if wrapped as dial.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
 }
 
 // syncWith opens a bidirectional sync session with addr:
@@ -146,7 +223,7 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 func (d *Daemon) syncWith(ctx context.Context, addr string) error {
 	conn, err := d.dial(ctx, addr)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("%w: %w", errDial, err)
 	}
 	defer conn.Close()
 	d.setConnDeadline(conn, ctx)

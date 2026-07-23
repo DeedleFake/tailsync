@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/client/local"
@@ -31,9 +32,17 @@ const (
 	// transfer/delta (v1 keeps whole-file buffers). Wire framing is also capped
 	// by proto.MaxMessageSize.
 	DefaultMaxFileBytes = 64 << 20 // 64 MiB
+	// DefaultDialTimeout is how long an outbound peer dial may block before
+	// failing. Without this, dials to online nodes that are not running tailsync
+	// (or are unreachable) can hang for a long time and stall syncPeers.
+	DefaultDialTimeout = 5 * time.Second
 	// maxParallelPeerSyncs caps concurrent peer dial/sync workers so N online
 	// peers cannot each hold up to MaxFileBytes in memory at once.
 	maxParallelPeerSyncs = 4
+	// manyPeersWarnThreshold is how many discovered peers trigger a one-time
+	// recommendation for -peers or -service when discovery is unfiltered.
+	// Independent of maxParallelPeerSyncs (concurrency/memory cap).
+	manyPeersWarnThreshold = 8
 )
 
 // Config holds daemon configuration.
@@ -51,8 +60,10 @@ type Config struct {
 	Hostname string
 	// ServiceName, when non-empty, filters discovered peers to those whose
 	// HostName or DNSName contains this substring (not a path prefix).
-	// Empty means dial all online tailnet peers except self (on large tailnets
-	// prefer setting this or -peers). Ignored when Peers is set.
+	// Empty means dial all online tailnet peers except self. On large tailnets
+	// that dials phones, TVs, and other nodes not running tailsync; prefer
+	// setting this or Peers so outbound sync does not waste time on them.
+	// Ignored when Peers is set.
 	ServiceName string
 	// Port is the TCP port to listen on over the tailnet (or localhost in plain mode).
 	Port int
@@ -79,6 +90,9 @@ type Config struct {
 	BlockSize int
 	// MaxFileBytes rejects local files larger than this for serve/pull (0 = default).
 	MaxFileBytes int64
+	// DialTimeout is the max wait for an outbound peer TCP dial (0 = DefaultDialTimeout).
+	// Caps hangs against online nodes that are not listening for tailsync.
+	DialTimeout time.Duration
 	// TombstoneTTL drops old deletion tombstones from the index (0 = default 30d).
 	TombstoneTTL time.Duration
 	// Logger defaults to slog.Default().
@@ -88,7 +102,9 @@ type Config struct {
 	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port). When empty,
-	// peers are discovered from Tailscale status (online nodes other than self).
+	// peers are discovered from Tailscale status (all online nodes other than self).
+	// Discovery will dial nodes that are not running tailsync; use Peers or
+	// ServiceName on multi-device tailnets to avoid slow outbound batches.
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library wrappers (e.g. mobile) so Start can wait for
@@ -154,6 +170,10 @@ type Daemon struct {
 	// appliesSinceSave counts successful index mutations since last Save.
 	// Touched only while holding syncMu.
 	appliesSinceSave int
+
+	// manyPeersWarned is set after the one-time unfiltered-discovery Warn so
+	// syncPeers does not spam every batch on multi-device tailnets.
+	manyPeersWarned atomic.Bool
 }
 
 // InjectNetworkChange signals tsnet's netmon that host connectivity changed
@@ -228,6 +248,9 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.MaxFileBytes <= 0 {
 		cfg.MaxFileBytes = DefaultMaxFileBytes
+	}
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = DefaultDialTimeout
 	}
 	if cfg.TombstoneTTL <= 0 {
 		cfg.TombstoneTTL = index.DefaultTombstoneTTL

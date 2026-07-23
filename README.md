@@ -53,15 +53,16 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-dir` | (required) | Directory to synchronize |
 | `-state` | `<dir>/.tailsync` | Index directory (also holds tsnet state when `-tsnet`) |
 | `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname; in host mode, identity comes from LocalAPI |
-| `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; empty means all online tailnet peers (see [Peer discovery](#peer-discovery)) |
+| `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; **empty discovery dials all online peers** (see [Peer discovery](#peer-discovery)) |
 | `-port` | `5960` | TCP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
-| `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery) |
+| `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery). Prefer this or `-service` when the tailnet has devices not running tailsync |
 | `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer sync period (local changes also open a bidirectional session) |
 | `-watch-debounce` | `300ms` | Debounce wait after FS events before reconcile (`0` = default) |
 | `-no-watch` | `false` | Disable filesystem watching; rely on `-scan-interval` only |
 | `-block-size` | `4096` | Delta block size |
+| `-dial-timeout` | `5s` (`daemon.DefaultDialTimeout`) | Max wait for each outbound peer dial (`0` = daemon default); caps waits on nodes not listening |
 | `-tsnet` | `false` | Use embedded tsnet instead of host `tailscaled` |
 | `-plain` | `false` | Plain TCP on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
 | `-v` | `false` | Debug logging |
@@ -70,17 +71,17 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 
 ### Peer discovery
 
-With host or tsnet mode and no `-peers` list, tailsync dials online tailnet peers on `-port` each sync interval, using Tailscale IPs from status (falling back to MagicDNS when needed). By default that includes **every** online peer—phones, TVs, unrelated servers—which is fine on a small personal tailnet. On larger tailnets, prefer:
+With host or tsnet mode and no `-peers` list, tailsync dials online tailnet peers on `-port` each sync interval, using Tailscale IPs from status (falling back to MagicDNS when needed). By default that includes **every** online peer—phones, TVs, unrelated servers—not only machines running tailsync. That is fine on a small personal tailnet, but nodes that are online and not listening for tailsync still consume a dial attempt each batch (capped by `-dial-timeout`, default 5s) and can delay outbound sync until those dials finish. Inbound connections still work in that case (e.g. phone→PC succeeds while PC→phone waits), so prefer:
 
-- `-service <substring>` to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`), or
-- `-peers host:port,...` to pin exact addresses and skip discovery.
+- `-peers host:port,...` to pin exact addresses and skip discovery (recommended when only a few machines sync), or
+- `-service <substring>` to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`).
 
 ```bash
 # two machines (each uses its host Tailscale identity)
 tailsync -dir ~/shared   # machine a
 tailsync -dir ~/shared   # machine b
 
-# pin peers explicitly
+# pin peers explicitly (avoids dialing the rest of the tailnet)
 tailsync -dir ~/shared -peers other-host:5960,100.x.y.z:5960
 ```
 
@@ -144,7 +145,7 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 
 | Go | Role |
 |----|------|
-| `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `WatchDebounceMs`, `DisableWatch`, `BlockSize`, `NetMode` |
+| `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `WatchDebounceMs`, `DisableWatch`, `BlockSize`, `DialTimeoutMs`, `NetMode` |
 | `NewNode(cfg)` | Validates config and returns a stopped `Node` |
 | `Node.Start()` / `Stop()` / `IsRunning()` | Lifecycle. `Start` blocks until listening succeeds or fails; call it off the main thread |
 | `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs, status, auth); handlers must return quickly |

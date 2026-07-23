@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -296,6 +298,110 @@ func TestMultiListenerOneSideClosedStillAccepts(t *testing.T) {
 		t.Fatalf("accept after one side closed: %v", err)
 	}
 	_ = sc.Close()
+}
+
+func TestDialTimeout(t *testing.T) {
+	// Short timeout against a documentation-only address that should not accept
+	// (TEST-NET-1). Proves dial does not hang for minutes when peers are offline
+	// or not running tailsync.
+	d := &Daemon{
+		cfg: Config{
+			NetMode:     NetModePlain,
+			DialTimeout: 200 * time.Millisecond,
+		},
+		log: slog.Default(),
+	}
+	const addr = "192.0.2.1:9"
+	start := time.Now()
+	_, err := d.dial(context.Background(), addr)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	// Allow scheduling noise above DialTimeout; must remain far below OS defaults.
+	if elapsed > 2*time.Second {
+		t.Fatalf("dial took %v (DialTimeout=%v); expected fail within ~timeout", elapsed, d.cfg.DialTimeout)
+	}
+	// Match the wrap used by syncWith so soft-fail classification stays accurate.
+	wrapped := fmt.Errorf("%w: %w", errDial, err)
+	if !isDialSoftFail(wrapped) {
+		t.Fatalf("expected soft fail for dial timeout: %v", wrapped)
+	}
+}
+
+func TestDialClosedPortFailsQuickly(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	d := &Daemon{
+		cfg: Config{
+			NetMode:     NetModePlain,
+			DialTimeout: time.Second,
+		},
+		log: slog.Default(),
+	}
+	start := time.Now()
+	_, err = d.dial(context.Background(), addr)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected connection refused")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("closed-port dial took %v", elapsed)
+	}
+	// Match the wrap used by syncWith so soft-fail classification stays accurate.
+	if !isDialSoftFail(fmt.Errorf("%w: %w", errDial, err)) {
+		t.Fatalf("expected soft fail for connection refused: %v", err)
+	}
+}
+
+func TestNewAppliesDefaultDialTimeout(t *testing.T) {
+	dir := t.TempDir()
+	d, err := New(Config{Dir: dir, NetMode: NetModePlain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.cfg.DialTimeout != DefaultDialTimeout {
+		t.Fatalf("DialTimeout=%v want %v", d.cfg.DialTimeout, DefaultDialTimeout)
+	}
+}
+
+func TestIsDialSoftFail(t *testing.T) {
+	dialWrap := func(err error) error {
+		return fmt.Errorf("%w: %w", errDial, err)
+	}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "dial timeout", err: dialWrap(context.DeadlineExceeded), want: true},
+		{name: "dial os deadline", err: dialWrap(os.ErrDeadlineExceeded), want: true},
+		{name: "dial refused", err: dialWrap(syscall.ECONNREFUSED), want: true},
+		{name: "dial host unreach", err: dialWrap(syscall.EHOSTUNREACH), want: true},
+		{name: "dial net unreach", err: dialWrap(syscall.ENETUNREACH), want: true},
+		{name: "dial conn aborted", err: dialWrap(syscall.ECONNABORTED), want: true},
+		{name: "dial conn reset", err: dialWrap(syscall.ECONNRESET), want: true},
+		{name: "dial canceled", err: dialWrap(context.Canceled), want: false},
+		// Mid-session errors must not be soft-fails even with the same causes.
+		{name: "mid-session deadline", err: fmt.Errorf("hello response: %w", context.DeadlineExceeded), want: false},
+		{name: "mid-session refused", err: fmt.Errorf("hello response: %w", syscall.ECONNREFUSED), want: false},
+		{name: "plain timeout without dial", err: context.DeadlineExceeded, want: false},
+		{name: "plain refused without dial", err: syscall.ECONNREFUSED, want: false},
+		{name: "other dial error", err: dialWrap(fmt.Errorf("weird")), want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDialSoftFail(tc.err); got != tc.want {
+				t.Fatalf("isDialSoftFail(%v)=%v want %v", tc.err, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestEnsureAndroidTSLogsDirNoopOffAndroid(t *testing.T) {

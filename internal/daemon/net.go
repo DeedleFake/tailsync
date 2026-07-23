@@ -589,14 +589,21 @@ func filterSelfHostname(addrs []string, hostname string) []string {
 }
 
 func (d *Daemon) dial(ctx context.Context, addr string) (net.Conn, error) {
+	timeout := d.cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = DefaultDialTimeout
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	switch d.cfg.NetMode {
 	case NetModeTSNet:
 		if d.server != nil {
-			return d.server.Dial(ctx, "tcp", addr)
+			return d.server.Dial(dialCtx, "tcp", addr)
 		}
 		fallthrough
 	default:
 		var nd net.Dialer
-		return nd.DialContext(ctx, "tcp", addr)
+		return nd.DialContext(dialCtx, "tcp", addr)
 	}
 }

@@ -239,6 +239,9 @@ func TestStatusJSON(t *testing.T) {
 	if int(m["watch_debounce_ms"].(float64)) != 300 {
 		t.Fatalf("watch_debounce_ms: %v", m["watch_debounce_ms"])
 	}
+	if int(m["dial_timeout_ms"].(float64)) != 5_000 {
+		t.Fatalf("dial_timeout_ms: %v", m["dial_timeout_ms"])
+	}
 	if int(m["block_size"].(float64)) != 4096 {
 		t.Fatalf("block_size: %v", m["block_size"])
 	}
