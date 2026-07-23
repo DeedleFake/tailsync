@@ -347,14 +347,47 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 		Logf: func(format string, args ...any) {
 			d.log.Debug(fmt.Sprintf(format, args...), "component", "tsnet")
 		},
+		// UserLogf surfaces AuthURL and other user-facing tsnet messages
+		// (CLI sees login URLs at Info without scraping Debug backend logs).
+		UserLogf: func(format string, args ...any) {
+			d.log.Info(fmt.Sprintf(format, args...), "component", "tsnet")
+		},
 	}
 	d.server = s
 
+	// Watch for interactive login URLs while Up blocks on Running.
+	// Cancel and join before Close/continue so LocalClient use and OnAuthURL
+	// cannot race tsnet shutdown or fire after bring-up completes.
+	var (
+		watchCancel context.CancelFunc
+		watchDone   chan struct{}
+	)
+	stopAuthWatch := func() {
+		if watchCancel != nil {
+			watchCancel()
+		}
+		if watchDone != nil {
+			<-watchDone
+		}
+	}
+	if d.cfg.OnAuthURL != nil {
+		watchCtx, cancel := context.WithCancel(ctx)
+		watchCancel = cancel
+		watchDone = make(chan struct{})
+		tracker := newAuthURLTracker(d.cfg.OnAuthURL)
+		go func() {
+			defer close(watchDone)
+			d.watchTSNetAuthURL(watchCtx, s, tracker)
+		}()
+	}
+
 	if _, err := s.Up(ctx); err != nil {
+		stopAuthWatch()
 		_ = s.Close()
 		d.server = nil
 		return fmt.Errorf("tsnet up: %w", err)
 	}
+	stopAuthWatch()
 
 	addr := ":" + strconv.Itoa(d.cfg.Port)
 	ln, err := s.Listen("tcp", addr)

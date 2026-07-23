@@ -142,8 +142,8 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 | `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `BlockSize`, `NetMode` |
 | `NewNode(cfg)` | Validates config and returns a stopped `Node` |
 | `Node.Start()` / `Stop()` / `IsRunning()` | Lifecycle. `Start` blocks until listening succeeds or fails; call it off the main thread |
-| `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs and status); handlers must return quickly |
-| `Node.StatusJSON()` | Snapshot for UI (never includes `AuthKey`; zero config fields are shown as effective defaults; includes `phase`) |
+| `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs, status, auth); handlers must return quickly |
+| `Node.StatusJSON()` | Snapshot for UI (never includes `AuthKey`; zero config fields are shown as effective defaults; includes `phase`; may include `needs_login` / `auth_url`) |
 | `Version()` | Module or build version string |
 
 `NetMode` values: `"tsnet"` (default), `"host"`, `"plain"` (localhost TCP for tests only).
@@ -156,9 +156,11 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 // After adding tailsync.aar to the Android app module.
 val cfg = Config().apply {
     dir = context.filesDir.resolve("sync").absolutePath
+    // Persist StateDir across runs so browser login is only needed once.
     stateDir = context.filesDir.resolve("tailsync-state").absolutePath
     hostname = "tailsync-phone"
-    authKey = BuildConfig.TS_AUTHKEY // prefer a reusable auth key
+    // Optional: pre-provisioned auth key. Leave empty for browser login on first run.
+    // authKey = BuildConfig.TS_AUTHKEY
     // netMode defaults to "tsnet"
 }
 val node = Mobile.newNode(cfg)
@@ -166,16 +168,25 @@ val mainHandler = Handler(Looper.getMainLooper())
 node.setListener(EventListener { eventJSON ->
     // Called from a Go background thread — keep this fast (no network/disk/UI).
     mainHandler.post {
-        // parse JSON: type = log | status | error
-        Log.i("tailsync", eventJSON)
+        // parse JSON: type = log | status | error | auth
+        val obj = JSONObject(eventJSON)
+        when (obj.getString("type")) {
+            "auth" -> {
+                // Interactive login needed — open Custom Tab / browser while start() waits.
+                val url = obj.getString("url")
+                val intent = CustomTabsIntent.Builder().build()
+                intent.launchUrl(context, Uri.parse(url))
+            }
+            else -> Log.i("tailsync", eventJSON)
+        }
     }
 })
 
 // From a foreground service — never call start() on the main thread
-// (tsnet bring-up can block long enough to ANR).
+// (tsnet bring-up / browser login can block long enough to ANR).
 serviceScope.launch(Dispatchers.IO) {
     try {
-        node.start() // blocks until listening or failure
+        node.start() // blocks until listening or failure; auth events fire while waiting
     } catch (e: Exception) {
         Log.e("tailsync", "start failed", e)
     }
@@ -186,9 +197,20 @@ serviceScope.launch(Dispatchers.IO) {
 }
 ```
 
+**Authentication (tsnet)**
+
+| Situation | What happens |
+|-----------|----------------|
+| `AuthKey` set and valid | Silent enroll; no `"auth"` event |
+| Existing tsnet state under `StateDir` (prior successful login) | Silent reconnect; no `"auth"` event |
+| Empty `AuthKey`, no enrolled state | tsnet starts interactive login; emits `{"type":"auth","url":"..."}` while `Start` blocks so the app can open a browser / Custom Tab |
+
+After the user completes login in the browser, `Start` finishes when the node is `Running`. Keep the same `StateDir` on later launches so the node does not re-prompt.
+
+`StatusJSON` may include `needs_login` and `auth_url` while interactive login is in progress (never includes `AuthKey`).
+
 **Notes**
 
-- First registration needs a Tailscale **auth key** (or existing tsnet state under `StateDir`).
 - Paths must be absolute and writable by the app process.
 - Call `Stop` when the service is destroyed so the embedded node and goroutines exit.
 - Run `start()` / `stop()` off the main thread; keep `OnEvent` non-blocking (post to the main thread only for UI).

@@ -3,6 +3,7 @@ package mobile
 import (
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"testing"
 )
 
@@ -60,11 +61,22 @@ func TestAppendAttrRedactsSecrets(t *testing.T) {
 }
 
 type captureListener struct {
+	mu     sync.Mutex
 	events []string
 }
 
 func (c *captureListener) OnEvent(eventJSON string) {
+	c.mu.Lock()
 	c.events = append(c.events, eventJSON)
+	c.mu.Unlock()
+}
+
+func (c *captureListener) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.events))
+	copy(out, c.events)
+	return out
 }
 
 func TestEventHandlerRedactsLogAttrs(t *testing.T) {
@@ -80,11 +92,12 @@ func TestEventHandlerRedactsLogAttrs(t *testing.T) {
 		"hostname", "phone",
 	)
 
-	if len(lis.events) != 1 {
-		t.Fatalf("events: %v", lis.events)
+	evs := lis.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("events: %v", evs)
 	}
 	var m map[string]any
-	if err := json.Unmarshal([]byte(lis.events[0]), &m); err != nil {
+	if err := json.Unmarshal([]byte(evs[0]), &m); err != nil {
 		t.Fatal(err)
 	}
 	if m["type"] != "log" {

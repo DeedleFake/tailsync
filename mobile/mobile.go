@@ -23,6 +23,13 @@
 //	{"type":"log","level":"INFO","msg":"...","time":"...","attrs":{...}}
 //	{"type":"status","running":true,"msg":"started"}
 //	{"type":"error","msg":"...","phase":"start"|"run"}
+//	{"type":"auth","url":"https://login.tailscale.com/..."}
+//
+// The "auth" event is emitted during Start (while still blocking) when the
+// embedded tsnet node needs interactive browser login and an AuthURL is
+// available. It is not emitted when AuthKey works, or when existing tsnet
+// state under StateDir already enrolls the node. Open the URL in a browser
+// or Custom Tab; after login, Start completes when the node is Running.
 //
 // Secrets such as AuthKey are never included. Log attribute keys named like
 // authkey/token are redacted; free-text log messages are not scrubbed.
@@ -59,7 +66,9 @@ type Config struct {
 	StateDir string
 	// Hostname is the tsnet hostname when NetMode is "tsnet".
 	Hostname string
-	// AuthKey is a Tailscale auth key for tsnet registration.
+	// AuthKey is an optional Tailscale auth key for tsnet registration.
+	// When empty, first run may require browser login (see "auth" events);
+	// subsequent runs reuse enrolled state under StateDir without re-prompting.
 	AuthKey string
 	// Port is the TCP listen/dial port (0 = daemon default).
 	Port int
@@ -79,12 +88,14 @@ type Config struct {
 	NetMode string
 }
 
-// EventListener is implemented in Kotlin (or other gomobile hosts) for status
-// and log callbacks. Events are JSON objects (see package docs).
+// EventListener is implemented in Kotlin (or other gomobile hosts) for status,
+// log, and auth callbacks. Events are JSON objects (see package docs).
 //
 // OnEvent must return quickly: it is called synchronously from daemon and
 // start/stop paths. Blocking here stalls logging and can delay Start. Do not
 // update Android UI directly; post to the main looper/dispatcher first.
+// For "auth" events, post opening a Custom Tab / browser; do not block OnEvent
+// on the login completing (Start remains blocked until login finishes).
 //
 // AuthKey and other secrets are never included in event payloads.
 type EventListener interface {
@@ -102,6 +113,14 @@ type Node struct {
 	mu       sync.Mutex
 	phase    nodePhase
 	listener EventListener
+
+	// authURL / needsLogin track interactive tsnet login during Start.
+	// Updated when OnAuthURL fires; cleared when ready or the run ends.
+	// acceptAuthURL gates noteAuthURL so late callbacks after ready/finish
+	// cannot re-arm needs_login or emit another "auth" event.
+	authURL       string
+	needsLogin    bool
+	acceptAuthURL bool
 
 	// gen is incremented on each claimStart; finish only clears matching gen.
 	gen        uint64
@@ -137,7 +156,7 @@ func NewNode(cfg *Config) (*Node, error) {
 		return nil, err
 	}
 	// Ensure daemon accepts the mapped config (defaults, abs paths, etc.).
-	dc, err := toDaemonConfig(&c, slog.Default(), nil)
+	dc, err := toDaemonConfig(&c, slog.Default(), nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +195,7 @@ func (n *Node) IsRunning() bool {
 // StatusJSON returns a small JSON snapshot for UI (config + lifecycle).
 // AuthKey is never included. Zero config fields are reported as effective
 // daemon defaults (see Config). Includes "phase": idle|starting|running|stopping.
+// When interactive login is in progress: "needs_login" and "auth_url" (if known).
 func (n *Node) StatusJSON() (string, error) {
 	if n == nil {
 		return "", errors.New("nil node")
@@ -184,20 +204,22 @@ func (n *Node) StatusJSON() (string, error) {
 	defer n.mu.Unlock()
 	port, scanMs, syncMs, block := effectiveDisplay(n.cfg)
 	st := statusSnapshot{
-		Type:      "status",
-		Running:   n.phase == phaseRunning,
-		Phase:     n.phase.String(),
-		Dir:       n.cfg.Dir,
-		StateDir:  n.cfg.StateDir,
-		Hostname:  n.cfg.Hostname,
-		Port:      port,
-		NetMode:   effectiveNetMode(n.cfg.NetMode),
-		Service:   n.cfg.ServiceName,
-		Peers:     n.cfg.Peers,
-		ScanMs:    scanMs,
-		SyncMs:    syncMs,
-		BlockSize: block,
-		Version:   Version(),
+		Type:       "status",
+		Running:    n.phase == phaseRunning,
+		Phase:      n.phase.String(),
+		Dir:        n.cfg.Dir,
+		StateDir:   n.cfg.StateDir,
+		Hostname:   n.cfg.Hostname,
+		Port:       port,
+		NetMode:    effectiveNetMode(n.cfg.NetMode),
+		Service:    n.cfg.ServiceName,
+		Peers:      n.cfg.Peers,
+		ScanMs:     scanMs,
+		SyncMs:     syncMs,
+		BlockSize:  block,
+		Version:    Version(),
+		NeedsLogin: n.needsLogin,
+		AuthURL:    n.authURL,
 	}
 	b, err := json.Marshal(st)
 	if err != nil {
@@ -265,7 +287,7 @@ func effectiveDisplay(cfg Config) (port int, scanMs, syncMs int64, block int) {
 	return port, scanMs, syncMs, block
 }
 
-func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func()) (daemon.Config, error) {
+func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL func(string)) (daemon.Config, error) {
 	mode := effectiveNetMode(cfg.NetMode)
 	var netMode daemon.NetMode
 	switch mode {
@@ -311,24 +333,71 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func()) (daemon.Confi
 		NetMode:      netMode,
 		Peers:        peers,
 		OnReady:      onReady,
+		OnAuthURL:    onAuthURL,
 	}, nil
 }
 
 type statusSnapshot struct {
-	Type      string `json:"type"`
-	Running   bool   `json:"running"`
-	Phase     string `json:"phase"`
-	Dir       string `json:"dir"`
-	StateDir  string `json:"state_dir,omitempty"`
-	Hostname  string `json:"hostname,omitempty"`
-	Port      int    `json:"port"`
-	NetMode   string `json:"net_mode"`
-	Service   string `json:"service,omitempty"`
-	Peers     string `json:"peers,omitempty"`
-	ScanMs    int64  `json:"scan_interval_ms"`
-	SyncMs    int64  `json:"sync_interval_ms"`
-	BlockSize int    `json:"block_size"`
-	Version   string `json:"version"`
+	Type       string `json:"type"`
+	Running    bool   `json:"running"`
+	Phase      string `json:"phase"`
+	Dir        string `json:"dir"`
+	StateDir   string `json:"state_dir,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	Port       int    `json:"port"`
+	NetMode    string `json:"net_mode"`
+	Service    string `json:"service,omitempty"`
+	Peers      string `json:"peers,omitempty"`
+	ScanMs     int64  `json:"scan_interval_ms"`
+	SyncMs     int64  `json:"sync_interval_ms"`
+	BlockSize  int    `json:"block_size"`
+	Version    string `json:"version"`
+	NeedsLogin bool   `json:"needs_login,omitempty"`
+	AuthURL    string `json:"auth_url,omitempty"`
+}
+
+// noteAuthURL records interactive login state and emits a single "auth" event
+// per distinct URL while Start is accepting auth (phaseStarting and before
+// ready/finish). Late callbacks after clearAuthState are ignored.
+// Safe for concurrent use; returns quickly.
+func (n *Node) noteAuthURL(url string) {
+	if n == nil || url == "" {
+		return
+	}
+	n.mu.Lock()
+	if !n.acceptAuthURL {
+		n.mu.Unlock()
+		return
+	}
+	if n.authURL == url && n.needsLogin {
+		n.mu.Unlock()
+		return
+	}
+	n.authURL = url
+	n.needsLogin = true
+	n.mu.Unlock()
+	n.emitEvent(map[string]any{
+		"type": "auth",
+		"url":  url,
+	})
+}
+
+// clearAuthState clears interactive login fields and stops accepting further
+// auth URLs (late OnAuthURL callbacks become no-ops).
+func (n *Node) clearAuthState() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	n.clearAuthStateLocked()
+	n.mu.Unlock()
+}
+
+// clearAuthStateLocked clears auth URL state and acceptAuthURL. Caller holds mu.
+func (n *Node) clearAuthStateLocked() {
+	n.authURL = ""
+	n.needsLogin = false
+	n.acceptAuthURL = false
 }
 
 func (n *Node) emitEvent(ev map[string]any) {

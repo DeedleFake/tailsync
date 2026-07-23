@@ -110,6 +110,7 @@ func (n *Node) Start() (err error) {
 				n.finished = nil
 				// workerDone stays until closeWorker so claimStart can drain it.
 				n.phase = phaseIdle
+				n.clearAuthStateLocked()
 			}
 			n.mu.Unlock()
 			close(finished)
@@ -147,12 +148,22 @@ func (n *Node) Start() (err error) {
 	var reachedReady atomic.Bool
 	onReady := func() {
 		readyOnce.Do(func() {
+			// Login completed (or was never needed). Drop acceptAuthURL so
+			// any in-flight watcher callback cannot re-arm needs_login.
+			n.clearAuthState()
 			reachedReady.Store(true)
 			close(ready)
 		})
 	}
+	// Only tsnet can produce interactive login URLs.
+	var onAuthURL func(string)
+	if effectiveNetMode(cfg.NetMode) == "tsnet" {
+		onAuthURL = func(url string) {
+			n.noteAuthURL(url)
+		}
+	}
 
-	dc, err := toDaemonConfig(&cfg, log, onReady)
+	dc, err := toDaemonConfig(&cfg, log, onReady, onAuthURL)
 	if err != nil {
 		finish(err, false)
 		closeWorker()
@@ -214,6 +225,8 @@ func (n *Node) Start() (err error) {
 			return errStartAborted
 		}
 		n.phase = phaseRunning
+		// Defense in depth: auth should already be cleared in onReady.
+		n.clearAuthStateLocked()
 		n.mu.Unlock()
 		n.emitEvent(map[string]any{
 			"type":    "status",
@@ -302,6 +315,9 @@ func (n *Node) claimStart() (context.Context, chan struct{}, chan struct{}, uint
 			n.gen++
 			gen := n.gen
 			n.phase = phaseStarting
+			// Fresh auth window for this Start; drop any residual UI fields.
+			n.clearAuthStateLocked()
+			n.acceptAuthURL = true
 			n.ctx = ctx
 			n.cancel = cancel
 			n.finished = finished

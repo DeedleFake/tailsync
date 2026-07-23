@@ -79,6 +79,13 @@ type Config struct {
 	// the main loop. Used by library wrappers (e.g. mobile) so Start can wait for
 	// listen success or a fast failure. Must not block indefinitely.
 	OnReady func()
+	// OnAuthURL, if non-nil, is called when interactive Tailscale login is needed
+	// during NetModeTSNet bring-up and an auth/login URL is available (for example
+	// browser login when AuthKey is empty and no enrolled tsnet state exists).
+	// Invoked from a background goroutine while Up is still waiting. Called at
+	// most once per distinct URL per listen attempt. Must return quickly.
+	// Not used for host or plain modes. Never receives AuthKey material.
+	OnAuthURL func(url string)
 }
 
 // Daemon is the synchronization service.
