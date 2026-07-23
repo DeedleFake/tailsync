@@ -59,8 +59,9 @@ type Result struct {
 type Options struct {
 	// Now is used for UpdatedAt/DeletedAt; defaults to time.Now.
 	Now func() time.Time
-	// Hash is the content hasher; defaults to SHA-256 hex of file contents.
-	Hash func(ctx context.Context, absPath string) (string, error)
+	// Hash is the content hasher; defaults to SHA-256 hex of file contents via root.Open(rel).
+	// rel is the slash-separated path relative to the scan root.
+	Hash func(ctx context.Context, rel string) (string, error)
 	// ForceRehash skips the size+mtime fast path and always hashes content.
 	ForceRehash bool
 }
@@ -72,20 +73,23 @@ func (o *Options) now() time.Time {
 	return time.Now()
 }
 
-func (o *Options) hash(ctx context.Context, absPath string) (string, error) {
+func (o *Options) hash(ctx context.Context, root *os.Root, rel string) (string, error) {
 	if o != nil && o.Hash != nil {
-		return o.Hash(ctx, absPath)
+		return o.Hash(ctx, rel)
 	}
-	return HashFile(ctx, absPath)
+	return HashFile(ctx, root, rel)
 }
 
 func (o *Options) forceRehash() bool {
 	return o != nil && o.ForceRehash
 }
 
-// HashFile returns the hex SHA-256 of the file at absPath.
-func HashFile(ctx context.Context, absPath string) (string, error) {
-	f, err := os.Open(absPath)
+// HashFile returns the hex SHA-256 of the file at rel under root.
+func HashFile(ctx context.Context, root *os.Root, rel string) (string, error) {
+	if root == nil {
+		return "", fmt.Errorf("nil sync root")
+	}
+	f, err := root.Open(rel)
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +135,8 @@ func stampUpdatedAt(now, modTime, prevUpdated time.Time) time.Time {
 }
 
 // Scan walks root, compares against idx, and returns changes without mutating idx.
-// root must be an absolute path. Relative paths in the result use forward slashes.
+// root confines all filesystem I/O to the sync directory tree (see [os.Root]).
+// Relative paths in the result use forward slashes.
 //
 // Only regular files are considered. Empty directories, symlinks, and special
 // files are not synchronized (v1 limitation). Parent dirs are created when a
@@ -141,41 +146,33 @@ func stampUpdatedAt(now, modTime, prevUpdated time.Time) time.Time {
 // ForceRehash is set. Filesystems with coarse mtime (or tools that preserve
 // mtime while rewriting content) can miss silent content changes until another
 // metadata field changes.
-func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*Result, error) {
-	root = filepath.Clean(root)
-	info, err := os.Stat(root)
-	if err != nil {
-		return nil, fmt.Errorf("stat sync root %s: %w", root, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("sync root is not a directory: %s", root)
+func Scan(ctx context.Context, root *os.Root, idx *index.Index, opts *Options) (*Result, error) {
+	if root == nil {
+		return nil, fmt.Errorf("nil sync root")
 	}
 
 	disk := make(map[string]index.Entry)
 	now := opts.now()
+	fsys := root.FS()
 
-	err = filepath.WalkDir(root, func(abs string, d fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(fsys, ".", func(rel string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if abs == root {
+		if rel == "." {
 			return nil
 		}
-		rel, err := filepath.Rel(root, abs)
-		if err != nil {
-			return err
-		}
-		// Normalize to forward slashes for stable keys.
+		// fs.WalkDir paths are slash-separated and relative to the FS root.
 		rel = filepath.ToSlash(rel)
 
 		// Skip hidden state directories at the root of the sync tree.
 		if d.IsDir() {
-			base := filepath.Base(abs)
+			base := filepath.Base(rel)
 			if base == ".tailsync" || strings.HasPrefix(base, ".tailsync-") {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
@@ -185,7 +182,7 @@ func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*R
 
 		fi, err := d.Info()
 		if err != nil {
-			return fmt.Errorf("stat %s: %w", abs, err)
+			return fmt.Errorf("stat %s: %w", rel, err)
 		}
 
 		// Fast path: reuse hash when size and mtime match a live index entry.
@@ -201,9 +198,9 @@ func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*R
 			prev.Size == fi.Size() && prev.ModTime.Equal(fi.ModTime()) && prev.Hash != "" {
 			hash = prev.Hash
 		} else {
-			hash, err = opts.hash(ctx, abs)
+			hash, err = opts.hash(ctx, root, rel)
 			if err != nil {
-				return fmt.Errorf("hash %s: %w", abs, err)
+				return fmt.Errorf("hash %s: %w", rel, err)
 			}
 		}
 
@@ -223,7 +220,7 @@ func Scan(ctx context.Context, root string, idx *index.Index, opts *Options) (*R
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("walk %s: %w", root, err)
+		return nil, fmt.Errorf("walk sync root: %w", err)
 	}
 
 	var changes []Change

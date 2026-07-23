@@ -254,7 +254,12 @@ func TestReconcileOfflineDeleteViaIndex(t *testing.T) {
 		Size:      2,
 		UpdatedAt: time.Now().Add(-time.Hour),
 	})
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	res, err := scan.Scan(context.Background(), r, idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

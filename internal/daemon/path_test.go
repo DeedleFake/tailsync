@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestAbsPath(t *testing.T) {
+func TestRelPath(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "root")
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
@@ -15,19 +15,26 @@ func TestAbsPath(t *testing.T) {
 
 	ok := []string{"a.txt", "foo/bar.txt", "foo..bar.txt", "dir/file..txt"}
 	for _, p := range ok {
-		abs, err := d.absPath(p)
+		rel, err := d.relPath(p)
 		if err != nil {
-			t.Fatalf("absPath(%q): %v", p, err)
+			t.Fatalf("relPath(%q): %v", p, err)
 		}
-		if abs == "" {
-			t.Fatalf("empty abs for %q", p)
+		if rel == "" {
+			t.Fatalf("empty rel for %q", p)
+		}
+		if filepath.IsAbs(rel) || rel[0] == '/' {
+			t.Fatalf("relPath(%q) = %q; want relative", p, rel)
 		}
 	}
 
-	bad := []string{"", "/etc/passwd", "..", "../x", "a/../../etc/passwd", "a/../..", ".", "foo/../../../x"}
+	bad := []string{
+		"", "/etc/passwd", "..", "../x", "a/../../etc/passwd", "a/../..", ".", "foo/../../../x",
+		// Reserved state trees (default StateDir lives under Dir/.tailsync).
+		".tailsync", ".tailsync/index.json", "foo/.tailsync/x", ".tailsync-tmp/x",
+	}
 	for _, p := range bad {
-		if _, err := d.absPath(p); err == nil {
-			t.Fatalf("absPath(%q) should fail", p)
+		if _, err := d.relPath(p); err == nil {
+			t.Fatalf("relPath(%q) should fail", p)
 		}
 	}
 }

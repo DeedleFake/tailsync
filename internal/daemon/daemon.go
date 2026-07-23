@@ -88,6 +88,8 @@ type Daemon struct {
 	server *tsnet.Server // NetModeTSNet only
 	local  *local.Client // NetModeHost
 	ln     net.Listener
+	// root confines sync-tree filesystem I/O to cfg.Dir (opened for Run).
+	root *os.Root
 
 	// syncMu serializes local reconcile and remote apply so scan→apply and
 	// peer mutations cannot interleave on the same path/index snapshot.
@@ -96,6 +98,10 @@ type Daemon struct {
 	// the connection deadline (up to ~5m). Future work: per-path locks or
 	// release-during-I/O with re-validation before commit.
 	syncMu sync.Mutex
+
+	// connWG tracks in-flight handleConn goroutines so Run can drain them
+	// before closing root (avoids nil/use-after-close races on d.root).
+	connWG sync.WaitGroup
 
 	mu       sync.Mutex
 	nodeID   string
@@ -180,6 +186,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("create sync dir: %w", err)
 	}
 
+	root, err := os.OpenRoot(d.cfg.Dir)
+	if err != nil {
+		return fmt.Errorf("open sync root: %w", err)
+	}
+	d.root = root
+	// Close root only after in-flight handlers finish (see network defer below).
+	// Use the local root variable so we never race a nil field on method calls.
+	defer func() {
+		_ = root.Close()
+		d.root = nil
+	}()
+
 	indexPath := filepath.Join(d.cfg.StateDir, "index.json")
 	idx, err := index.Load(indexPath)
 	if err != nil {
@@ -208,11 +226,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	// On every exit path: close the listener to unblock Accept, wait for the
-	// accept goroutine to finish, then tear down tsnet/local client state.
+	// accept goroutine to finish, drain in-flight handleConn, then tear down
+	// tsnet/local client state. Registered after the root-close defer so this
+	// runs first (LIFO) and connWG.Wait completes before root.Close.
 	// Never nil d.ln while acceptLoop may still call Accept on a shared field.
 	defer func() {
 		d.closeNetListener()
 		<-acceptDone
+		d.connWG.Wait()
 		d.closeNetworkBackend()
 	}()
 
@@ -282,7 +303,9 @@ func (d *Daemon) acceptLoop(ctx context.Context, ln net.Listener) error {
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
-		go d.handleConn(ctx, conn)
+		d.connWG.Go(func() {
+			d.handleConn(ctx, conn)
+		})
 	}
 }
 
@@ -382,9 +405,15 @@ func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message)
 	}
 }
 
-// absPath validates a relative sync path and returns its absolute location under Dir.
-// Uses filepath.IsLocal so names like "foo..bar" are allowed while ".." segments are not.
-func (d *Daemon) absPath(rel string) (string, error) {
+// relPath validates a relative sync path and returns its cleaned slash form for
+// [os.Root] I/O and index keys. Uses filepath.IsLocal so names like "foo..bar"
+// are allowed while ".." segments are not. String validation is defense in depth;
+// actual tree I/O is confined by d.root.
+//
+// Paths with any component named ".tailsync" or prefixed ".tailsync-" are
+// rejected so peers cannot write into the default StateDir (Dir/.tailsync) or
+// other reserved state trees that scan also ignores.
+func (d *Daemon) relPath(rel string) (string, error) {
 	rel = filepath.ToSlash(strings.TrimSpace(rel))
 	if rel == "" || strings.HasPrefix(rel, "/") {
 		return "", fmt.Errorf("invalid path %q", rel)
@@ -393,6 +422,11 @@ func (d *Daemon) absPath(rel string) (string, error) {
 	cleaned := pathCleanSlash(rel)
 	if cleaned == "." || cleaned == "" || !fs.ValidPath(cleaned) {
 		return "", fmt.Errorf("invalid path %q", rel)
+	}
+	for part := range strings.SplitSeq(cleaned, "/") {
+		if part == ".tailsync" || strings.HasPrefix(part, ".tailsync-") {
+			return "", fmt.Errorf("reserved path %q", rel)
+		}
 	}
 	// filepath.IsLocal rejects "..", absolute, and volume paths on all platforms.
 	fromSlash := filepath.FromSlash(cleaned)
@@ -404,7 +438,7 @@ func (d *Daemon) absPath(rel string) (string, error) {
 	if err != nil || !filepath.IsLocal(relCheck) {
 		return "", fmt.Errorf("path escapes root: %q", rel)
 	}
-	return abs, nil
+	return cleaned, nil
 }
 
 // pathCleanSlash is path.Clean for slash-separated relative paths.
@@ -423,16 +457,16 @@ func (d *Daemon) checkFileSize(path string, size int64) error {
 	return nil
 }
 
-// readFileLimited reads a file after checking size against MaxFileBytes.
-func (d *Daemon) readFileLimited(abs, rel string) ([]byte, os.FileInfo, error) {
-	fi, err := os.Stat(abs)
+// readFileLimited reads a file under the sync root after checking size against MaxFileBytes.
+func (d *Daemon) readFileLimited(rel string) ([]byte, os.FileInfo, error) {
+	fi, err := d.root.Stat(rel)
 	if err != nil {
 		return nil, nil, err
 	}
 	if err := d.checkFileSize(rel, fi.Size()); err != nil {
 		return nil, nil, err
 	}
-	data, err := os.ReadFile(abs)
+	data, err := d.root.ReadFile(rel)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -442,21 +476,17 @@ func (d *Daemon) readFileLimited(abs, rel string) ([]byte, os.FileInfo, error) {
 // serveEntry returns a live index entry after validating path. It refuses the
 // serve (without rehashing) if size/mtime have drifted from the index since the
 // last scan, so clients fail fast instead of transferring stale bytes.
+// The returned path is the cleaned relative form used for Root I/O.
 func (d *Daemon) serveEntry(ctx context.Context, rel string) (index.Entry, string, error) {
-	if _, err := d.absPath(rel); err != nil {
+	rel, err := d.relPath(rel)
+	if err != nil {
 		return index.Entry{}, "", err
 	}
-	// Normalize path key to cleaned slash form for index lookup.
-	rel = pathCleanSlash(filepath.ToSlash(rel))
 	e, ok := d.idx.Get(rel)
 	if !ok || e.Deleted {
 		return index.Entry{}, "", fmt.Errorf("file not found: %s", rel)
 	}
-	abs, err := d.absPath(rel)
-	if err != nil {
-		return index.Entry{}, "", err
-	}
-	fi, err := os.Stat(abs)
+	fi, err := d.root.Stat(rel)
 	if err != nil {
 		return index.Entry{}, "", fmt.Errorf("stat %s: %w", rel, err)
 	}
@@ -471,31 +501,31 @@ func (d *Daemon) serveEntry(ctx context.Context, rel string) (index.Entry, strin
 	if err := ctx.Err(); err != nil {
 		return index.Entry{}, "", err
 	}
-	return e, abs, nil
+	return e, rel, nil
 }
 
 func (d *Daemon) serveFile(ctx context.Context, conn net.Conn, rel string) error {
-	e, abs, err := d.serveEntry(ctx, rel)
+	e, rel, err := d.serveEntry(ctx, rel)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(abs)
+	data, err := d.root.ReadFile(rel)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", rel, err)
 	}
-	return proto.Encode(conn, proto.NewFileData(pathCleanSlash(filepath.ToSlash(rel)), e, data))
+	return proto.Encode(conn, proto.NewFileData(rel, e, data))
 }
 
 func (d *Daemon) serveSig(ctx context.Context, conn net.Conn, rel string, blockSize int) error {
 	if blockSize <= 0 {
 		blockSize = d.cfg.BlockSize
 	}
-	e, abs, err := d.serveEntry(ctx, rel)
+	e, rel, err := d.serveEntry(ctx, rel)
 	if err != nil {
 		return err
 	}
 	_ = e
-	f, err := os.Open(abs)
+	f, err := d.root.Open(rel)
 	if err != nil {
 		return err
 	}
@@ -508,18 +538,18 @@ func (d *Daemon) serveSig(ctx context.Context, conn net.Conn, rel string, blockS
 	if err != nil {
 		return err
 	}
-	return proto.Encode(conn, proto.NewSig(pathCleanSlash(filepath.ToSlash(rel)), blockSize, raw))
+	return proto.Encode(conn, proto.NewSig(rel, blockSize, raw))
 }
 
 func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel, wantHash string, blockSize int, sigRaw []byte) error {
-	e, abs, err := d.serveEntry(ctx, rel)
+	e, rel, err := d.serveEntry(ctx, rel)
 	if err != nil {
 		return err
 	}
 	if wantHash != "" && e.Hash != wantHash {
 		d.log.Debug("delta hash mismatch", "path", rel, "want", wantHash, "have", e.Hash)
 	}
-	data, err := os.ReadFile(abs)
+	data, err := d.root.ReadFile(rel)
 	if err != nil {
 		return err
 	}
@@ -542,14 +572,14 @@ func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel, wantHash st
 	if err != nil {
 		return err
 	}
-	return proto.Encode(conn, proto.NewDelta(pathCleanSlash(filepath.ToSlash(rel)), e, raw))
+	return proto.Encode(conn, proto.NewDelta(rel, e, raw))
 }
 
 func (d *Daemon) reconcile(ctx context.Context) error {
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
 
-	res, err := scan.Scan(ctx, d.cfg.Dir, d.idx, nil)
+	res, err := scan.Scan(ctx, d.root, d.idx, nil)
 	if err != nil {
 		return err
 	}
@@ -694,10 +724,11 @@ func peerLogical(msg string) error {
 // applyRemote reconciles one remote manifest entry. Returns true if local state changed.
 func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.ManifestEntry) (bool, error) {
 	// Validate path before any index mutation.
-	if _, err := d.absPath(remote.Path); err != nil {
+	rel, err := d.relPath(remote.Path)
+	if err != nil {
 		return false, fmt.Errorf("reject path: %w", err)
 	}
-	remote.Path = pathCleanSlash(filepath.ToSlash(remote.Path))
+	remote.Path = rel
 
 	d.syncMu.Lock()
 	defer d.syncMu.Unlock()
@@ -729,11 +760,7 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 		if !index.Wins(local, re) {
 			return false, nil
 		}
-		abs, err := d.absPath(remote.Path)
-		if err != nil {
-			return false, err
-		}
-		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		if err := d.root.Remove(remote.Path); err != nil && !os.IsNotExist(err) {
 			return false, fmt.Errorf("delete %s: %w", remote.Path, err)
 		}
 		// Re-check LWW before commit in case another apply raced (we hold syncMu).
@@ -765,16 +792,12 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 		if !needMeta {
 			return false, nil
 		}
-		metaAbs, err := d.absPath(remote.Path)
-		if err != nil {
-			return false, err
-		}
 		mode := remote.Mode
 		if mode == 0 {
 			mode = 0o644
 		}
 		// If the file is missing, fall through to a content pull instead of committing metadata-only.
-		if _, err := os.Stat(metaAbs); err != nil {
+		if _, err := d.root.Stat(remote.Path); err != nil {
 			if !os.IsNotExist(err) {
 				return false, fmt.Errorf("stat %s: %w", remote.Path, err)
 			}
@@ -790,18 +813,18 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 			prevMT := local.ModTime
 
 			if !remote.ModTime.IsZero() {
-				if err := os.Chtimes(metaAbs, remote.ModTime, remote.ModTime); err != nil {
+				if err := d.root.Chtimes(remote.Path, remote.ModTime, remote.ModTime); err != nil {
 					return false, fmt.Errorf("chtimes %s: %w", remote.Path, err)
 				}
 			}
-			if err := os.Chmod(metaAbs, mode); err != nil {
+			if err := d.root.Chmod(remote.Path, mode); err != nil {
 				// Best-effort rollback of mtime applied above.
 				if !remote.ModTime.IsZero() && !prevMT.IsZero() {
-					if rerr := os.Chtimes(metaAbs, prevMT, prevMT); rerr != nil {
+					if rerr := d.root.Chtimes(remote.Path, prevMT, prevMT); rerr != nil {
 						d.log.Warn("rollback mtime after chmod failure", "path", remote.Path, "err", rerr)
 					}
 				}
-				if rerr := os.Chmod(metaAbs, prevMode); rerr != nil {
+				if rerr := d.root.Chmod(remote.Path, prevMode); rerr != nil {
 					d.log.Warn("rollback mode after chmod failure", "path", remote.Path, "err", rerr)
 				}
 				return false, fmt.Errorf("chmod %s: %w", remote.Path, err)
@@ -809,7 +832,7 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 
 			// Store filesystem-observed mtime/mode so scan equality matches disk
 			// (some FS truncate timestamps; Chtimes success ≠ Stat equality).
-			actualMode, actualMT, err := diskMeta(metaAbs, mode, remote.ModTime, local.ModTime)
+			actualMode, actualMT, err := diskMeta(d.root, remote.Path, mode, remote.ModTime, local.ModTime)
 			if err != nil {
 				// Ops succeeded; still commit with best-effort values rather than
 				// rolling back a successful metadata write.
@@ -826,15 +849,10 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 		return false, nil
 	}
 
-	abs, err := d.absPath(remote.Path)
-	if err != nil {
-		return false, err
-	}
-
 	// Network I/O while holding syncMu (see field comment): serializes applies.
 	var data []byte
 	if hasLocal && !local.Deleted {
-		data, err = d.pullDelta(ctx, conn, remote, abs)
+		data, err = d.pullDelta(ctx, conn, remote)
 		if err != nil {
 			if isTransportErr(err) {
 				d.log.Debug("delta pull failed, aborting peer apply (transport)", "path", remote.Path, "err", err)
@@ -868,14 +886,14 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 	if mode == 0 {
 		mode = 0o644
 	}
-	if err := atomicfile.WriteFile(abs, data, mode); err != nil {
+	if err := atomicfile.WriteFileRoot(d.root, remote.Path, data, mode); err != nil {
 		return false, err
 	}
 	// Always commit content after a successful write so scan cannot promote the
 	// new bytes under a fresh local UpdatedAt (LWW inversion). Chtimes failure
 	// is logged; disk mtime is re-Stat'd and same-hash adopt can retry later.
 	if !remote.ModTime.IsZero() {
-		if err := os.Chtimes(abs, remote.ModTime, remote.ModTime); err != nil {
+		if err := d.root.Chtimes(remote.Path, remote.ModTime, remote.ModTime); err != nil {
 			d.log.Warn("chtimes after pull; committing content with disk mtime", "path", remote.Path, "err", err)
 		}
 	}
@@ -884,7 +902,7 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 	if fallbackMT.IsZero() && hasLocal && !local.Deleted {
 		fallbackMT = local.ModTime
 	}
-	actualMode, actualMT, err := diskMeta(abs, mode, remote.ModTime, fallbackMT)
+	actualMode, actualMT, err := diskMeta(d.root, remote.Path, mode, remote.ModTime, fallbackMT)
 	if err != nil {
 		d.log.Warn("stat after pull", "path", remote.Path, "err", err)
 	}
@@ -910,8 +928,8 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 // content apply. When remoteMT is zero, keeps fallbackMT (local/disk) instead of
 // committing a zero index mtime. On Stat failure, returns modeWant and a non-zero
 // mtime preference of remoteMT then fallbackMT.
-func diskMeta(abs string, modeWant os.FileMode, remoteMT, fallbackMT time.Time) (os.FileMode, time.Time, error) {
-	fi, err := os.Stat(abs)
+func diskMeta(root *os.Root, rel string, modeWant os.FileMode, remoteMT, fallbackMT time.Time) (os.FileMode, time.Time, error) {
+	fi, err := root.Stat(rel)
 	if err != nil {
 		mt := remoteMT
 		if mt.IsZero() {
@@ -980,11 +998,11 @@ func (d *Daemon) pullFull(ctx context.Context, conn net.Conn, remote index.Manif
 	return msg.Payload, nil
 }
 
-func (d *Daemon) pullDelta(ctx context.Context, conn net.Conn, remote index.ManifestEntry, abs string) ([]byte, error) {
+func (d *Daemon) pullDelta(ctx context.Context, conn net.Conn, remote index.ManifestEntry) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	basis, fi, err := d.readFileLimited(abs, remote.Path)
+	basis, fi, err := d.readFileLimited(remote.Path)
 	if err != nil {
 		// Local basis missing/unreadable is a logical failure for this path.
 		return nil, peerLogical(err.Error())

@@ -22,6 +22,16 @@ func writeFile(t *testing.T, root, rel, content string) {
 	}
 }
 
+func openRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	r, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	return r
+}
+
 func TestScanDetectsAddModifyDelete(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "keep.txt", "keep")
@@ -33,7 +43,7 @@ func TestScanDetectsAddModifyDelete(t *testing.T) {
 
 	idx := index.New()
 	// Empty index: all files are adds.
-	res, err := scan.Scan(context.Background(), root, idx, opts)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +67,7 @@ func TestScanDetectsAddModifyDelete(t *testing.T) {
 
 	later := fixed.Add(time.Hour)
 	opts.Now = func() time.Time { return later }
-	res2, err := scan.Scan(context.Background(), root, idx, opts)
+	res2, err := scan.Scan(context.Background(), openRoot(t, root), idx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +111,7 @@ func TestOfflineDeletionOnlyInIndex(t *testing.T) {
 		UpdatedAt: time.Now().Add(-time.Hour),
 	})
 
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +134,7 @@ func TestSkipsTailsyncStateDir(t *testing.T) {
 	writeFile(t, root, ".tailsync-tmp/x", "x")
 
 	idx := index.New()
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +149,7 @@ func TestResurrectionFromTombstone(t *testing.T) {
 	idx.MarkDeleted("back.txt", time.Now().Add(-time.Hour))
 	writeFile(t, root, "back.txt", "alive")
 
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,11 +160,10 @@ func TestResurrectionFromTombstone(t *testing.T) {
 
 func TestHashFile(t *testing.T) {
 	root := t.TempDir()
-	p := filepath.Join(root, "f")
-	if err := os.WriteFile(p, []byte("hello"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, err := scan.HashFile(context.Background(), p)
+	h, err := scan.HashFile(context.Background(), openRoot(t, root), "f")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +178,7 @@ func TestModeOnlyChange(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "m.txt", "same")
 	idx := index.New()
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +196,7 @@ func TestModeOnlyChange(t *testing.T) {
 	_ = os.Chtimes(p, e.ModTime, e.ModTime)
 	_ = fi
 
-	res2, err := scan.Scan(context.Background(), root, idx, nil)
+	res2, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +214,7 @@ func TestMtimeOnlyChange(t *testing.T) {
 	fixed := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 	opts := &scan.Options{Now: func() time.Time { return fixed }}
 	idx := index.New()
-	res, err := scan.Scan(context.Background(), root, idx, opts)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +233,7 @@ func TestMtimeOnlyChange(t *testing.T) {
 
 	later := fixed.Add(time.Minute)
 	opts.Now = func() time.Time { return later }
-	res2, err := scan.Scan(context.Background(), root, idx, opts)
+	res2, err := scan.Scan(context.Background(), openRoot(t, root), idx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +257,7 @@ func TestMtimeOnlyChange(t *testing.T) {
 
 	// No-op scan: nothing changed on disk → no changes.
 	scan.Apply(idx, res2)
-	res3, err := scan.Scan(context.Background(), root, idx, opts)
+	res3, err := scan.Scan(context.Background(), openRoot(t, root), idx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +270,7 @@ func TestModeAndMtimeChange(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "both.txt", "same")
 	idx := index.New()
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +286,7 @@ func TestModeAndMtimeChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res2, err := scan.Scan(context.Background(), root, idx, nil)
+	res2, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,11 +305,42 @@ func TestModeAndMtimeChange(t *testing.T) {
 	}
 }
 
+func TestScanSkipsSymlinksAndEscapeLinks(t *testing.T) {
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "sync")
+	outside := filepath.Join(base, "out")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, rootDir, "ok.txt", "ok")
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(rootDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	idx := index.New()
+	res, err := scan.Scan(context.Background(), openRoot(t, rootDir), idx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Changes) != 1 || res.Changes[0].Path != "ok.txt" {
+		t.Fatalf("scan should only see regular files, got %+v", res.Changes)
+	}
+	if _, ok := res.Disk["link"]; ok {
+		t.Fatal("symlink must not appear in disk map")
+	}
+}
+
 func TestApplyDoesNotClobberNewer(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "f.txt", "v1")
 	idx := index.New()
-	res, err := scan.Scan(context.Background(), root, idx, nil)
+	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

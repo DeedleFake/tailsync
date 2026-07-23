@@ -113,8 +113,9 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge.
 - **Metadata** — Mode and mtime are synchronized end-to-end; peers adopt metadata when the same content hash wins LWW.
 - **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`), discovers peers via LocalAPI status, and dials with the host network stack (routed by `tailscaled`).
+- **Sync-tree confinement** — File I/O under `-dir` (scan, serve, apply, deletes) uses Go’s [`os.Root`](https://pkg.go.dev/os#Root) so path traversal and symlink escapes cannot reach outside the sync directory; index/state paths under `-state` are separate trusted local storage. Peer paths under `.tailsync` / `.tailsync-*` are rejected so the default state dir cannot be written via sync. On multi-party tailnets, prefer an explicit `-state` path outside `-dir`.
 
-State directories under the sync tree named `.tailsync` or `.tailsync-*` are ignored by the scanner.
+State directories under the sync tree named `.tailsync` or `.tailsync-*` are ignored by the scanner and cannot be applied from peers.
 
 ## Android / gomobile
 
