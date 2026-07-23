@@ -103,16 +103,23 @@ func (n *Node) Start() (err error) {
 	finish := func(runErr error, wasReady bool) {
 		finishOnce.Do(func() {
 			n.mu.Lock()
+			var injectGen uint64
 			if n.finished == finished && n.gen == gen {
 				n.runErr = runErr
 				n.ctx = nil
 				n.cancel = nil
 				n.finished = nil
+				n.d = nil
+				injectGen = n.injectGen
+				n.injectGen = 0
 				// workerDone stays until closeWorker so claimStart can drain it.
 				n.phase = phaseIdle
 				n.clearAuthStateLocked()
 			}
 			n.mu.Unlock()
+			if injectGen != 0 {
+				androidNet.clearInject(injectGen)
+			}
 			close(finished)
 
 			if wasReady {
@@ -181,6 +188,18 @@ func (n *Node) Start() (err error) {
 		closeWorker()
 		return errStartAborted
 	}
+
+	// Publish daemon for NotifyNetworkChange and register package-level inject
+	// before Run. During tsnet.Up the daemon inject is still nil (no-op); after
+	// Up the daemon installs NetMon.InjectEvent and fires a catch-up so host
+	// snapshot updates made while Up blocked are re-read. injectGen is cleared
+	// in finish so a concurrent Stop cannot leave a stale package callback.
+	n.mu.Lock()
+	if n.finished == finished && n.gen == gen && n.phase == phaseStarting {
+		n.d = d
+		n.injectGen = androidNet.setInject(d.InjectNetworkChange)
+	}
+	n.mu.Unlock()
 
 	// Always launch while we own finished so Stop's wait is satisfied.
 	go func() {
@@ -341,6 +360,28 @@ func (n *Node) ownsStart(finished chan struct{}, gen uint64) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.finished == finished && n.gen == gen && n.phase == phaseStarting
+}
+
+// NotifyNetworkChange tells this node's running tsnet netmon that host
+// connectivity changed. Prefer updating SetNetworkInterfaces* /
+// SetDefaultRoute* first, then call this. No-op if the node is not running,
+// not in tsnet mode, or NetMon is not yet available (during tsnet.Up; after
+// Up a catch-up InjectEvent applies the latest snapshot). Prefer this method
+// over package-level NotifyNetworkChange when more than one Node may run in
+// the process (package-level targets only the most recently started node).
+//
+// Safe concurrent with Stop: copies the daemon pointer under mu, then
+// InjectNetworkChange copies its inject func under a separate lock.
+func (n *Node) NotifyNetworkChange() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	d := n.d
+	n.mu.Unlock()
+	if d != nil {
+		d.InjectNetworkChange()
+	}
 }
 
 // Stop cancels the daemon and waits for it to exit (with a timeout).

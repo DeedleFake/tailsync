@@ -145,10 +145,42 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 | `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs, status, auth); handlers must return quickly |
 | `Node.StatusJSON()` | Snapshot for UI (never includes `AuthKey`; zero config fields are shown as effective defaults; includes `phase`; may include `needs_login` / `auth_url`) |
 | `Version()` | Module or build version string |
+| `SetNetworkInterfacesJSON` / `SetNetworkInterfaces` | Supply host interfaces for tsnet (required on Android API 30+ before `Start`) |
+| `SetDefaultRouteInterface` / `SetDefaultGateway` | Default route/gateway from `ConnectivityManager` / `LinkProperties` |
+| `NotifyNetworkChange` / `Node.NotifyNetworkChange` | After interface/route updates while running, inject a netmon event (no-op if not running) |
 
 `NetMode` values: `"tsnet"` (default), `"host"`, `"plain"` (localhost TCP for tests only).
 
 `IsRunning()` is true while starting, serving, or stopping (resources may still be held after a timed-out `Stop`). `StatusJSON`’s `running` field is true only while serving after a successful `Start`. `phase` is one of `idle`, `starting`, `running`, or `stopping`.
+
+### Network interfaces on Android (required for tsnet)
+
+On **Android API 30+**, Go’s `net.Interfaces()` fails with permission errors. tsnet/netmon will not start correctly unless the app supplies interfaces **before** `node.start()` (and updates them when connectivity changes).
+
+The `INTERNET` permission is still required for sockets; it does **not** fix `net.Interfaces` alone.
+
+**Required Kotlin flow**
+
+1. Use `ConnectivityManager` / `LinkProperties` to build the interface list (name, index, flags, MTU, address CIDRs) and the default route interface name + gateway IP.
+2. Call `SetNetworkInterfacesJSON` (or the `NetworkInterfaceList` builder + `SetNetworkInterfaces`), `SetDefaultRouteInterface`, and `SetDefaultGateway` **before** `node.start()`.
+3. On network callbacks (`NetworkCallback`, default-network changes, etc.), update the same APIs again and call `NotifyNetworkChange()` (or `node.notifyNetworkChange()`). Snapshot updates are visible to the getter immediately; `NotifyNetworkChange` wakes netmon after `tsnet.Up` has installed the monitor (during the long Up/auth window it is a no-op, then the daemon fires a catch-up inject).
+
+Interface JSON example:
+
+```json
+[
+  {"name":"wlan0","index":21,"flags":51,"mtu":1500,"addrs":["192.168.1.2/24","fe80::1/64"]},
+  {"name":"lo","index":1,"flags":5,"mtu":65536,"addrs":["127.0.0.1/8"]}
+]
+```
+
+`flags` are Go `net.Flags` bits (`1=Up`, `2=Broadcast`, `4=Loopback`, `8=PointToPoint`, `16=Multicast`, `32=Running`). Mirror OS flags when possible; live uplinks should include `Up|Running` (example `51` = `Up|Broadcast|Multicast|Running`). Prefer including at least loopback and the active uplink; an empty list is accepted but can break tsnet bring-up.
+
+`SetDefaultGateway` rejects non-empty strings that are not valid IP addresses (empty string still clears).
+
+**Multi-node:** package-level `NotifyNetworkChange` targets only the most recently started `Node`. If you run more than one node in-process, call `node.notifyNetworkChange()` on each.
+
+Desktop/CLI is unchanged: if the app never sets interfaces, netmon keeps using `net.Interfaces()`.
 
 ### Kotlin example
 
@@ -182,6 +214,18 @@ node.setListener(EventListener { eventJSON ->
     }
 })
 
+// Supply interfaces from ConnectivityManager BEFORE start (API 30+).
+// Build JSON from LinkProperties / NetworkInterface; flags = Go net.Flags bits
+// (include FlagRunning=32 on live uplinks when the OS reports it).
+fun publishNetworkToGo(ifacesJson: String, defaultIf: String, gateway: String) {
+    Mobile.setNetworkInterfacesJSON(ifacesJson)
+    Mobile.setDefaultRouteInterface(defaultIf) // "" if network lost
+    Mobile.setDefaultGateway(gateway)         // "" if none / lost; invalid IP throws
+}
+
+// Call once before start, and again from NetworkCallback when paths change.
+publishNetworkToGo(currentIfacesJson(), currentDefaultIf(), currentGateway())
+
 // From a foreground service — never call start() on the main thread
 // (tsnet bring-up / browser login can block long enough to ANR).
 serviceScope.launch(Dispatchers.IO) {
@@ -191,6 +235,11 @@ serviceScope.launch(Dispatchers.IO) {
         Log.e("tailsync", "start failed", e)
     }
 }
+
+// On ConnectivityManager network callbacks (after updating interfaces/route):
+publishNetworkToGo(currentIfacesJson(), currentDefaultIf(), currentGateway())
+// Prefer node.notifyNetworkChange() if multiple Nodes may exist in-process.
+Mobile.notifyNetworkChange() // package-level: most recently started node only
 
 serviceScope.launch(Dispatchers.IO) {
     node.stop() // no-op if already stopped; call when the service is destroyed
@@ -216,6 +265,7 @@ After the user completes login in the browser, `Start` finishes when the node is
 - Run `start()` / `stop()` off the main thread; keep `OnEvent` non-blocking (post to the main thread only for UI).
 - Do not log or ship auth keys. Mobile events redact secret-like **attribute keys**; free-text log messages are not scrubbed.
 - Zero `Port`, interval, or `BlockSize` mean daemon defaults; `StatusJSON` reports effective values (for example port `5960`).
+- For tsnet on Android API 30+, set network interfaces and default route **before** `start()`; update + `notifyNetworkChange` on connectivity changes (see above).
 
 ## Development
 

@@ -115,6 +115,11 @@ type Daemon struct {
 	// syncMu serializes reconcile and remote apply commits (see package comment).
 	syncMu sync.Mutex
 
+	// netMu guards injectNetChange so mobile NotifyNetworkChange can race Stop
+	// without observing a half-torn-down callback.
+	netMu           sync.Mutex
+	injectNetChange func() // NetModeTSNet: mon.InjectEvent after Up; nil otherwise
+
 	// connWG tracks in-flight handleConn goroutines so Run can drain them
 	// before closing root (avoids nil/use-after-close races on d.root).
 	connWG sync.WaitGroup
@@ -126,6 +131,28 @@ type Daemon struct {
 	// appliesSinceSave counts successful index mutations since last Save.
 	// Touched only while holding syncMu.
 	appliesSinceSave int
+}
+
+// InjectNetworkChange signals tsnet's netmon that host connectivity changed
+// (Android ConnectivityManager updates). No-op when not in tsnet mode, before
+// Up succeeds, or after closeNetworkBackend. Safe concurrent with Run/Stop:
+// copies the inject func under netMu, then invokes it outside the lock.
+func (d *Daemon) InjectNetworkChange() {
+	if d == nil {
+		return
+	}
+	d.netMu.Lock()
+	f := d.injectNetChange
+	d.netMu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+func (d *Daemon) setInjectNetChange(f func()) {
+	d.netMu.Lock()
+	d.injectNetChange = f
+	d.netMu.Unlock()
 }
 
 // New constructs a Daemon from cfg (does not start it).

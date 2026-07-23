@@ -389,9 +389,21 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 	}
 	stopAuthWatch()
 
+	// Enable Android (and other hosts) to inject netmon events after route
+	// updates. Capture InjectEvent under netMu; clear before Close so concurrent
+	// InjectNetworkChange either runs on a live monitor or no-ops.
+	// Catch-up InjectEvent re-reads the host snapshot: mid-Up NotifyNetworkChange
+	// is a no-op while injectNetChange is still nil, and NetMon may have polled
+	// an older list during Up.
+	if mon, ok := s.Sys().NetMon.GetOK(); ok && mon != nil {
+		d.setInjectNetChange(mon.InjectEvent)
+		mon.InjectEvent()
+	}
+
 	addr := ":" + strconv.Itoa(d.cfg.Port)
 	ln, err := s.Listen("tcp", addr)
 	if err != nil {
+		d.setInjectNetChange(nil)
 		_ = s.Close()
 		d.server = nil
 		return fmt.Errorf("tsnet listen %s: %w", addr, err)
@@ -462,7 +474,11 @@ func (d *Daemon) closeNetListener() {
 
 // closeNetworkBackend tears down tsnet/local clients and clears listener state.
 // Call only after acceptLoop has exited (so no concurrent Accept on d.ln).
+// Clears injectNetChange under netMu before Close so concurrent
+// InjectNetworkChange does not race a torn-down monitor pointer after we drop
+// the only remaining reference path from the daemon.
 func (d *Daemon) closeNetworkBackend() {
+	d.setInjectNetChange(nil)
 	d.ln = nil
 	if d.server != nil {
 		_ = d.server.Close()

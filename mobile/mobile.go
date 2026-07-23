@@ -33,6 +33,24 @@
 //
 // Secrets such as AuthKey are never included. Log attribute keys named like
 // authkey/token are redacted; free-text log messages are not scrubbed.
+//
+// # Android network interfaces (tsnet)
+//
+// On Android API 30+, Go's net.Interfaces() fails with permission errors.
+// Before Node.Start with NetMode "tsnet", the host app must supply the current
+// interface list and default route from ConnectivityManager:
+//
+//	SetNetworkInterfacesJSON(...) // or SetNetworkInterfaces(list)
+//	SetDefaultRouteInterface("wlan0")
+//	SetDefaultGateway("192.168.1.1")
+//	node.Start()
+//
+// On network callbacks, update the same APIs and call NotifyNetworkChange()
+// (package-level or Node method) so tsnet re-evaluates links. Notifies during
+// the long tsnet.Up window are no-ops until NetMon is installed; the daemon
+// then fires a catch-up inject. Prefer Node.NotifyNetworkChange when more than
+// one Node may run. INTERNET permission is still required; it does not fix
+// net.Interfaces alone. See README for the full Kotlin flow.
 package mobile
 
 import (
@@ -129,6 +147,12 @@ type Node struct {
 	finished   chan struct{} // closed when ownership ends (per generation)
 	workerDone chan struct{} // closed when Run/abort fully done (per generation)
 	runErr     error         // set before finished is closed
+
+	// d is the daemon for the active generation (starting/running). Used by
+	// NotifyNetworkChange. Cleared in finish under mu before phase→idle.
+	d *daemon.Daemon
+	// injectGen is the androidNet inject registration for this generation.
+	injectGen uint64
 }
 
 // Version returns the module version from build info when available.
