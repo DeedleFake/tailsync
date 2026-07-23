@@ -325,3 +325,441 @@ func TestRunCancelAcceptLoopRace(t *testing.T) {
 		}
 	}
 }
+
+// freePort binds 127.0.0.1:0 and returns the chosen port after closing.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// TestFSWatchSyncOnChange verifies watch + sync-on-change deliver a post-start
+// write to a peer when BOTH sides use a very long SyncInterval (and ScanInterval).
+// That only passes with a bidirectional session: A dials after local change and
+// B reverse-pulls A's file without waiting for B's sync ticker.
+func TestFSWatchSyncOnChange(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	stateA := t.TempDir()
+	stateB := t.TempDir()
+
+	portA := freePort(t)
+	portB := freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var readyA, readyB sync.Once
+	ready := make(chan struct{}, 2)
+	markReady := func() {
+		ready <- struct{}{}
+	}
+
+	// Long intervals on both sides: success under 5s proves watch → reconcile →
+	// sync-on-change bidirectional delivery, not peer tickers.
+	cfgA := daemon.Config{
+		Dir:           dirA,
+		StateDir:      stateA,
+		Hostname:      "watch-a",
+		Port:          portA,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portB)},
+		ScanInterval:  time.Hour,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 50 * time.Millisecond,
+		OnReady:       func() { readyA.Do(markReady) },
+	}
+	cfgB := daemon.Config{
+		Dir:           dirB,
+		StateDir:      stateB,
+		Hostname:      "watch-b",
+		Port:          portB,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portA)},
+		ScanInterval:  time.Hour,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 50 * time.Millisecond,
+		OnReady:       func() { readyB.Do(markReady) },
+	}
+
+	da, err := daemon.New(cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := daemon.New(cfgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() { errA <- da.Run(ctx) }()
+	go func() { errB <- db.Run(ctx) }()
+
+	for range 2 {
+		select {
+		case <-ready:
+		case err := <-errA:
+			t.Fatalf("A exited: %v", err)
+		case err := <-errB:
+			t.Fatalf("B exited: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for ready")
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(dirA, "fast.txt"), []byte("fast-sync"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFile(t, filepath.Join(dirB, "fast.txt"), "fast-sync", 5*time.Second, errA, errB)
+
+	cancel()
+	<-errA
+	<-errB
+}
+
+// TestSyncOnChangeDeliversToPeer asserts that a local write on A reaches B via
+// sync-on-change when both SyncIntervals are hours (B never dials on its ticker).
+func TestSyncOnChangeDeliversToPeer(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	stateA := t.TempDir()
+	stateB := t.TempDir()
+
+	portA := freePort(t)
+	portB := freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Barrier: first AfterSyncPeers after OnReady is the initial post-listen sync.
+	initialSyncDone := make(chan struct{})
+	var initialOnce sync.Once
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+
+	cfgA := daemon.Config{
+		Dir:           dirA,
+		StateDir:      stateA,
+		Hostname:      "sync-a",
+		Port:          portA,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portB)},
+		ScanInterval:  time.Hour,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 50 * time.Millisecond,
+		OnReady: func() {
+			readyOnce.Do(func() { close(ready) })
+		},
+		AfterSyncPeers: func() {
+			initialOnce.Do(func() { close(initialSyncDone) })
+		},
+	}
+	cfgB := daemon.Config{
+		Dir:          dirB,
+		StateDir:     stateB,
+		Hostname:     "sync-b",
+		Port:         portB,
+		NetMode:      daemon.NetModePlain,
+		ListenHost:   "127.0.0.1",
+		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portA)},
+		ScanInterval: time.Hour,
+		SyncInterval: time.Hour,
+		DisableWatch: true,
+	}
+
+	da, err := daemon.New(cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := daemon.New(cfgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() { errA <- da.Run(ctx) }()
+	go func() { errB <- db.Run(ctx) }()
+
+	select {
+	case <-ready:
+	case err := <-errA:
+		t.Fatalf("A exited: %v", err)
+	case err := <-errB:
+		t.Fatalf("B exited: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for ready")
+	}
+
+	select {
+	case <-initialSyncDone:
+	case err := <-errA:
+		t.Fatalf("A exited before initial sync: %v", err)
+	case err := <-errB:
+		t.Fatalf("B exited before initial sync: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for initial syncPeers")
+	}
+
+	if err := os.WriteFile(filepath.Join(dirA, "kick.txt"), []byte("kick"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// B must receive content via A's sync-on-change reverse-pull phase.
+	waitFile(t, filepath.Join(dirB, "kick.txt"), "kick", 5*time.Second, errA, errB)
+
+	cancel()
+	<-errA
+	<-errB
+}
+
+// TestWatchDebounceCoalesces ensures a burst of FS events produces one (or few)
+// reconciles rather than one per event.
+func TestWatchDebounceCoalesces(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	port := freePort(t)
+
+	var mu sync.Mutex
+	reconciles := 0
+	changedN := 0
+
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+
+	d, err := daemon.New(daemon.Config{
+		Dir:           dir,
+		StateDir:      state,
+		Hostname:      "debounce",
+		Port:          port,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		ScanInterval:  time.Hour,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 100 * time.Millisecond,
+		OnReady: func() {
+			readyOnce.Do(func() { close(ready) })
+		},
+		AfterReconcile: func(changed bool) {
+			mu.Lock()
+			reconciles++
+			if changed {
+				changedN++
+			}
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- d.Run(ctx) }()
+
+	select {
+	case <-ready:
+	case err := <-errCh:
+		t.Fatalf("Run exited: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for ready")
+	}
+
+	mu.Lock()
+	afterReady := reconciles
+	mu.Unlock()
+
+	// Burst of creates while debounce window keeps resetting.
+	for i := range 20 {
+		name := filepath.Join(dir, "f"+strconv.Itoa(i)+".txt")
+		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait past debounce + processing; should not approach 20 reconciles.
+	deadline := time.Now().Add(2 * time.Second)
+	var final, finalChanged int
+	for {
+		mu.Lock()
+		final = reconciles
+		finalChanged = changedN
+		mu.Unlock()
+		// At least one post-ready reconcile with changes should land.
+		if final > afterReady && finalChanged > 0 {
+			// Give a little extra quiet time so a second debounce cannot still be pending.
+			time.Sleep(250 * time.Millisecond)
+			mu.Lock()
+			final = reconciles
+			finalChanged = changedN
+			mu.Unlock()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for debounced reconcile: reconciles=%d afterReady=%d changed=%d",
+				final, afterReady, finalChanged)
+		}
+		select {
+		case err := <-errCh:
+			t.Fatalf("daemon exited: %v", err)
+		default:
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	extra := final - afterReady
+	if extra > 5 {
+		t.Fatalf("debounce failed to coalesce: %d reconciles after burst (afterReady=%d total=%d)",
+			extra, afterReady, final)
+	}
+	if finalChanged < 1 {
+		t.Fatal("expected at least one changed reconcile after writes")
+	}
+
+	cancel()
+	<-errCh
+}
+
+// TestDisableWatchFallsBackToScanInterval ensures timer-only mode still syncs.
+func TestDisableWatchFallsBackToScanInterval(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	stateA := t.TempDir()
+	stateB := t.TempDir()
+
+	portA := freePort(t)
+	portB := freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfgA := daemon.Config{
+		Dir:          dirA,
+		StateDir:     stateA,
+		Hostname:     "nowatch-a",
+		Port:         portA,
+		NetMode:      daemon.NetModePlain,
+		ListenHost:   "127.0.0.1",
+		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portB)},
+		ScanInterval: 100 * time.Millisecond,
+		SyncInterval: 100 * time.Millisecond,
+		DisableWatch: true,
+	}
+	cfgB := daemon.Config{
+		Dir:          dirB,
+		StateDir:     stateB,
+		Hostname:     "nowatch-b",
+		Port:         portB,
+		NetMode:      daemon.NetModePlain,
+		ListenHost:   "127.0.0.1",
+		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portA)},
+		ScanInterval: 100 * time.Millisecond,
+		SyncInterval: 100 * time.Millisecond,
+		DisableWatch: true,
+	}
+
+	if err := os.WriteFile(filepath.Join(dirA, "timer.txt"), []byte("timer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	da, err := daemon.New(cfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := daemon.New(cfgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	go func() { errA <- da.Run(ctx) }()
+	go func() { errB <- db.Run(ctx) }()
+
+	waitFile(t, filepath.Join(dirB, "timer.txt"), "timer", 10*time.Second, errA, errB)
+
+	// Post-start write still propagates via scan + sync intervals.
+	if err := os.WriteFile(filepath.Join(dirA, "timer2.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFile(t, filepath.Join(dirB, "timer2.txt"), "two", 10*time.Second, errA, errB)
+
+	cancel()
+	<-errA
+	<-errB
+}
+
+// TestReconcileNoChangeNoSyncThrash writes nothing after ready and checks that
+// AfterReconcile is not flooded with changed=true (remote/self thrash guard).
+func TestReconcileIdleNoChanged(t *testing.T) {
+	dir := t.TempDir()
+	state := t.TempDir()
+	port := freePort(t)
+
+	var mu sync.Mutex
+	changedN := 0
+
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+
+	d, err := daemon.New(daemon.Config{
+		Dir:           dir,
+		StateDir:      state,
+		Hostname:      "idle",
+		Port:          port,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		ScanInterval:  50 * time.Millisecond,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 20 * time.Millisecond,
+		DisableWatch:  true, // force periodic reconcile only
+		OnReady: func() {
+			readyOnce.Do(func() { close(ready) })
+		},
+		AfterReconcile: func(changed bool) {
+			if !changed {
+				return
+			}
+			mu.Lock()
+			changedN++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- d.Run(ctx) }()
+
+	select {
+	case <-ready:
+	case err := <-errCh:
+		t.Fatalf("Run exited: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for ready")
+	}
+
+	// Empty dir: initial reconcile may be changed=false; further scans stay quiet.
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	n := changedN
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("idle reconciles reported changed=%d want 0", n)
+	}
+
+	cancel()
+	<-errCh
+}

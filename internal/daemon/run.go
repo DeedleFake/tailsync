@@ -12,7 +12,29 @@ import (
 	"deedles.dev/tailsync/internal/index"
 )
 
+// signal coalesces multiple requests into a single buffered wake-up so the
+// Run loop never blocks a producer and never stacks unbounded work.
+type signal chan struct{}
+
+func newSignal() signal {
+	return make(chan struct{}, 1)
+}
+
+func (s signal) request() {
+	select {
+	case s <- struct{}{}:
+	default:
+	}
+}
+
 // Run starts the daemon until ctx is cancelled.
+//
+// Main loop roles:
+//   - FS watch (debounced) and ScanInterval both request reconcile
+//   - successful reconcile with peer-visible changes requests peer sync
+//   - SyncInterval is a backup/catch-up peer sync
+//   - sync requests are single-flighted by the sequential select loop; a
+//     request that arrives during syncPeers stays pending for a follow-up run
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := os.MkdirAll(d.cfg.StateDir, 0o755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
@@ -43,8 +65,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.nodeID = d.cfg.Hostname
 
 	// Initial reconcile: detect offline deletions and local changes.
-	if err := d.reconcile(ctx); err != nil {
+	// Peer sync runs after listen; if this applied offline changes, the
+	// immediate bidirectional syncPeers below exchanges with peers without
+	// waiting for SyncInterval.
+	changed, err := d.reconcile(ctx)
+	if err != nil {
 		return fmt.Errorf("initial reconcile: %w", err)
+	}
+	if d.cfg.AfterReconcile != nil {
+		d.cfg.AfterReconcile(changed)
 	}
 
 	if err := d.listen(ctx); err != nil {
@@ -72,6 +101,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.closeNetworkBackend()
 	}()
 
+	needReconcile := newSignal()
+	needSync := newSignal()
+
+	// FS watch goroutine: must stop before root closes. stop waits for the
+	// watcher to exit and Close itself (no use-after-close).
+	stopWatch := d.startFSWatch(ctx, needReconcile.request)
+	defer stopWatch()
+
 	d.log.Info("tailsync started",
 		"dir", d.cfg.Dir,
 		"state", d.cfg.StateDir,
@@ -80,6 +117,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"net_mode", d.cfg.NetMode.String(),
 		"index_entries", d.idx.Len(),
 		"max_file_bytes", d.cfg.MaxFileBytes,
+		"watch", !d.cfg.DisableWatch,
 	)
 	if d.cfg.OnReady != nil {
 		d.cfg.OnReady()
@@ -90,8 +128,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 	syncTick := time.NewTicker(d.cfg.SyncInterval)
 	defer syncTick.Stop()
 
-	// Immediate peer sync attempt.
-	d.syncPeers(ctx)
+	doSync := func() {
+		d.syncPeers(ctx)
+		if d.cfg.AfterSyncPeers != nil {
+			d.cfg.AfterSyncPeers()
+		}
+	}
+
+	// Immediate peer sync attempt (covers initial offline changes).
+	doSync()
+
+	doReconcile := func() {
+		changed, err := d.reconcile(ctx)
+		if err != nil {
+			d.log.Error("reconcile", "err", err)
+			return
+		}
+		if d.cfg.AfterReconcile != nil {
+			d.cfg.AfterReconcile(changed)
+		}
+		if changed {
+			// Must not run syncPeers while holding syncMu; reconcile already
+			// released the lock. Coalesce via buffered signal so rapid edits
+			// share one bidirectional peer session.
+			needSync.request()
+		}
+	}
 
 	for {
 		select {
@@ -109,11 +171,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		case <-scanTick.C:
-			if err := d.reconcile(ctx); err != nil {
-				d.log.Error("reconcile", "err", err)
-			}
+			// Safety-net full rescan (also used when watch is disabled).
+			doReconcile()
+		case <-needReconcile:
+			// Debounced FS events.
+			doReconcile()
 		case <-syncTick.C:
-			d.syncPeers(ctx)
+			// Backup/catch-up peer sync.
+			doSync()
+		case <-needSync:
+			// Sync-on-change (and coalesced follow-up if more changes arrived
+			// during a prior syncPeers).
+			doSync()
 		}
 	}
 }

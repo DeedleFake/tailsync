@@ -26,6 +26,14 @@ func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
 	_ = conn.SetDeadline(deadline)
 }
 
+// handleConn serves a bidirectional sync session (listener side):
+//
+//  1. Hello / HelloOK
+//  2. Serve dialer's pull (ManifestReq / FileReq / DeltaReq) until SyncDone
+//  3. Reverse-pull from dialer (ManifestReq → apply)
+//  4. Send SyncDone; close
+//
+// See syncWith for the dialer-side sequence.
 func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	d.setConnDeadline(conn, ctx)
@@ -50,8 +58,8 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Serve requests until EOF or fatal error. Recoverable per-request errors
-	// send TypeError and keep the session open so the client can continue.
+	// Phase 1: serve dialer's pull until SyncDone.
+	// Recoverable per-request errors send TypeError and keep the session open.
 	for {
 		if err := ctx.Err(); err != nil {
 			return
@@ -64,6 +72,9 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+		if msg.Header.Type == proto.TypeSyncDone {
+			break
+		}
 		if err := d.serveMsg(ctx, conn, msg); err != nil {
 			d.log.Debug("serve message", "remote", remote, "type", msg.Header.Type, "err", err)
 			if encodeErr := proto.Encode(conn, proto.NewError(err.Error())); encodeErr != nil {
@@ -75,6 +86,17 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 				return
 			}
 		}
+	}
+
+	// Phase 2: reverse-pull dialer's state so their local changes land here
+	// without waiting for our SyncInterval.
+	if _, err := d.pullFromConn(ctx, conn); err != nil {
+		d.log.Debug("reverse pull", "remote", remote, "err", err)
+		return
+	}
+	if err := proto.Encode(conn, proto.NewSyncDone()); err != nil {
+		d.log.Debug("sync_done", "remote", remote, "err", err)
+		return
 	}
 }
 

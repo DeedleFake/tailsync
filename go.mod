@@ -2,7 +2,10 @@ module deedles.dev/tailsync
 
 go 1.26.5
 
-require tailscale.com v1.102.0
+require (
+	github.com/fsnotify/fsnotify v1.10.1
+	tailscale.com v1.102.0
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect

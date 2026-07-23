@@ -33,6 +33,10 @@ const (
 	// requested the peer's signature — only TypeDeltaReq is used.)
 	TypeDeltaReq Type = "delta_req"
 	TypeDelta    Type = "delta"
+	// TypeSyncDone ends one pull phase of a bidirectional session. After the
+	// dialer finishes pulling, it sends SyncDone; the listener then pulls from
+	// the dialer and sends SyncDone when finished. Both sides close after that.
+	TypeSyncDone Type = "sync_done"
 	TypeError    Type = "error"
 	TypePing     Type = "ping"
 	TypePong     Type = "pong"
@@ -222,4 +226,9 @@ func NewDelta(path string, e index.Entry, delta []byte) Message {
 // NewError builds an error message.
 func NewError(err string) Message {
 	return Message{Header: Header{Type: TypeError, Error: err}}
+}
+
+// NewSyncDone marks the end of a pull phase in a bidirectional session.
+func NewSyncDone() Message {
+	return Message{Header: Header{Type: TypeSyncDone}}
 }

@@ -75,8 +75,8 @@ import (
 // Dir is required and must be an absolute path. StateDir, when set, must also
 // be absolute; otherwise it defaults to Dir/.tailsync (resolved by the daemon).
 //
-// Zero values for Port, ScanIntervalMs, SyncIntervalMs, and BlockSize mean
-// “use daemon defaults”. StatusJSON reports those effective defaults.
+// Zero values for Port, ScanIntervalMs, SyncIntervalMs, WatchDebounceMs, and
+// BlockSize mean “use daemon defaults”. StatusJSON reports those effective defaults.
 type Config struct {
 	// Dir is the absolute path to the sync root (required).
 	Dir string
@@ -94,10 +94,15 @@ type Config struct {
 	Peers string
 	// ServiceName filters discovered peers by hostname/DNS substring.
 	ServiceName string
-	// ScanIntervalMs is the local rescan period in milliseconds (0 = default).
+	// ScanIntervalMs is the safety-net full rescan period in milliseconds (0 = default).
 	ScanIntervalMs int64
-	// SyncIntervalMs is the peer sync period in milliseconds (0 = default).
+	// SyncIntervalMs is the backup peer sync period in milliseconds (0 = default).
+	// Local index changes also open an immediate coalesced bidirectional peer session.
 	SyncIntervalMs int64
+	// WatchDebounceMs is the FS-event debounce before reconcile (0 = default).
+	WatchDebounceMs int64
+	// DisableWatch skips filesystem watching (timer-only scan). Useful in tests.
+	DisableWatch bool
 	// BlockSize is the delta block size (0 = default).
 	BlockSize int
 	// NetMode selects networking: "tsnet" (default for mobile), "host", or "plain".
@@ -226,24 +231,26 @@ func (n *Node) StatusJSON() (string, error) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	port, scanMs, syncMs, block := effectiveDisplay(n.cfg)
+	port, scanMs, syncMs, watchMs, block := effectiveDisplay(n.cfg)
 	st := statusSnapshot{
-		Type:       "status",
-		Running:    n.phase == phaseRunning,
-		Phase:      n.phase.String(),
-		Dir:        n.cfg.Dir,
-		StateDir:   n.cfg.StateDir,
-		Hostname:   n.cfg.Hostname,
-		Port:       port,
-		NetMode:    effectiveNetMode(n.cfg.NetMode),
-		Service:    n.cfg.ServiceName,
-		Peers:      n.cfg.Peers,
-		ScanMs:     scanMs,
-		SyncMs:     syncMs,
-		BlockSize:  block,
-		Version:    Version(),
-		NeedsLogin: n.needsLogin,
-		AuthURL:    n.authURL,
+		Type:         "status",
+		Running:      n.phase == phaseRunning,
+		Phase:        n.phase.String(),
+		Dir:          n.cfg.Dir,
+		StateDir:     n.cfg.StateDir,
+		Hostname:     n.cfg.Hostname,
+		Port:         port,
+		NetMode:      effectiveNetMode(n.cfg.NetMode),
+		Service:      n.cfg.ServiceName,
+		Peers:        n.cfg.Peers,
+		ScanMs:       scanMs,
+		SyncMs:       syncMs,
+		WatchMs:      watchMs,
+		DisableWatch: n.cfg.DisableWatch,
+		BlockSize:    block,
+		Version:      Version(),
+		NeedsLogin:   n.needsLogin,
+		AuthURL:      n.authURL,
 	}
 	b, err := json.Marshal(st)
 	if err != nil {
@@ -277,6 +284,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.SyncIntervalMs < 0 {
 		return errors.New("SyncIntervalMs must be >= 0")
 	}
+	if cfg.WatchDebounceMs < 0 {
+		return errors.New("WatchDebounceMs must be >= 0")
+	}
 	if cfg.BlockSize < 0 {
 		return errors.New("BlockSize must be >= 0")
 	}
@@ -291,7 +301,7 @@ func effectiveNetMode(mode string) string {
 	return mode
 }
 
-func effectiveDisplay(cfg Config) (port int, scanMs, syncMs int64, block int) {
+func effectiveDisplay(cfg Config) (port int, scanMs, syncMs, watchMs int64, block int) {
 	port = cfg.Port
 	if port == 0 {
 		port = daemon.DefaultPort
@@ -304,11 +314,15 @@ func effectiveDisplay(cfg Config) (port int, scanMs, syncMs int64, block int) {
 	if syncMs == 0 {
 		syncMs = daemon.DefaultSyncInterval.Milliseconds()
 	}
+	watchMs = cfg.WatchDebounceMs
+	if watchMs == 0 {
+		watchMs = daemon.DefaultWatchDebounce.Milliseconds()
+	}
 	block = cfg.BlockSize
 	if block == 0 {
 		block = delta.DefaultBlockSize
 	}
-	return port, scanMs, syncMs, block
+	return port, scanMs, syncMs, watchMs, block
 }
 
 func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL func(string)) (daemon.Config, error) {
@@ -335,49 +349,56 @@ func toDaemonConfig(cfg *Config, log *slog.Logger, onReady func(), onAuthURL fun
 		}
 	}
 
-	var scanEvery, syncEvery time.Duration
+	var scanEvery, syncEvery, watchDebounce time.Duration
 	if cfg.ScanIntervalMs > 0 {
 		scanEvery = time.Duration(cfg.ScanIntervalMs) * time.Millisecond
 	}
 	if cfg.SyncIntervalMs > 0 {
 		syncEvery = time.Duration(cfg.SyncIntervalMs) * time.Millisecond
 	}
+	if cfg.WatchDebounceMs > 0 {
+		watchDebounce = time.Duration(cfg.WatchDebounceMs) * time.Millisecond
+	}
 
 	return daemon.Config{
-		Dir:          cfg.Dir,
-		StateDir:     cfg.StateDir,
-		Hostname:     cfg.Hostname,
-		ServiceName:  cfg.ServiceName,
-		Port:         cfg.Port,
-		AuthKey:      cfg.AuthKey,
-		ScanInterval: scanEvery,
-		SyncInterval: syncEvery,
-		BlockSize:    cfg.BlockSize,
-		Logger:       log,
-		NetMode:      netMode,
-		Peers:        peers,
-		OnReady:      onReady,
-		OnAuthURL:    onAuthURL,
+		Dir:           cfg.Dir,
+		StateDir:      cfg.StateDir,
+		Hostname:      cfg.Hostname,
+		ServiceName:   cfg.ServiceName,
+		Port:          cfg.Port,
+		AuthKey:       cfg.AuthKey,
+		ScanInterval:  scanEvery,
+		SyncInterval:  syncEvery,
+		WatchDebounce: watchDebounce,
+		DisableWatch:  cfg.DisableWatch,
+		BlockSize:     cfg.BlockSize,
+		Logger:        log,
+		NetMode:       netMode,
+		Peers:         peers,
+		OnReady:       onReady,
+		OnAuthURL:     onAuthURL,
 	}, nil
 }
 
 type statusSnapshot struct {
-	Type       string `json:"type"`
-	Running    bool   `json:"running"`
-	Phase      string `json:"phase"`
-	Dir        string `json:"dir"`
-	StateDir   string `json:"state_dir,omitempty"`
-	Hostname   string `json:"hostname,omitempty"`
-	Port       int    `json:"port"`
-	NetMode    string `json:"net_mode"`
-	Service    string `json:"service,omitempty"`
-	Peers      string `json:"peers,omitempty"`
-	ScanMs     int64  `json:"scan_interval_ms"`
-	SyncMs     int64  `json:"sync_interval_ms"`
-	BlockSize  int    `json:"block_size"`
-	Version    string `json:"version"`
-	NeedsLogin bool   `json:"needs_login,omitempty"`
-	AuthURL    string `json:"auth_url,omitempty"`
+	Type         string `json:"type"`
+	Running      bool   `json:"running"`
+	Phase        string `json:"phase"`
+	Dir          string `json:"dir"`
+	StateDir     string `json:"state_dir,omitempty"`
+	Hostname     string `json:"hostname,omitempty"`
+	Port         int    `json:"port"`
+	NetMode      string `json:"net_mode"`
+	Service      string `json:"service,omitempty"`
+	Peers        string `json:"peers,omitempty"`
+	ScanMs       int64  `json:"scan_interval_ms"`
+	SyncMs       int64  `json:"sync_interval_ms"`
+	WatchMs      int64  `json:"watch_debounce_ms"`
+	DisableWatch bool   `json:"disable_watch,omitempty"`
+	BlockSize    int    `json:"block_size"`
+	Version      string `json:"version"`
+	NeedsLogin   bool   `json:"needs_login,omitempty"`
+	AuthURL      string `json:"auth_url,omitempty"`
 }
 
 // noteAuthURL records interactive login state and emits a single "auth" event

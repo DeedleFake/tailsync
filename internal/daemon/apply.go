@@ -98,6 +98,11 @@ func decideApply(local index.Entry, hasLocal bool, remote index.Entry, diskPrese
 // maxParallelPeerSyncs (each in-flight content pull may buffer up to
 // MaxFileBytes). Disk and index commits remain serialized via syncMu.
 // The main Run loop waits for this call to return before the next reconcile.
+//
+// Each session is bidirectional (see syncWith): both sides exchange manifests
+// and pull missing content on the same connection, so a dial after local
+// changes delivers those changes to the peer without waiting for the peer's
+// SyncInterval.
 func (d *Daemon) syncPeers(ctx context.Context) {
 	peers, err := d.listPeers(ctx)
 	if err != nil {
@@ -129,6 +134,15 @@ func (d *Daemon) syncPeers(ctx context.Context) {
 	wg.Wait()
 }
 
+// syncWith opens a bidirectional sync session with addr:
+//
+//  1. Hello / HelloOK
+//  2. Dialer pulls listener (ManifestReq → apply entries, FileReq/DeltaReq as needed)
+//  3. Dialer sends SyncDone
+//  4. Dialer serves while listener pulls (ManifestReq / FileReq / DeltaReq)
+//  5. Listener sends SyncDone; both sides close
+//
+// This delivers the dialer's local index changes to the peer in one session.
 func (d *Daemon) syncWith(ctx context.Context, addr string) error {
 	conn, err := d.dial(ctx, addr)
 	if err != nil {
@@ -154,25 +168,46 @@ func (d *Daemon) syncWith(ctx context.Context, addr string) error {
 		return fmt.Errorf("connected to self")
 	}
 
-	if err := proto.Encode(conn, proto.NewManifestReq()); err != nil {
+	// Phase 1: pull from peer.
+	n, err := d.pullFromConn(ctx, conn)
+	if err != nil {
 		return err
+	}
+	// End pull phase so the peer can reverse-pull our manifest.
+	if err := proto.Encode(conn, proto.NewSyncDone()); err != nil {
+		return fmt.Errorf("sync_done: %w", err)
+	}
+	// Phase 2: serve peer's reverse pull until their SyncDone (or EOF).
+	if err := d.servePullPhase(ctx, conn); err != nil {
+		return err
+	}
+	d.log.Info("synced peer", "addr", addr, "remote_node", resp.Header.NodeID, "pulled_entries", n)
+	return nil
+}
+
+// pullFromConn requests the peer's manifest and applies each entry (pulling
+// file/delta content as needed on conn). Returns the number of manifest
+// entries received. On transport failure during apply, aborts early.
+func (d *Daemon) pullFromConn(ctx context.Context, conn net.Conn) (int, error) {
+	if err := proto.Encode(conn, proto.NewManifestReq()); err != nil {
+		return 0, err
 	}
 	man, err := proto.Decode(conn)
 	if err != nil {
-		return fmt.Errorf("manifest: %w", err)
+		return 0, fmt.Errorf("manifest: %w", err)
 	}
 	if man.Header.Type == proto.TypeError {
-		return fmt.Errorf("manifest error: %s", man.Header.Error)
+		return 0, fmt.Errorf("manifest error: %s", man.Header.Error)
 	}
 	if man.Header.Type != proto.TypeManifest {
-		return fmt.Errorf("expected manifest, got %q", man.Header.Type)
+		return 0, fmt.Errorf("expected manifest, got %q", man.Header.Type)
 	}
 
 	changed := false
 	var transportErr error
 	for _, remote := range man.Header.Entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return len(man.Header.Entries), err
 		}
 		d.setConnDeadline(conn, ctx)
 		did, err := d.applyRemote(ctx, conn, remote)
@@ -180,7 +215,7 @@ func (d *Daemon) syncWith(ctx context.Context, addr string) error {
 			// Per-entry logical errors: continue. Transport/decode failures abort.
 			if isTransportErr(err) {
 				transportErr = err
-				d.log.Warn("peer transport error, aborting peer sync", "addr", addr, "err", err)
+				d.log.Warn("peer transport error, aborting pull", "err", err)
 				break
 			}
 			d.log.Warn("apply remote entry", "path", remote.Path, "err", err)
@@ -194,16 +229,47 @@ func (d *Daemon) syncWith(ctx context.Context, addr string) error {
 		d.syncMu.Lock()
 		if err := d.idx.Save(); err != nil {
 			d.syncMu.Unlock()
-			return fmt.Errorf("save index: %w", err)
+			return len(man.Header.Entries), fmt.Errorf("save index: %w", err)
 		}
 		d.appliesSinceSave = 0
 		d.syncMu.Unlock()
 	}
 	if transportErr != nil {
-		return transportErr
+		return len(man.Header.Entries), transportErr
 	}
-	d.log.Info("synced peer", "addr", addr, "remote_node", resp.Header.NodeID, "entries", len(man.Header.Entries))
-	return nil
+	return len(man.Header.Entries), nil
+}
+
+// servePullPhase answers ManifestReq / FileReq / DeltaReq until the peer
+// sends SyncDone or the connection ends. Used by the dialer after its own
+// pull completes so the listener can reverse-pull.
+func (d *Daemon) servePullPhase(ctx context.Context, conn net.Conn) error {
+	remote := conn.RemoteAddr().String()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d.setConnDeadline(conn, ctx)
+		msg, err := proto.Decode(conn)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("serve pull phase: %w", err)
+		}
+		if msg.Header.Type == proto.TypeSyncDone {
+			return nil
+		}
+		if err := d.serveMsg(ctx, conn, msg); err != nil {
+			d.log.Debug("serve message", "remote", remote, "type", msg.Header.Type, "err", err)
+			if encodeErr := proto.Encode(conn, proto.NewError(err.Error())); encodeErr != nil {
+				return encodeErr
+			}
+			if msg.Header.Type == "" || errors.Is(err, errUnexpectedMsgType) {
+				return err
+			}
+		}
+	}
 }
 
 // applyRemote reconciles one remote manifest entry.

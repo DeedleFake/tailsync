@@ -28,10 +28,11 @@ On each machine (with [Tailscale](https://tailscale.com/) already running and lo
 tailsync -dir /path/to/shared
 ```
 
-By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens on TCP port `5960` on the host’s Tailscale IP(s) and periodically:
+By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens on TCP port `5960` on the host’s Tailscale IP(s) and:
 
-1. Scans the sync directory and reconciles against the on-disk index (adds, modifies, and offline deletions).
-2. Connects to online tailnet peers (or addresses from `-peers`) and merges remote manifests using last-writer-wins on `updated_at`.
+1. Watches the sync directory for filesystem events (debounced), with a periodic full rescan as a safety net, and reconciles against the on-disk index (adds, modifies, and offline deletions).
+2. When local index content changes, opens an immediate **bidirectional** peer session (both sides pull on one connection, coalesced); a periodic sync interval remains as catch-up for offline peers.
+3. Merges remote manifests using last-writer-wins on `updated_at`.
 
 Keep host clocks roughly in sync (NTP). Conflict resolution uses wall-clock `updated_at`; equal-timestamp ties use a stable total order (deletion preference, then content hash, mode, then mtime).
 
@@ -56,8 +57,10 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-port` | `5960` | TCP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
 | `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery) |
-| `-scan-interval` | `30s` | Local directory rescan period |
-| `-sync-interval` | `45s` | Peer sync period |
+| `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
+| `-sync-interval` | `45s` | Backup peer sync period (local changes also open a bidirectional session) |
+| `-watch-debounce` | `300ms` | Debounce wait after FS events before reconcile (`0` = default) |
+| `-no-watch` | `false` | Disable filesystem watching; rely on `-scan-interval` only |
 | `-block-size` | `4096` | Delta block size |
 | `-tsnet` | `false` | Use embedded tsnet instead of host `tailscaled` |
 | `-plain` | `false` | Plain TCP on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
@@ -105,7 +108,9 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 ## How it works
 
 - **Index** — JSON under `-state` with size, mtime, mode, content SHA-256, and deletion tombstones (GC’d after 30 days by default). After a tombstone is dropped, a lagging peer that never saw the delete can re-introduce the file; keep the TTL longer than the maximum expected peer offline window.
-- **Scan** — Walks regular files only; live index entries missing on disk become tombstones (offline deletion). Empty directories and symlinks are not synced.
+- **FS watch + debounce** — Local edits are detected via recursive filesystem events (debounced, default 300 ms), then reconciled. Paths under `.tailsync` / `.tailsync-*` are ignored. If watching fails to start (unsupported platform/permissions), tailsync logs a warning and falls back to timer-only scanning.
+- **Scan** — Walks regular files only; live index entries missing on disk become tombstones (offline deletion). Empty directories and symlinks are not synced. `-scan-interval` remains a full safety-net rescan when watch is active.
+- **Sync-on-change** — When reconcile applies peer-visible local index changes, a coalesced bidirectional peer session is opened: the dialer pulls the peer’s manifest, then the peer reverse-pulls the dialer’s, so a local write is delivered without waiting for the peer’s `-sync-interval`. That interval remains backup/catch-up for offline peers. End-to-end lag is typically on the order of watch debounce plus one dial/RTT (not a full sync interval).
 - **Hash fast path** — Reuses the stored SHA-256 when size and mtime still match the index. Silent content rewrites that preserve mtime are not detected until another field changes.
 - **Delta** — Adler-style rolling weak checksums and MD5 strong match per block; full-file SHA-256 is authoritative after apply. Whole-file buffers are used for transfers (default max 64 MiB per file).
 - **Concurrency** — Local reconcile and peer apply share one mutex, including during network transfers (correctness over throughput; a slow peer can delay scans).
@@ -139,7 +144,7 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 
 | Go | Role |
 |----|------|
-| `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `BlockSize`, `NetMode` |
+| `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `WatchDebounceMs`, `DisableWatch`, `BlockSize`, `NetMode` |
 | `NewNode(cfg)` | Validates config and returns a stopped `Node` |
 | `Node.Start()` / `Stop()` / `IsRunning()` | Lifecycle. `Start` blocks until listening succeeds or fails; call it off the main thread |
 | `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs, status, auth); handlers must return quickly |

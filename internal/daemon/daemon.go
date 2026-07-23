@@ -24,6 +24,9 @@ const (
 	DefaultPort         = 5960
 	DefaultScanInterval = 30 * time.Second
 	DefaultSyncInterval = 45 * time.Second
+	// DefaultWatchDebounce is how long to wait after an FS event before
+	// reconciling when filesystem watching is active.
+	DefaultWatchDebounce = 300 * time.Millisecond
 	// DefaultMaxFileBytes is the max single-file size loaded into memory for
 	// transfer/delta (v1 keeps whole-file buffers). Wire framing is also capped
 	// by proto.MaxMessageSize.
@@ -56,10 +59,22 @@ type Config struct {
 	// AuthKey is an optional Tailscale auth key for NetModeTSNet
 	// (else interactive login / existing tsnet state). Unused in host mode.
 	AuthKey string
-	// ScanInterval is how often to rescan the local directory.
+	// ScanInterval is the safety-net full rescan period. When filesystem
+	// watching is active, local edits are reconciled via debounced FS events;
+	// this interval still walks the tree to catch missed events.
 	ScanInterval time.Duration
-	// SyncInterval is how often to reconnect/sync with peers.
+	// SyncInterval is the backup peer sync period for catch-up (offline peers,
+	// missed notifications). Local index changes also request an immediate
+	// coalesced bidirectional peer session (both sides pull on one connection)
+	// without waiting for this ticker.
 	SyncInterval time.Duration
+	// WatchDebounce is how long to wait after an FS event before reconciling
+	// (0 = DefaultWatchDebounce). Ignored when DisableWatch is set or watch
+	// fails to start.
+	WatchDebounce time.Duration
+	// DisableWatch skips filesystem watching and relies on ScanInterval only.
+	// Useful in tests and on platforms where watching is unavailable.
+	DisableWatch bool
 	// BlockSize for rsync-style signatures.
 	BlockSize int
 	// MaxFileBytes rejects local files larger than this for serve/pull (0 = default).
@@ -86,6 +101,14 @@ type Config struct {
 	// most once per distinct URL per listen attempt. Must return quickly.
 	// Not used for host or plain modes. Never receives AuthKey material.
 	OnAuthURL func(url string)
+	// AfterReconcile, if non-nil, is called after each successful reconcile with
+	// whether peer-visible local index content changed. For tests. Must return
+	// quickly and must not call back into the daemon.
+	AfterReconcile func(changed bool)
+	// AfterSyncPeers, if non-nil, is called after each syncPeers batch completes
+	// (including empty peer lists). For tests. Must return quickly and must not
+	// call back into the daemon.
+	AfterSyncPeers func()
 }
 
 // Daemon is the synchronization service.
@@ -96,8 +119,8 @@ type Config struct {
 //     optional network → re-check LWW → disk/index commit). Concurrent peer
 //     applies may run network I/O in parallel while unlocked; only decide and
 //     commit hold syncMu. The main Run loop does not start reconcile until
-//     syncPeers returns, so scanTick cannot interleave with an in-flight peer
-//     sync batch.
+//     syncPeers returns, so reconcile signals cannot interleave with an
+//     in-flight peer sync batch.
 //   - index.Index has its own RWMutex for map access. Holding syncMu does not
 //     replace index locks; index methods still lock internally. Callers that
 //     need a stable multi-step view of the index relative to disk must hold
@@ -196,6 +219,9 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.SyncInterval <= 0 {
 		cfg.SyncInterval = DefaultSyncInterval
+	}
+	if cfg.WatchDebounce <= 0 {
+		cfg.WatchDebounce = DefaultWatchDebounce
 	}
 	if cfg.BlockSize <= 0 {
 		cfg.BlockSize = delta.DefaultBlockSize
