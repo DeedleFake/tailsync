@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -340,8 +343,19 @@ func (d *Daemon) listenPlain() error {
 }
 
 func (d *Daemon) listenTSNet(ctx context.Context) error {
+	tsnetDir := filepath.Join(d.cfg.StateDir, "tsnet")
+	if err := os.MkdirAll(tsnetDir, 0o700); err != nil {
+		return fmt.Errorf("create tsnet state dir: %w", err)
+	}
+	// Android-only: avoid logpolicy.LogsDir panic when default cache/state
+	// paths are unusable. Non-Android keeps Tailscale's normal log dirs;
+	// existing TS_LOGS_DIR is never overwritten.
+	if err := ensureAndroidTSLogsDir(d.cfg.StateDir, d.log); err != nil {
+		return err
+	}
+
 	s := &tsnet.Server{
-		Dir:      filepath.Join(d.cfg.StateDir, "tsnet"),
+		Dir:      tsnetDir,
 		Hostname: d.cfg.Hostname,
 		AuthKey:  d.cfg.AuthKey,
 		Logf: func(format string, args ...any) {
@@ -411,6 +425,37 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 	d.ln = ln
 	d.nodeID = d.cfg.Hostname
 	d.log.Info("listening on tailnet (tsnet)", "addr", ln.Addr().String(), "hostname", d.cfg.Hostname, "mode", NetModeTSNet.String())
+	return nil
+}
+
+// ensureAndroidTSLogsDir points Tailscale logpolicy at a writable directory under
+// stateDir on Android only. ipnlocal/sockstatlog calls logpolicy.LogsDir during
+// backend start; without a safe path it panics ("no safe place found to store
+// log state"). Java Os.setenv is not always visible to the Go runtime, so we
+// set the env from Go.
+//
+// No-op on non-Android platforms so desktop/server tsnet keeps default log
+// locations. No-op when TS_LOGS_DIR is already set so hosts can override.
+func ensureAndroidTSLogsDir(stateDir string, log *slog.Logger) error {
+	if runtime.GOOS != "android" {
+		return nil
+	}
+	if os.Getenv("TS_LOGS_DIR") != "" {
+		return nil
+	}
+	logsDir := filepath.Join(stateDir, "tsnet-logs")
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
+		return fmt.Errorf("create tsnet logs dir: %w", err)
+	}
+	if err := os.Setenv("TS_LOGS_DIR", logsDir); err != nil {
+		if log != nil {
+			log.Warn("set TS_LOGS_DIR", "err", err, "dir", logsDir)
+		}
+		return nil
+	}
+	if log != nil {
+		log.Info("tsnet log dir", "dir", logsDir, "component", "tsnet")
+	}
 	return nil
 }
 

@@ -3,8 +3,12 @@ package daemon
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -292,4 +296,50 @@ func TestMultiListenerOneSideClosedStillAccepts(t *testing.T) {
 		t.Fatalf("accept after one side closed: %v", err)
 	}
 	_ = sc.Close()
+}
+
+func TestEnsureAndroidTSLogsDirNoopOffAndroid(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("this case covers non-Android builds only")
+	}
+	prev, had := os.LookupEnv("TS_LOGS_DIR")
+	if had {
+		t.Cleanup(func() { _ = os.Setenv("TS_LOGS_DIR", prev) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv("TS_LOGS_DIR") })
+	}
+	_ = os.Unsetenv("TS_LOGS_DIR")
+
+	dir := t.TempDir()
+	if err := ensureAndroidTSLogsDir(dir, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	if v := os.Getenv("TS_LOGS_DIR"); v != "" {
+		t.Fatalf("TS_LOGS_DIR must not be set off Android, got %q", v)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tsnet-logs")); !os.IsNotExist(err) {
+		t.Fatalf("tsnet-logs must not be created off Android: %v", err)
+	}
+}
+
+func TestEnsureAndroidTSLogsDirPreservesExistingEnv(t *testing.T) {
+	// On Android the helper returns early when TS_LOGS_DIR is already set.
+	// Off Android it is a no-op; either way an existing value must survive.
+	const sentinel = "/tmp/tailsync-test-ts-logs-dir-preserve"
+	prev, had := os.LookupEnv("TS_LOGS_DIR")
+	if had {
+		t.Cleanup(func() { _ = os.Setenv("TS_LOGS_DIR", prev) })
+	} else {
+		t.Cleanup(func() { _ = os.Unsetenv("TS_LOGS_DIR") })
+	}
+	if err := os.Setenv("TS_LOGS_DIR", sentinel); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := ensureAndroidTSLogsDir(dir, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("TS_LOGS_DIR"); got != sentinel {
+		t.Fatalf("TS_LOGS_DIR overwritten: got %q want %q", got, sentinel)
+	}
 }
