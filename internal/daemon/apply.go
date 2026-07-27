@@ -208,6 +208,50 @@ func isSoftDialNetworkErr(err error) bool {
 	return false
 }
 
+// dialHello dials addr, exchanges Hello/HelloOK, remembers remoteNode→addr in
+// the hot set, and returns the live connection. On error the connection is
+// closed. After success the caller owns conn and must Close it.
+//
+// prepare, if non-nil, runs after dial and before Hello so callers can set
+// deadlines: notify uses a short cap; pull uses setConnDeadline (longer).
+func (d *Daemon) dialHello(ctx context.Context, addr string, prepare func(net.Conn)) (net.Conn, string, error) {
+	conn, err := d.dial(ctx, addr)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %w", errDial, err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = conn.Close()
+		}
+	}()
+	if prepare != nil {
+		prepare(conn)
+	}
+
+	if err := proto.Encode(conn, proto.NewHello(d.nodeID, d.cfg.Port)); err != nil {
+		return nil, "", err
+	}
+	resp, err := proto.Decode(conn)
+	if err != nil {
+		return nil, "", fmt.Errorf("hello response: %w", err)
+	}
+	if resp.Header.Type == proto.TypeError {
+		return nil, "", fmt.Errorf("hello error: %s", resp.Header.Error)
+	}
+	if resp.Header.Type != proto.TypeHelloOK {
+		return nil, "", fmt.Errorf("unexpected hello response %q", resp.Header.Type)
+	}
+	remoteNode := resp.Header.NodeID
+	if remoteNode == d.nodeID {
+		return nil, "", fmt.Errorf("connected to self")
+	}
+	// Outbound dial addr is authoritative for this peer.
+	d.peers.remember(remoteNode, addr)
+	ok = true
+	return conn, remoteNode, nil
+}
+
 // pullFrom opens a pull-only session with addr:
 //
 //  1. Hello / HelloOK (learns remote nodeID into hot set)
@@ -216,33 +260,13 @@ func isSoftDialNetworkErr(err error) bool {
 //
 // Local writes are delivered via notify + peer-initiated pull, not reverse-pull.
 func (d *Daemon) pullFrom(ctx context.Context, addr string) error {
-	conn, err := d.dial(ctx, addr)
+	conn, remoteNode, err := d.dialHello(ctx, addr, func(c net.Conn) {
+		d.setConnDeadline(c, ctx)
+	})
 	if err != nil {
-		return fmt.Errorf("%w: %w", errDial, err)
-	}
-	defer conn.Close()
-	d.setConnDeadline(conn, ctx)
-
-	if err := proto.Encode(conn, proto.NewHello(d.nodeID, d.cfg.Port)); err != nil {
 		return err
 	}
-	resp, err := proto.Decode(conn)
-	if err != nil {
-		return fmt.Errorf("hello response: %w", err)
-	}
-	if resp.Header.Type == proto.TypeError {
-		return fmt.Errorf("hello error: %s", resp.Header.Error)
-	}
-	if resp.Header.Type != proto.TypeHelloOK {
-		return fmt.Errorf("unexpected hello response %q", resp.Header.Type)
-	}
-	remoteNode := resp.Header.NodeID
-	if remoteNode == d.nodeID {
-		return fmt.Errorf("connected to self")
-	}
-	// Outbound dial addr is the correct re-dial target (may differ from peer's
-	// advertised port only if we used a non-standard dial form).
-	d.peers.remember(remoteNode, addr)
+	defer conn.Close()
 
 	n, err := d.pullFromConn(ctx, conn)
 	if err != nil {

@@ -2,95 +2,168 @@ package daemon_test
 
 import (
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"deedles.dev/tailsync/internal/daemon"
 )
 
-// TestNotifyPullDeliversFile: A writes → notify → B pulls (long SyncInterval).
-func TestNotifyPullDeliversFile(t *testing.T) {
-	dirA := t.TempDir()
-	dirB := t.TempDir()
-	stateA := t.TempDir()
-	stateB := t.TempDir()
-	portA := freePort(t)
-	portB := freePort(t)
+// meshNode is one plain-mode daemon in a mesh fixture.
+type meshNode struct {
+	Dir, State string
+	Port       int
+	D          *daemon.Daemon
+	Err        chan error
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var readyA, readyB sync.Once
-	ready := make(chan struct{}, 2)
-	markReady := func() { ready <- struct{}{} }
-
-	cfgA := daemon.Config{
-		Dir:           dirA,
-		StateDir:      stateA,
-		Hostname:      "notify-a",
-		Port:          portA,
-		NetMode:       daemon.NetModePlain,
-		ListenHost:    "127.0.0.1",
-		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portB)},
-		ScanInterval:  time.Hour,
-		SyncInterval:  time.Hour,
-		WatchDebounce: 40 * time.Millisecond,
-		OnReady:       func() { readyA.Do(markReady) },
+// startMesh launches n fully-meshed plain TCP daemons on 127.0.0.1 and waits
+// until all OnReady callbacks fire. configure may adjust intervals/hooks per
+// node (i = 0..n-1); Port/Peers/ListenHost/NetMode/OnReady are set after
+// configure so wiring stays consistent. Uses freePorts and waitFile helpers
+// from daemon_test.go.
+func startMesh(t *testing.T, ctx context.Context, n int, configure func(i int, cfg *daemon.Config)) []meshNode {
+	t.Helper()
+	if n < 1 {
+		t.Fatalf("startMesh: n=%d", n)
 	}
-	cfgB := daemon.Config{
-		Dir:           dirB,
-		StateDir:      stateB,
-		Hostname:      "notify-b",
-		Port:          portB,
-		NetMode:       daemon.NetModePlain,
-		ListenHost:    "127.0.0.1",
-		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portA)},
-		ScanInterval:  time.Hour,
-		SyncInterval:  time.Hour,
-		WatchDebounce: 40 * time.Millisecond,
-		OnReady:       func() { readyB.Do(markReady) },
+	ports := freePorts(t, n)
+	nodes := make([]meshNode, n)
+	for i := range n {
+		nodes[i] = meshNode{
+			Dir:   t.TempDir(),
+			State: t.TempDir(),
+			Port:  ports[i],
+			Err:   make(chan error, 1),
+		}
 	}
 
-	da, err := daemon.New(cfgA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db, err := daemon.New(cfgB)
-	if err != nil {
-		t.Fatal(err)
+	ready := make(chan struct{}, n)
+	for i := range n {
+		var peers []string
+		for j := range n {
+			if j == i {
+				continue
+			}
+			peers = append(peers, "127.0.0.1:"+strconv.Itoa(nodes[j].Port))
+		}
+		cfg := daemon.Config{
+			Dir:           nodes[i].Dir,
+			StateDir:      nodes[i].State,
+			Hostname:      "mesh-" + strconv.Itoa(i),
+			Port:          nodes[i].Port,
+			NetMode:       daemon.NetModePlain,
+			ListenHost:    "127.0.0.1",
+			Peers:         peers,
+			ScanInterval:  time.Hour,
+			SyncInterval:  time.Hour,
+			WatchDebounce: 40 * time.Millisecond,
+		}
+		if configure != nil {
+			configure(i, &cfg)
+		}
+		// Re-assert mesh wiring so configure cannot break peer topology.
+		cfg.Dir = nodes[i].Dir
+		cfg.StateDir = nodes[i].State
+		cfg.Port = nodes[i].Port
+		cfg.NetMode = daemon.NetModePlain
+		cfg.ListenHost = "127.0.0.1"
+		cfg.Peers = peers
+		prevReady := cfg.OnReady
+		cfg.OnReady = func() {
+			if prevReady != nil {
+				prevReady()
+			}
+			ready <- struct{}{}
+		}
+		d, err := daemon.New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nodes[i].D = d
 	}
 
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
-	go func() { errA <- da.Run(ctx) }()
-	go func() { errB <- db.Run(ctx) }()
+	for i := range nodes {
+		go func(i int) { nodes[i].Err <- nodes[i].D.Run(ctx) }(i)
+	}
+	waitMeshReady(t, n, ready, nodes)
+	return nodes
+}
 
-	for range 2 {
+// pairDaemons is startMesh for two mutual peers.
+func pairDaemons(t *testing.T, ctx context.Context, configure func(i int, cfg *daemon.Config)) (a, b meshNode) {
+	t.Helper()
+	nodes := startMesh(t, ctx, 2, configure)
+	return nodes[0], nodes[1]
+}
+
+func waitMeshReady(t *testing.T, n int, ready <-chan struct{}, nodes []meshNode) {
+	t.Helper()
+	// Fan-in daemon exits so a failed Run fails immediately (same as pre-refactor
+	// select on Err). Restore each buffered Err after reading so stopMesh can join.
+	type exit struct {
+		i   int
+		err error
+	}
+	exited := make(chan exit, 1)
+	done := make(chan struct{})
+	defer close(done)
+	for i, node := range nodes {
+		go func(i int, errCh chan error) {
+			select {
+			case err := <-errCh:
+				errCh <- err // restore for stopMesh
+				select {
+				case exited <- exit{i: i, err: err}:
+				case <-done:
+				}
+			case <-done:
+			}
+		}(i, node.Err)
+	}
+	for range n {
 		select {
 		case <-ready:
-		case err := <-errA:
-			t.Fatalf("A exited: %v", err)
-		case err := <-errB:
-			t.Fatalf("B exited: %v", err)
+		case e := <-exited:
+			t.Fatalf("daemon %d exited during ready: %v", e.i, e.err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("timeout waiting for ready")
 		}
 	}
+}
 
-	if err := os.WriteFile(filepath.Join(dirA, "n.txt"), []byte("from-a"), 0o644); err != nil {
+func meshErrs(nodes ...meshNode) []<-chan error {
+	out := make([]<-chan error, len(nodes))
+	for i, n := range nodes {
+		out[i] = n.Err
+	}
+	return out
+}
+
+func stopMesh(cancel context.CancelFunc, nodes ...meshNode) {
+	cancel()
+	for _, n := range nodes {
+		<-n.Err
+	}
+}
+
+// TestNotifyPullDeliversFile: A writes → notify → B pulls (long SyncInterval).
+func TestNotifyPullDeliversFile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a, b := pairDaemons(t, ctx, func(i int, cfg *daemon.Config) {
+		cfg.Hostname = []string{"notify-a", "notify-b"}[i]
+	})
+	defer stopMesh(cancel, a, b)
+
+	if err := os.WriteFile(filepath.Join(a.Dir, "n.txt"), []byte("from-a"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitFile(t, filepath.Join(dirB, "n.txt"), "from-a", 8*time.Second, errA, errB)
-
-	cancel()
-	<-errA
-	<-errB
+	waitFile(t, filepath.Join(b.Dir, "n.txt"), "from-a", 8*time.Second, meshErrs(a, b)...)
 }
 
 // TestWriterNotBlockedByDeadPeers: reconcile + notify launch finish quickly
@@ -98,16 +171,14 @@ func TestNotifyPullDeliversFile(t *testing.T) {
 func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
-	port := freePort(t)
-	// Closed port: dial soft-fails.
-	dead := freePort(t)
+	ports := freePorts(t, 2)
+	port, dead := ports[0], ports[1]
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ready := make(chan struct{})
 	var readyOnce sync.Once
-	var notifyN atomic.Int32
 	notified := make(chan struct{}, 8)
 
 	d, err := daemon.New(daemon.Config{
@@ -126,7 +197,6 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 			readyOnce.Do(func() { close(ready) })
 		},
 		AfterNotify: func() {
-			notifyN.Add(1)
 			select {
 			case notified <- struct{}{}:
 			default:
@@ -160,8 +230,6 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for AfterNotify (writer blocked?)")
 	}
-	// scheduleNotify returns before dials complete; allow some debounce but
-	// far below many dial timeouts.
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("notify path took %v; writer should not wait on dead peers", elapsed)
 	}
@@ -173,168 +241,47 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 // TestThreeNodeNotifyDedupe: A writes; B and C both end with the same content
 // without requiring reverse-pull. Long intervals so delivery is notify+pull.
 func TestThreeNodeNotifyDedupe(t *testing.T) {
-	dirA := t.TempDir()
-	dirB := t.TempDir()
-	dirC := t.TempDir()
-	stateA := t.TempDir()
-	stateB := t.TempDir()
-	stateC := t.TempDir()
-	portA := freePort(t)
-	portB := freePort(t)
-	portC := freePort(t)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	peer := func(ports ...int) []string {
-		var out []string
-		for _, p := range ports {
-			out = append(out, "127.0.0.1:"+strconv.Itoa(p))
-		}
-		return out
-	}
-
-	readyN := make(chan struct{}, 3)
-	mk := func(dir, state, host string, port int, peers []string) *daemon.Daemon {
-		d, err := daemon.New(daemon.Config{
-			Dir:           dir,
-			StateDir:      state,
-			Hostname:      host,
-			Port:          port,
-			NetMode:       daemon.NetModePlain,
-			ListenHost:    "127.0.0.1",
-			Peers:         peers,
-			ScanInterval:  time.Hour,
-			SyncInterval:  time.Hour,
-			WatchDebounce: 40 * time.Millisecond,
-			OnReady:       func() { readyN <- struct{}{} },
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return d
-	}
-
-	da := mk(dirA, stateA, "mesh-a", portA, peer(portB, portC))
-	db := mk(dirB, stateB, "mesh-b", portB, peer(portA, portC))
-	dc := mk(dirC, stateC, "mesh-c", portC, peer(portA, portB))
-
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
-	errC := make(chan error, 1)
-	go func() { errA <- da.Run(ctx) }()
-	go func() { errB <- db.Run(ctx) }()
-	go func() { errC <- dc.Run(ctx) }()
-
-	for range 3 {
-		select {
-		case <-readyN:
-		case err := <-errA:
-			t.Fatalf("A: %v", err)
-		case err := <-errB:
-			t.Fatalf("B: %v", err)
-		case err := <-errC:
-			t.Fatalf("C: %v", err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("ready timeout")
-		}
-	}
+	nodes := startMesh(t, ctx, 3, func(i int, cfg *daemon.Config) {
+		cfg.Hostname = []string{"mesh-a", "mesh-b", "mesh-c"}[i]
+	})
+	defer stopMesh(cancel, nodes...)
 
 	// Let bootstrap pulls settle so hot sets form.
 	time.Sleep(200 * time.Millisecond)
 
-	if err := os.WriteFile(filepath.Join(dirA, "mesh.txt"), []byte("mesh-content"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(nodes[0].Dir, "mesh.txt"), []byte("mesh-content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitFile(t, filepath.Join(dirB, "mesh.txt"), "mesh-content", 10*time.Second, errA, errB, errC)
-	waitFile(t, filepath.Join(dirC, "mesh.txt"), "mesh-content", 10*time.Second, errA, errB, errC)
-
-	cancel()
-	<-errA
-	<-errB
-	<-errC
+	errs := meshErrs(nodes...)
+	waitFile(t, filepath.Join(nodes[1].Dir, "mesh.txt"), "mesh-content", 10*time.Second, errs...)
+	waitFile(t, filepath.Join(nodes[2].Dir, "mesh.txt"), "mesh-content", 10*time.Second, errs...)
 }
 
 // TestStaleNotifyThenNewerFile: B eventually has the latest content after A
 // updates again (pull uses current manifest, not notify hints).
 func TestStaleNotifyThenNewerFile(t *testing.T) {
-	dirA := t.TempDir()
-	dirB := t.TempDir()
-	stateA := t.TempDir()
-	stateB := t.TempDir()
-	portA := freePort(t)
-	portB := freePort(t)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ready := make(chan struct{}, 2)
-	cfgA := daemon.Config{
-		Dir:           dirA,
-		StateDir:      stateA,
-		Hostname:      "stale-a",
-		Port:          portA,
-		NetMode:       daemon.NetModePlain,
-		ListenHost:    "127.0.0.1",
-		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portB)},
-		ScanInterval:  time.Hour,
-		SyncInterval:  time.Hour,
-		WatchDebounce: 30 * time.Millisecond,
-		OnReady:       func() { ready <- struct{}{} },
-	}
-	cfgB := daemon.Config{
-		Dir:           dirB,
-		StateDir:      stateB,
-		Hostname:      "stale-b",
-		Port:          portB,
-		NetMode:       daemon.NetModePlain,
-		ListenHost:    "127.0.0.1",
-		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portA)},
-		ScanInterval:  time.Hour,
-		SyncInterval:  time.Hour,
-		WatchDebounce: 30 * time.Millisecond,
-		OnReady:       func() { ready <- struct{}{} },
-	}
+	a, b := pairDaemons(t, ctx, func(i int, cfg *daemon.Config) {
+		cfg.Hostname = []string{"stale-a", "stale-b"}[i]
+		cfg.WatchDebounce = 30 * time.Millisecond
+	})
+	defer stopMesh(cancel, a, b)
 
-	da, err := daemon.New(cfgA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db, err := daemon.New(cfgB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
-	go func() { errA <- da.Run(ctx) }()
-	go func() { errB <- db.Run(ctx) }()
-
-	for range 2 {
-		select {
-		case <-ready:
-		case err := <-errA:
-			t.Fatalf("A: %v", err)
-		case err := <-errB:
-			t.Fatalf("B: %v", err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("ready timeout")
-		}
-	}
-
-	pathA := filepath.Join(dirA, "v.txt")
+	pathA := filepath.Join(a.Dir, "v.txt")
 	if err := os.WriteFile(pathA, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitFile(t, filepath.Join(dirB, "v.txt"), "v1", 8*time.Second, errA, errB)
+	waitFile(t, filepath.Join(b.Dir, "v.txt"), "v1", 8*time.Second, meshErrs(a, b)...)
 
 	if err := os.WriteFile(pathA, []byte("v2-final"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitFile(t, filepath.Join(dirB, "v.txt"), "v2-final", 8*time.Second, errA, errB)
-
-	cancel()
-	<-errA
-	<-errB
+	waitFile(t, filepath.Join(b.Dir, "v.txt"), "v2-final", 8*time.Second, meshErrs(a, b)...)
 }
 
 // TestLateJoinerPullCatchUp: B starts after A already has content; interval or
@@ -415,161 +362,50 @@ func TestLateJoinerPullCatchUp(t *testing.T) {
 // TestNotifyDoesNotStorm: many rapid local writes still complete; no hang from
 // notify/pull loops (content-id dedupe + single-flight pull).
 func TestNotifyDoesNotStorm(t *testing.T) {
-	dirA := t.TempDir()
-	dirB := t.TempDir()
-	stateA := t.TempDir()
-	stateB := t.TempDir()
-	portA := freePort(t)
-	portB := freePort(t)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ready := make(chan struct{}, 2)
-	cfg := func(dir, state, host string, port, peer int) daemon.Config {
-		return daemon.Config{
-			Dir:           dir,
-			StateDir:      state,
-			Hostname:      host,
-			Port:          port,
-			NetMode:       daemon.NetModePlain,
-			ListenHost:    "127.0.0.1",
-			Peers:         []string{"127.0.0.1:" + strconv.Itoa(peer)},
-			ScanInterval:  time.Hour,
-			SyncInterval:  time.Hour,
-			WatchDebounce: 40 * time.Millisecond,
-			OnReady:       func() { ready <- struct{}{} },
-		}
-	}
-
-	da, err := daemon.New(cfg(dirA, stateA, "storm-a", portA, portB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	db, err := daemon.New(cfg(dirB, stateB, "storm-b", portB, portA))
-	if err != nil {
-		t.Fatal(err)
-	}
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
-	go func() { errA <- da.Run(ctx) }()
-	go func() { errB <- db.Run(ctx) }()
-
-	for range 2 {
-		select {
-		case <-ready:
-		case err := <-errA:
-			t.Fatalf("A: %v", err)
-		case err := <-errB:
-			t.Fatalf("B: %v", err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("ready")
-		}
-	}
+	a, b := pairDaemons(t, ctx, func(i int, cfg *daemon.Config) {
+		cfg.Hostname = []string{"storm-a", "storm-b"}[i]
+	})
+	defer stopMesh(cancel, a, b)
 
 	for i := range 15 {
-		name := filepath.Join(dirA, "s"+strconv.Itoa(i)+".txt")
+		name := filepath.Join(a.Dir, "s"+strconv.Itoa(i)+".txt")
 		if err := os.WriteFile(name, []byte("x"+strconv.Itoa(i)), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	waitFile(t, filepath.Join(dirB, "s14.txt"), "x14", 15*time.Second, errA, errB)
+	waitFile(t, filepath.Join(b.Dir, "s14.txt"), "x14", 15*time.Second, meshErrs(a, b)...)
 
 	// Daemons must still be healthy (not stuck in notify storm).
 	select {
-	case err := <-errA:
+	case err := <-a.Err:
 		t.Fatalf("A exited early: %v", err)
-	case err := <-errB:
+	case err := <-b.Err:
 		t.Fatalf("B exited early: %v", err)
 	default:
-	}
-
-	cancel()
-	<-errA
-	<-errB
-}
-
-// Ensure freePort still works when many tests run (sanity for mesh suite).
-func TestMeshFreePortDistinct(t *testing.T) {
-	a := freePort(t)
-	b := freePort(t)
-	if a == b {
-		// Extremely unlikely with :0; if it happens re-bind check.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		c := ln.Addr().(*net.TCPAddr).Port
-		_ = ln.Close()
-		if a == c && b == c {
-			t.Fatal("ports not distinct")
-		}
 	}
 }
 
 // TestMetaOnlyNotifyPull: touch (mtime-only) on A reaches B via notify→pull
 // with huge SyncIntervals (would fail if alreadyHaveAll ignored meta LWW).
 func TestMetaOnlyNotifyPull(t *testing.T) {
-	dirA := t.TempDir()
-	dirB := t.TempDir()
-	stateA := t.TempDir()
-	stateB := t.TempDir()
-	portA := freePort(t)
-	portB := freePort(t)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	content := []byte("touch-meta")
-	pathA := filepath.Join(dirA, "meta.txt")
+	a, b := pairDaemons(t, ctx, func(i int, cfg *daemon.Config) {
+		cfg.Hostname = []string{"meta-a", "meta-b"}[i]
+	})
+	defer stopMesh(cancel, a, b)
+
+	pathA := filepath.Join(a.Dir, "meta.txt")
 	if err := os.WriteFile(pathA, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	ready := make(chan struct{}, 2)
-	cfg := func(dir, state, host string, port, peer int) daemon.Config {
-		return daemon.Config{
-			Dir:           dir,
-			StateDir:      state,
-			Hostname:      host,
-			Port:          port,
-			NetMode:       daemon.NetModePlain,
-			ListenHost:    "127.0.0.1",
-			Peers:         []string{"127.0.0.1:" + strconv.Itoa(peer)},
-			ScanInterval:  time.Hour,
-			SyncInterval:  time.Hour,
-			WatchDebounce: 40 * time.Millisecond,
-			OnReady:       func() { ready <- struct{}{} },
-		}
-	}
-
-	da, err := daemon.New(cfg(dirA, stateA, "meta-a", portA, portB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	db, err := daemon.New(cfg(dirB, stateB, "meta-b", portB, portA))
-	if err != nil {
-		t.Fatal(err)
-	}
-	errA := make(chan error, 1)
-	errB := make(chan error, 1)
-	go func() { errA <- da.Run(ctx) }()
-	go func() { errB <- db.Run(ctx) }()
-
-	for range 2 {
-		select {
-		case <-ready:
-		case err := <-errA:
-			t.Fatalf("A: %v", err)
-		case err := <-errB:
-			t.Fatalf("B: %v", err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("ready timeout")
-		}
-	}
-
-	pathB := filepath.Join(dirB, "meta.txt")
-	waitFile(t, pathB, string(content), 8*time.Second, errA, errB)
+	pathB := filepath.Join(b.Dir, "meta.txt")
+	waitFile(t, pathB, string(content), 8*time.Second, meshErrs(a, b)...)
 
 	fiB, err := os.Stat(pathB)
 	if err != nil {
@@ -588,7 +424,7 @@ func TestMetaOnlyNotifyPull(t *testing.T) {
 			fiB, _ = os.Stat(pathB)
 			t.Fatalf("timeout waiting for mtime via notify+pull: B=%v want≈%v", fiB.ModTime(), newMT)
 		}
-		for _, ch := range []<-chan error{errA, errB} {
+		for _, ch := range meshErrs(a, b) {
 			select {
 			case err := <-ch:
 				if err != nil {
@@ -618,10 +454,6 @@ func TestMetaOnlyNotifyPull(t *testing.T) {
 		}
 		break
 	}
-
-	cancel()
-	<-errA
-	<-errB
 }
 
 // TestNotifyDuringSlowPull: local write schedules AfterNotify while a slow
@@ -629,11 +461,11 @@ func TestMetaOnlyNotifyPull(t *testing.T) {
 func TestNotifyDuringSlowPull(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
-	port := freePort(t)
-	// Several closed ports so pull batch takes DialTimeout * N / parallelism.
+	ports := freePorts(t, 7)
+	port := ports[0]
 	var dead []string
-	for range 6 {
-		dead = append(dead, "127.0.0.1:"+strconv.Itoa(freePort(t)))
+	for _, p := range ports[1:] {
+		dead = append(dead, "127.0.0.1:"+strconv.Itoa(p))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -679,10 +511,6 @@ func TestNotifyDuringSlowPull(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("ready")
 	}
-
-	// Bootstrap pull is in flight (or done); write while dead-peer dials may still run.
-	// AfterNotify must arrive without waiting for a multi-second dial batch.
-	// Do not wait for pullStarted — that would serialize with the slow pull.
 
 	start := time.Now()
 	if err := os.WriteFile(filepath.Join(dir, "fast.txt"), []byte("y"), 0o644); err != nil {

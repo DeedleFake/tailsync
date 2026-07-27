@@ -23,31 +23,24 @@ func (d *Daemon) reconcile(ctx context.Context) (changed bool, hints []index.Man
 	if err != nil {
 		return false, nil, err
 	}
-	applied := 0
 	if len(res.Changes) > 0 {
 		for _, c := range res.Changes {
 			d.log.Info("local change", "kind", c.Kind.String(), "path", c.Path)
 		}
-		// Collect hints for entries that actually win into the index.
-		for _, c := range res.Changes {
-			if d.idx.SetIfWins(c.Entry) {
-				applied++
-				hints = append(hints, c.Entry)
-			}
-		}
 	}
+	n, hints := scan.Apply(d.idx, res)
 
 	gc := 0
-	if n := d.idx.GCTombstones(time.Now(), d.cfg.TombstoneTTL); n > 0 {
-		d.log.Info("gc tombstones", "removed", n)
-		gc = n
+	if removed := d.idx.GCTombstones(time.Now(), d.cfg.TombstoneTTL); removed > 0 {
+		d.log.Info("gc tombstones", "removed", removed)
+		gc = removed
 	}
 
-	if applied > 0 || gc > 0 || d.appliesSinceSave > 0 {
+	if n > 0 || gc > 0 || d.appliesSinceSave > 0 {
 		if err := d.idx.Save(); err != nil {
 			return false, nil, fmt.Errorf("save index: %w", err)
 		}
 		d.appliesSinceSave = 0
 	}
-	return applied > 0, hints, nil
+	return n > 0, hints, nil
 }

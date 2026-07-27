@@ -269,12 +269,16 @@ func Scan(ctx context.Context, root *os.Root, idx *index.Index, opts *Options) (
 // Apply writes Scan changes into the index (adds, modifies, tombstones).
 // Each change is applied only if it still wins against the current index entry
 // (avoids clobbering a peer update that landed after Scan started).
-func Apply(idx *index.Index, res *Result) int {
-	n := 0
+// Returns the count of applied entries and those entries (for notify hints).
+func Apply(idx *index.Index, res *Result) (n int, applied []index.Entry) {
+	if res == nil {
+		return 0, nil
+	}
 	for _, c := range res.Changes {
 		if idx.SetIfWins(c.Entry) {
 			n++
+			applied = append(applied, c.Entry)
 		}
 	}
-	return n
+	return n, applied
 }

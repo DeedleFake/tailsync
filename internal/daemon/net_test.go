@@ -322,7 +322,7 @@ func TestDialTimeout(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("dial took %v (DialTimeout=%v); expected fail within ~timeout", elapsed, d.cfg.DialTimeout)
 	}
-	// Match the wrap used by syncWith so soft-fail classification stays accurate.
+	// Match the wrap used by dialHello/pullFrom/notifyPeer so soft-fail classification stays accurate.
 	wrapped := fmt.Errorf("%w: %w", errDial, err)
 	if !isDialSoftFail(wrapped) {
 		t.Fatalf("expected soft fail for dial timeout: %v", wrapped)
@@ -353,7 +353,7 @@ func TestDialClosedPortFailsQuickly(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("closed-port dial took %v", elapsed)
 	}
-	// Match the wrap used by syncWith so soft-fail classification stays accurate.
+	// Match the wrap used by dialHello/pullFrom/notifyPeer so soft-fail classification stays accurate.
 	if !isDialSoftFail(fmt.Errorf("%w: %w", errDial, err)) {
 		t.Fatalf("expected soft fail for connection refused: %v", err)
 	}

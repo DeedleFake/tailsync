@@ -92,10 +92,13 @@ func TestPeerMemSoftFailNeverDeletes(t *testing.T) {
 	if ids := p.snapshotIDs(); len(ids) != 1 {
 		t.Fatalf("ids %v", ids)
 	}
-	p.softFail("n1")
-	// Still present; may be in backoff so hotAddrs empty.
+	p.softFailAddr("127.0.0.1:1")
+	// Still present; in addr backoff so hotAddrs empty.
 	if ids := p.snapshotIDs(); len(ids) != 1 || ids[0] != "n1" {
 		t.Fatalf("soft-fail must not delete: %v", ids)
+	}
+	if len(p.hotAddrs()) != 0 {
+		t.Fatal("expected hot addr hidden by backoff")
 	}
 	// remember clears backoff.
 	p.remember("n1", "127.0.0.1:1")

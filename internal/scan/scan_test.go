@@ -350,9 +350,9 @@ func TestApplyDoesNotClobberNewer(t *testing.T) {
 	newer.UpdatedAt = newer.UpdatedAt.Add(time.Hour)
 	idx.Set(newer)
 
-	n := scan.Apply(idx, res)
-	if n != 0 {
-		t.Fatalf("stale scan should not apply, n=%d", n)
+	n, applied := scan.Apply(idx, res)
+	if n != 0 || len(applied) != 0 {
+		t.Fatalf("stale scan should not apply, n=%d applied=%d", n, len(applied))
 	}
 	e, _ := idx.Get("f.txt")
 	if e.Hash != "peer-newer" {

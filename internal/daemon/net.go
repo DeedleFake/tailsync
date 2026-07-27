@@ -532,10 +532,10 @@ func (d *Daemon) closeNetworkBackend() {
 	d.local = nil
 }
 
+// listPeers returns online discovery peers from Tailscale status only.
+// It does not consult Config.Peers; candidateAddrs unions pins, the hot set,
+// and this status list (status only when pins are empty for test determinism).
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
-	if len(d.cfg.Peers) > 0 {
-		return append([]string(nil), d.cfg.Peers...), nil
-	}
 	switch d.cfg.NetMode {
 	case NetModePlain:
 		return nil, nil

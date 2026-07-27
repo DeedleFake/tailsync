@@ -14,7 +14,11 @@ import (
 
 // contentKey identifies a path version for notify dedupe (storm prevention).
 // Keyed by path + hash + deleted + updated_at unix nano so the same logical
-// content (including meta-only bumps of UpdatedAt) is not re-notified in a loop.
+// content is not re-notified in a loop.
+//
+// Invariant: any meta-only change that should re-notify (mode/mtime adopt)
+// must bump UpdatedAt so the key differs. scan stamps and peer LWW already do;
+// callers that forge entries must advance UpdatedAt when meta changes.
 type contentKey struct {
 	path      string
 	hash      string
@@ -35,6 +39,11 @@ func contentKeyFrom(e index.Entry) contentKey {
 // and local re-notify do not storm. Keys are claimed in-flight when a fan-out is
 // scheduled and marked only after at least one successful notify (or released if
 // every dial fails), so peers that appear later can still get a prompt re-notify.
+//
+// Confirmation semantics: the first successful notify for a claimed batch marks
+// the entire claim set as seen — not a full fan-out to every candidate. Peers
+// that miss this notify still converge via SyncInterval pull (correctness
+// backstop). Empty mesh / all soft-fails release claims for a later retry.
 type notifyTracker struct {
 	mu       sync.Mutex
 	seen     map[contentKey]time.Time
@@ -59,8 +68,20 @@ func (t *notifyTracker) gcLocked(now time.Time) {
 	}
 }
 
-// pending returns hints not yet confirmed as successfully notified and not
-// currently claimed by an in-flight fan-out (read-only; does not claim).
+// freeLocked reports whether k is neither successfully seen nor in-flight.
+// Caller must hold t.mu (and should have gc'd with now).
+func (t *notifyTracker) freeLocked(k contentKey, now time.Time) bool {
+	if at, ok := t.seen[k]; ok && now.Sub(at) <= notifySeenTTL {
+		return false
+	}
+	if _, ok := t.inflight[k]; ok {
+		return false
+	}
+	return true
+}
+
+// pending is test-only: returns hints not yet confirmed and not currently
+// claimed (read-only; does not claim). Production paths use claim only.
 func (t *notifyTracker) pending(hints []index.ManifestEntry) []index.ManifestEntry {
 	if t == nil {
 		return hints
@@ -71,14 +92,9 @@ func (t *notifyTracker) pending(hints []index.ManifestEntry) []index.ManifestEnt
 	t.gcLocked(now)
 	var out []index.ManifestEntry
 	for _, h := range hints {
-		k := contentKeyFrom(h)
-		if at, ok := t.seen[k]; ok && now.Sub(at) <= notifySeenTTL {
-			continue
+		if t.freeLocked(contentKeyFrom(h), now) {
+			out = append(out, h)
 		}
-		if _, ok := t.inflight[k]; ok {
-			continue
-		}
-		out = append(out, h)
 	}
 	return out
 }
@@ -97,10 +113,7 @@ func (t *notifyTracker) claim(hints []index.ManifestEntry) []index.ManifestEntry
 	var out []index.ManifestEntry
 	for _, h := range hints {
 		k := contentKeyFrom(h)
-		if at, ok := t.seen[k]; ok && now.Sub(at) <= notifySeenTTL {
-			continue
-		}
-		if _, ok := t.inflight[k]; ok {
+		if !t.freeLocked(k, now) {
 			continue
 		}
 		t.inflight[k] = struct{}{}
@@ -110,6 +123,10 @@ func (t *notifyTracker) claim(hints []index.ManifestEntry) []index.ManifestEntry
 }
 
 // mark records keys as successfully notified and clears in-flight claims.
+//
+// Called after the first successful notify for a claimed batch: marks the whole
+// claim set (not per-peer). Remaining candidates may miss this advertisement;
+// SyncInterval pull is the correctness backstop.
 func (t *notifyTracker) mark(hints []index.ManifestEntry) {
 	if t == nil || len(hints) == 0 {
 		return
@@ -133,19 +150,8 @@ func (t *notifyTracker) release(hints []index.ManifestEntry) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, h := range hints {
-		k := contentKeyFrom(h)
-		// Do not clear if a concurrent mark already confirmed.
-		if _, ok := t.seen[k]; ok {
-			delete(t.inflight, k)
-			continue
-		}
-		delete(t.inflight, k)
+		delete(t.inflight, contentKeyFrom(h))
 	}
-}
-
-// markSeen records keys without filtering (receiver already has / will ignore).
-func (t *notifyTracker) markSeen(hints []index.ManifestEntry) {
-	t.mark(hints)
 }
 
 // scheduleNotify fans out best-effort notifies to candidates. Does not block
@@ -153,8 +159,11 @@ func (t *notifyTracker) markSeen(hints []index.ManifestEntry) {
 // Returns true when at least one notify goroutine was scheduled.
 //
 // Content keys are claimed while a fan-out is in flight (prevents concurrent
-// double fan-out) and marked only after a successful Hello+Notify, or released
-// if every dial fails, so peers that appear later can still receive a re-notify.
+// double fan-out). The first successful Hello+Notify marks the whole claim set
+// as seen (any success ≡ done advertising this content id for this batch — not
+// full fan-out). If every dial fails, claims are released so peers that appear
+// later can still receive a re-notify. Correctness does not depend on notify
+// delivery; SyncInterval pull is the backstop.
 func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry) bool {
 	if ctx.Err() != nil {
 		return false
@@ -207,8 +216,7 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 				d.log.Debug("notify peer", "addr", addr, "err", err)
 				return
 			}
-			// Confirm only after a successful notify so soft-fail / empty mesh
-			// does not suppress re-notify when peers appear.
+			// First success marks the whole claim set (not full fan-out).
 			anyOK.Store(true)
 			if len(toSend) > 0 {
 				d.notifySeen.mark(toSend)
@@ -230,37 +238,18 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 // notifyPeer dials addr, Hellos, sends TypeNotify, then closes. Soft-fail on
 // unreachable peers. Learns remote nodeID into the hot set on HelloOK.
 func (d *Daemon) notifyPeer(ctx context.Context, addr string, hints []index.ManifestEntry) error {
-	conn, err := d.dial(ctx, addr)
-	if err != nil {
-		return fmt.Errorf("%w: %w", errDial, err)
-	}
-	defer conn.Close()
 	// Short deadline for notify probes (not full file transfer).
-	deadline := time.Now().Add(d.cfg.DialTimeout + 5*time.Second)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
-	_ = conn.SetDeadline(deadline)
-
-	if err := proto.Encode(conn, proto.NewHello(d.nodeID, d.cfg.Port)); err != nil {
+	conn, remoteNode, err := d.dialHello(ctx, addr, func(c net.Conn) {
+		deadline := time.Now().Add(d.cfg.DialTimeout + 5*time.Second)
+		if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+			deadline = dl
+		}
+		_ = c.SetDeadline(deadline)
+	})
+	if err != nil {
 		return err
 	}
-	resp, err := proto.Decode(conn)
-	if err != nil {
-		return fmt.Errorf("hello response: %w", err)
-	}
-	if resp.Header.Type == proto.TypeError {
-		return fmt.Errorf("hello error: %s", resp.Header.Error)
-	}
-	if resp.Header.Type != proto.TypeHelloOK {
-		return fmt.Errorf("unexpected hello response %q", resp.Header.Type)
-	}
-	remoteNode := resp.Header.NodeID
-	if remoteNode == d.nodeID {
-		return fmt.Errorf("connected to self")
-	}
-	// Outbound dial addr is authoritative for this peer.
-	d.peers.remember(remoteNode, addr)
+	defer conn.Close()
 
 	if err := proto.Encode(conn, proto.NewNotify(d.nodeID, d.cfg.Port, hints)); err != nil {
 		return err
@@ -288,7 +277,7 @@ func (d *Daemon) onNotify(remoteNode, remoteAddr string, remotePort int, hints [
 	// ignore (no pull, no re-notify).
 	if len(hints) > 0 && d.alreadyHaveAll(hints) {
 		d.log.Debug("notify ignored; already have content", "remote_node", remoteNode, "hints", len(hints))
-		d.notifySeen.markSeen(hints)
+		d.notifySeen.mark(hints)
 		return
 	}
 
