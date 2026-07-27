@@ -135,155 +135,81 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 
 State directories under the sync tree named `.tailsync` or `.tailsync-*` are ignored by the scanner and cannot be applied from peers.
 
-## Android / gomobile
+## Embedding (library API)
 
-Android apps can embed the same sync engine via [gomobile](https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile) using the package `deedles.dev/tailsync/mobile`. The CLI (`cmd/tailsync`) remains the usual way to run on desktops and servers.
+The public Go package [`deedles.dev/tailsync/daemon`](https://pkg.go.dev/deedles.dev/tailsync/daemon) is the primary library API for embedding tailsync (still **alpha**; may change without compatibility guarantees, same as the rest of the project). The CLI (`cmd/tailsync`) is a thin wrapper around the same package.
 
-On mobile, the default network mode is **tsnet** (an embedded Tailscale node). Host LocalAPI mode expects a system `tailscaled` and is not a typical Android setup. The app owns the lifecycle (`Start` / `Stop`), usually from a foreground service, and must pass **absolute, writable** paths (for example app-private storage).
+### Daemon API overview
 
-### Bind (AAR)
+| Go | Role |
+|----|------|
+| `daemon.Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, intervals, `DisableWatch`, `BlockSize`, `DialTimeout`, `TombstoneTTL`, `NetMode`, `Logger`, `OnReady`, `OnAuthURL`, … |
+| `daemon.New(cfg)` | Validates config and returns a stopped `*Daemon` (does not start networking) |
+| `(*Daemon).Run(ctx)` | Brings up networking and runs until `ctx` is canceled or a fatal error |
+| `(*Daemon).InjectNetworkChange()` | After host connectivity updates in **tsnet** mode, inject a netmon event (no-op if not running / not yet installed) |
+| `daemon.DefaultPort`, `DefaultScanInterval`, `DefaultSyncInterval`, `DefaultWatchDebounce`, `DefaultBlockSize`, `DefaultDialTimeout`, `DefaultTombstoneTTL`, … | Effective defaults when zero values are left in `Config` |
+| `daemon.NetModeHost` / `NetModeTSNet` / `NetModePlain` | Network attachment modes (same semantics as CLI flags) |
 
-Requires gomobile and an Android NDK/SDK.
+Minimal embed:
+
+```go
+cfg := daemon.Config{
+	Dir:     "/path/to/shared",
+	NetMode: daemon.NetModeTSNet, // or NetModeHost / NetModePlain
+	// AuthKey, Hostname, StateDir, OnReady, OnAuthURL, Logger, …
+}
+d, err := daemon.New(cfg)
+if err != nil {
+	return err
+}
+return d.Run(ctx)
+```
+
+Zero `Port`, interval, `BlockSize`, or `DialTimeout` mean the `Default*` constants above (for example port `5960`, block size `4096`).
+
+### Android / gomobile
+
+This module no longer ships a `mobile` package. Android apps should:
+
+1. Depend on **`deedles.dev/tailsync/daemon`** for the sync engine.
+2. Own a **gomobile-bindable wrapper** in the app repository (config mapping, Start/Stop lifecycle, JSON event callbacks, Android netmon interface injection). That wrapper imports `daemon` and is what `gomobile bind` targets.
+
+Requires gomobile and an Android NDK/SDK:
 
 ```bash
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
 
-# from a checkout of this module
-gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
+# Bind the app-owned package (example path — lives in the Android app repo):
+gomobile bind -target=android -o tailsync.aar ./mobile
 ```
 
-### API overview
-
-| Go | Role |
-|----|------|
-| `Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, `ScanIntervalMs`, `SyncIntervalMs`, `WatchDebounceMs`, `DisableWatch`, `BlockSize`, `DialTimeoutMs`, `NetMode` |
-| `NewNode(cfg)` | Validates config and returns a stopped `Node` |
-| `Node.Start()` / `Stop()` / `IsRunning()` | Lifecycle. `Start` blocks until listening succeeds or fails; call it off the main thread |
-| `Node.SetListener(EventListener)` | Optional JSON event callbacks (logs, status, auth); handlers must return quickly |
-| `Node.StatusJSON()` | Snapshot for UI (never includes `AuthKey`; zero config fields are shown as effective defaults; includes `phase`; may include `needs_login` / `auth_url`) |
-| `Version()` | Module or build version string |
-| `SetNetworkInterfacesJSON` / `SetNetworkInterfaces` | Supply host interfaces for tsnet (required on Android API 30+ before `Start`) |
-| `SetDefaultRouteInterface` / `SetDefaultGateway` | Default route/gateway from `ConnectivityManager` / `LinkProperties` |
-| `NotifyNetworkChange` / `Node.NotifyNetworkChange` | After interface/route updates while running, inject a netmon event (no-op if not running) |
-
-`NetMode` values: `"tsnet"` (default), `"host"`, `"plain"` (localhost QUIC for tests only).
-
-`IsRunning()` is true while starting, serving, or stopping (resources may still be held after a timed-out `Stop`). `StatusJSON`’s `running` field is true only while serving after a successful `Start`. `phase` is one of `idle`, `starting`, `running`, or `stopping`.
-
-### Network interfaces on Android (required for tsnet)
-
-On **Android API 30+**, Go’s `net.Interfaces()` fails with permission errors. tsnet/netmon will not start correctly unless the app supplies interfaces **before** `node.start()` (and updates them when connectivity changes).
-
-The `INTERNET` permission is still required for sockets; it does **not** fix `net.Interfaces` alone.
-
-**Required Kotlin flow**
-
-1. Use `ConnectivityManager` / `LinkProperties` to build the interface list (name, index, flags, MTU, address CIDRs) and the default route interface name + gateway IP.
-2. Call `SetNetworkInterfacesJSON` (or the `NetworkInterfaceList` builder + `SetNetworkInterfaces`), `SetDefaultRouteInterface`, and `SetDefaultGateway` **before** `node.start()`.
-3. On network callbacks (`NetworkCallback`, default-network changes, etc.), update the same APIs again and call `NotifyNetworkChange()` (or `node.notifyNetworkChange()`). Snapshot updates are visible to the getter immediately; `NotifyNetworkChange` wakes netmon after `tsnet.Up` has installed the monitor (during the long Up/auth window it is a no-op, then the daemon fires a catch-up inject).
-
-Interface JSON example:
-
-```json
-[
-  {"name":"wlan0","index":21,"flags":51,"mtu":1500,"addrs":["192.168.1.2/24","fe80::1/64"]},
-  {"name":"lo","index":1,"flags":5,"mtu":65536,"addrs":["127.0.0.1/8"]}
-]
-```
-
-`flags` are Go `net.Flags` bits (`1=Up`, `2=Broadcast`, `4=Loopback`, `8=PointToPoint`, `16=Multicast`, `32=Running`). Mirror OS flags when possible; live uplinks should include `Up|Running` (example `51` = `Up|Broadcast|Multicast|Running`). Prefer including at least loopback and the active uplink; an empty list is accepted but can break tsnet bring-up.
-
-`SetDefaultGateway` rejects non-empty strings that are not valid IP addresses (empty string still clears).
-
-**Multi-node:** package-level `NotifyNetworkChange` targets only the most recently started `Node`. If you run more than one node in-process, call `node.notifyNetworkChange()` on each.
-
-Desktop/CLI is unchanged: if the app never sets interfaces, netmon keeps using `net.Interfaces()`.
-
-### Kotlin example
-
-```kotlin
-// After adding tailsync.aar to the Android app module.
-val cfg = Config().apply {
-    dir = context.filesDir.resolve("sync").absolutePath
-    // Persist StateDir across runs so browser login is only needed once.
-    stateDir = context.filesDir.resolve("tailsync-state").absolutePath
-    hostname = "tailsync-phone"
-    // Optional: pre-provisioned auth key. Leave empty for browser login on first run.
-    // authKey = BuildConfig.TS_AUTHKEY
-    // netMode defaults to "tsnet"
-}
-val node = Mobile.newNode(cfg)
-val mainHandler = Handler(Looper.getMainLooper())
-node.setListener(EventListener { eventJSON ->
-    // Called from a Go background thread — keep this fast (no network/disk/UI).
-    mainHandler.post {
-        // parse JSON: type = log | status | error | auth
-        val obj = JSONObject(eventJSON)
-        when (obj.getString("type")) {
-            "auth" -> {
-                // Interactive login needed — open Custom Tab / browser while start() waits.
-                val url = obj.getString("url")
-                val intent = CustomTabsIntent.Builder().build()
-                intent.launchUrl(context, Uri.parse(url))
-            }
-            else -> Log.i("tailsync", eventJSON)
-        }
-    }
-})
-
-// Supply interfaces from ConnectivityManager BEFORE start (API 30+).
-// Build JSON from LinkProperties / NetworkInterface; flags = Go net.Flags bits
-// (include FlagRunning=32 on live uplinks when the OS reports it).
-fun publishNetworkToGo(ifacesJson: String, defaultIf: String, gateway: String) {
-    Mobile.setNetworkInterfacesJSON(ifacesJson)
-    Mobile.setDefaultRouteInterface(defaultIf) // "" if network lost
-    Mobile.setDefaultGateway(gateway)         // "" if none / lost; invalid IP throws
-}
-
-// Call once before start, and again from NetworkCallback when paths change.
-publishNetworkToGo(currentIfacesJson(), currentDefaultIf(), currentGateway())
-
-// From a foreground service — never call start() on the main thread
-// (tsnet bring-up / browser login can block long enough to ANR).
-serviceScope.launch(Dispatchers.IO) {
-    try {
-        node.start() // blocks until listening or failure; auth events fire while waiting
-    } catch (e: Exception) {
-        Log.e("tailsync", "start failed", e)
-    }
-}
-
-// On ConnectivityManager network callbacks (after updating interfaces/route):
-publishNetworkToGo(currentIfacesJson(), currentDefaultIf(), currentGateway())
-// Prefer node.notifyNetworkChange() if multiple Nodes may exist in-process.
-Mobile.notifyNetworkChange() // package-level: most recently started node only
-
-serviceScope.launch(Dispatchers.IO) {
-    node.stop() // no-op if already stopped; call when the service is destroyed
-}
-```
+On Android, prefer **`NetModeTSNet`** (embedded Tailscale node). Host LocalAPI expects a system `tailscaled` and is not a typical phone setup. The app owns lifecycle (usually a foreground service) and must pass **absolute, writable** paths (for example app-private storage).
 
 **Authentication (tsnet)**
 
 | Situation | What happens |
 |-----------|----------------|
-| `AuthKey` set and valid | Silent enroll; no `"auth"` event |
-| Existing tsnet state under `StateDir` (prior successful login) | Silent reconnect; no `"auth"` event |
-| Empty `AuthKey`, no enrolled state | tsnet starts interactive login; emits `{"type":"auth","url":"..."}` while `Start` blocks so the app can open a browser / Custom Tab |
+| `AuthKey` set and valid | Silent enroll |
+| Existing tsnet state under `StateDir` (prior successful login) | Silent reconnect |
+| Empty `AuthKey`, no enrolled state | Interactive browser login; use `Config.OnAuthURL` to surface the login URL while `Run` / bring-up is still waiting |
 
-After the user completes login in the browser, `Start` finishes when the node is `Running`. Keep the same `StateDir` on later launches so the node does not re-prompt.
+Keep a stable `StateDir` across launches so the node does not re-prompt after the first successful login.
 
-`StatusJSON` may include `needs_login` and `auth_url` while interactive login is in progress (never includes `AuthKey`).
+**Network interfaces on Android (required for tsnet)**
 
-**Notes**
+On **Android API 30+**, Go’s `net.Interfaces()` fails with permission errors. The app-owned bind layer should register a host interface snapshot for tsnet/netmon (via Tailscale’s `netmon` getters) **before** bring-up, and call `(*Daemon).InjectNetworkChange()` after connectivity updates once the node is running. During the long `tsnet.Up` window inject may no-op until NetMon is installed; the daemon then fires a catch-up inject.
 
-- Paths must be absolute and writable by the app process.
-- Call `Stop` when the service is destroyed so the embedded node and goroutines exit.
-- Run `start()` / `stop()` off the main thread; keep `OnEvent` non-blocking (post to the main thread only for UI).
-- Do not log or ship auth keys. Mobile events redact secret-like **attribute keys**; free-text log messages are not scrubbed.
-- Zero `Port`, interval, or `BlockSize` mean daemon defaults; `StatusJSON` reports effective values (for example port `5960`).
-- For tsnet on Android API 30+, set network interfaces and default route **before** `start()`; update + `notifyNetworkChange` on connectivity changes (see above).
+The `INTERNET` permission is still required for sockets; it does **not** fix `net.Interfaces` alone. Typical sources: `ConnectivityManager` / `LinkProperties` for interface name, index, flags, MTU, address CIDRs, default route interface, and gateway.
+
+Desktop/CLI is unchanged: if nothing overrides interfaces, netmon keeps using `net.Interfaces()`.
+
+**Notes for app wrappers**
+
+- Paths must be absolute and writable by the process.
+- Cancel `Run`’s context (or stop the wrapper’s generation) when the service is destroyed so the embedded node and goroutines exit.
+- Call long-running start paths off the Android main thread; keep auth/log callbacks non-blocking (post to the main looper only for UI).
+- Do not log or ship auth keys.
 
 ## Development
 
@@ -295,4 +221,4 @@ go tool modernize ./...
 go tool staticcheck ./...
 ```
 
-`modernize` and `staticcheck` are module tools (see the `tool` block in `go.mod`). CI runs the same checks (`.github/workflows/ci.yml`), including a `go mod tidy` drift check. Android SDK is not required for `go test`; plain-mode tests exercise the mobile API on localhost.
+`modernize` and `staticcheck` are module tools (see the `tool` block in `go.mod`). CI runs the same checks (`.github/workflows/ci.yml`), including a `go mod tidy` drift check.
