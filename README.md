@@ -82,7 +82,7 @@ Membership is **memory-only** (not persisted):
 
 Candidates for notify and pull are the hot set union status Online peers (plus `-peers` when set). Soft-fail (timeout/refused) applies **per dial address** to hot-set and status-discovered candidates with exponential backoff, but **never permanently bans**; after backoff expires, status Online and successful Hello reintroduce the peer. Explicit `-peers` pins always re-dial each batch (test/override). Offline (status) peers are skipped when possible.
 
-With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures are expected and do not block writers (notifies are fire-and-forget; pulls are capped). Prefer:
+With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures are expected and do not block writers (notifies are fire-and-forget; pulls are capped). **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Prefer:
 
 - **`-service <substring>`** to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`), or
 - **`-peers host:port,...`** only for local tests / explicit overrides (not the recommended production path).

@@ -75,11 +75,29 @@ func nodeIDFromSelf(self *ipnstate.PeerStatus) string {
 	return string(self.ID)
 }
 
+// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
+// peers. Those peers are Online on the tailnet but never run tailsync; dialing
+// them only burns DialTimeout. Do not use ExitNodeOption alone — user-run exit
+// nodes may still run tailsync.
+const mullvadExitNodeTag = "tag:mullvad-exit-node"
+
+// isMullvadPeer reports whether p is a Tailscale Mullvad exit-node peer
+// (has tag:mullvad-exit-node).
+func isMullvadPeer(p *ipnstate.PeerStatus) bool {
+	if p == nil || p.Tags == nil {
+		return false
+	}
+	return p.Tags.ContainsFunc(func(tag string) bool {
+		return tag == mullvadExitNodeTag
+	})
+}
+
 // peersFromStatus returns dial addresses (host:port) for online peers excluding self.
 // Prefers the first Tailscale IP for reliable dialing with the host net stack
 // (does not depend on MagicDNS); falls back to MagicDNS when no IP is known.
 // When serviceName is non-empty, only peers whose HostName or DNSName contains
 // that substring (case-insensitive) are included.
+// Mullvad VPN exit nodes (tag:mullvad-exit-node) are always skipped.
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
@@ -103,6 +121,9 @@ func peersFromStatus(st *ipnstate.Status, port int, serviceName string) []string
 			continue
 		}
 		if selfID != "" && string(p.ID) == selfID {
+			continue
+		}
+		if isMullvadPeer(p) {
 			continue
 		}
 		dns := strings.TrimSuffix(p.DNSName, ".")

@@ -18,6 +18,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 )
 
 func TestBindAddrsFromTailscaleIPs(t *testing.T) {
@@ -116,6 +117,67 @@ func TestPeersFromStatus(t *testing.T) {
 	got = peersFromStatus(st, 5960, "tailsync")
 	if len(got) != 1 || got[0] != "100.64.0.2:5960" {
 		t.Fatalf("service filter: %v", got)
+	}
+}
+
+func TestPeersFromStatusSkipsMullvad(t *testing.T) {
+	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
+	st := &ipnstate.Status{
+		Self: &ipnstate.PeerStatus{
+			ID:      "self",
+			DNSName: "me.tailnet.ts.net.",
+		},
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			key.NewNode().Public(): {
+				ID:           "real",
+				HostName:     "laptop",
+				DNSName:      "laptop.tailnet.ts.net.",
+				Online:       true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+			},
+			// Tailscale Mullvad exit nodes carry tag:mullvad-exit-node.
+			key.NewNode().Public(): {
+				ID:             "mullvad-se",
+				HostName:       "se-mma-wg-001",
+				DNSName:        "se-mma-wg-001.mullvad.ts.net.",
+				Online:         true,
+				ExitNodeOption: true,
+				Tags:           &mullvadTags,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
+			},
+			// User-run exit node is still a candidate (may run tailsync).
+			key.NewNode().Public(): {
+				ID:             "home-exit",
+				HostName:       "home-exit",
+				DNSName:        "home-exit.tailnet.ts.net.",
+				Online:         true,
+				ExitNodeOption: true,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.60")},
+			},
+			// mullvad.ts.net-looking DNS alone is not enough without the tag.
+			key.NewNode().Public(): {
+				ID:           "not-mullvad",
+				HostName:     "named-like-mullvad",
+				DNSName:      "fake.mullvad.ts.net.",
+				Online:       true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.70")},
+			},
+		},
+	}
+
+	got := peersFromStatus(st, 5960, "")
+	wantSet := map[string]bool{
+		"100.64.0.2:5960":  true,
+		"100.64.0.60:5960": true,
+		"100.64.0.70:5960": true,
+	}
+	if len(got) != len(wantSet) {
+		t.Fatalf("got %v", got)
+	}
+	for _, a := range got {
+		if !wantSet[a] {
+			t.Errorf("unexpected addr %q (Mullvad should be filtered)", a)
+		}
 	}
 }
 
