@@ -44,7 +44,7 @@ require (
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260718201538-764159d718ef // indirect
 	golang.org/x/exp/typeparams v0.0.0-20240314144324-c7f7c6466f7f // indirect
-	golang.org/x/mobile v0.0.0-20260709172247-6129f5bee9d5 // indirect
+	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
@@ -61,7 +61,6 @@ require (
 )
 
 tool (
-	golang.org/x/mobile/cmd/gobind
 	golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize
 	honnef.co/go/tools/cmd/staticcheck
 )
