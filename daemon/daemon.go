@@ -16,7 +16,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -27,6 +26,7 @@ import (
 	"tailscale.com/tsnet"
 
 	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/peer"
 )
 
 // Default configuration values applied by [New] when the corresponding
@@ -46,24 +46,25 @@ const (
 	// transfer/delta (v1 keeps whole-file buffers). Wire framing is capped
 	// separately so peer messages cannot allocate unboundedly.
 	DefaultMaxFileBytes = 64 << 20 // 64 MiB
-	// DefaultDialTimeout is how long an outbound peer dial may block before
-	// failing. Without this, dials to online nodes that are not running tailsync
-	// (or are unreachable) can hang for a long time and stall pull batches.
-	DefaultDialTimeout = 5 * time.Second
+	// DefaultDialTimeout is how long an outbound peer dial/handshake may block
+	// before failing during discovery.
+	DefaultDialTimeout = 30 * time.Second
 	// DefaultTombstoneTTL is how long deletion tombstones are retained before
 	// garbage collection when Config.TombstoneTTL is zero (30 days).
 	DefaultTombstoneTTL = 30 * 24 * time.Hour
-	// maxParallelPulls caps concurrent peer pull workers so N online peers
-	// cannot each hold up to MaxFileBytes in memory at once. Notify fan-out is
-	// separate (see maxParallelNotifies).
-	maxParallelPulls = 4
-	// maxParallelNotifies caps concurrent Hello+Notify probe dials so a large
-	// candidate set cannot open unbounded sockets per local change. Fan-out is
-	// still fire-and-forget w.r.t. the main loop (no batch Wait).
+	// DefaultDiscoveryConcurrency caps concurrent discovery dials (in-flight only).
+	DefaultDiscoveryConcurrency = 32
+	// DefaultPullStreamConcurrency caps concurrent pull streams across peers
+	// (each may buffer up to MaxFileBytes).
+	DefaultPullStreamConcurrency = 8
+	// DefaultHeartbeatInterval is the app-level ping interval on each session.
+	DefaultHeartbeatInterval = 20 * time.Second
+	// maxParallelNotifies caps concurrent notify streams so a large connected
+	// set cannot open unbounded streams per local change. Fan-out is still
+	// fire-and-forget w.r.t. the main loop (no batch Wait).
 	maxParallelNotifies = 16
 	// manyPeersWarnThreshold is how many discovered peers trigger a one-time
 	// recommendation for -service (or test -peers) when discovery is unfiltered.
-	// Independent of maxParallelPulls (concurrency/memory cap).
 	manyPeersWarnThreshold = 8
 )
 
@@ -111,9 +112,18 @@ type Config struct {
 	BlockSize int
 	// MaxFileBytes rejects local files larger than this for serve/pull (0 = default).
 	MaxFileBytes int64
-	// DialTimeout is the max wait for an outbound peer QUIC dial (0 = DefaultDialTimeout).
-	// Caps hangs against online nodes that are not listening for tailsync.
+	// DialTimeout is the max wait for an outbound peer QUIC dial+handshake
+	// during discovery (0 = DefaultDialTimeout).
 	DialTimeout time.Duration
+	// DiscoveryConcurrency caps concurrent discovery dials (0 = default 32).
+	// The semaphore is in-flight only (released before backoff sleep).
+	DiscoveryConcurrency int
+	// PullStreamConcurrency caps concurrent content pull streams across all
+	// peers (0 = default 8). Separate from discovery concurrency.
+	PullStreamConcurrency int
+	// HeartbeatInterval is the app-level ping period on each peer session
+	// (0 = DefaultHeartbeatInterval). QUIC also has its own keep-alive.
+	HeartbeatInterval time.Duration
 	// TombstoneTTL drops old deletion tombstones from the index (0 = DefaultTombstoneTTL).
 	TombstoneTTL time.Duration
 	// Logger defaults to slog.Default().
@@ -123,9 +133,9 @@ type Config struct {
 	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port) for tests
-	// and overrides. When empty, candidates are the in-memory hot set (after
-	// successful Hello) union Tailscale status Online peers. Prefer ServiceName
-	// on large tailnets; Peers is not the recommended production path.
+	// and overrides. When empty, discovery uses Tailscale status Online peers.
+	// Prefer ServiceName on large tailnets; Peers is not the recommended
+	// production path. When set, status discovery is skipped (test determinism).
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
@@ -183,12 +193,10 @@ type Daemon struct {
 	idx    *index.Index
 	server *tsnet.Server // NetModeTSNet only
 	local  *local.Client // NetModeHost
-	ln     net.Listener
+	// mesh owns shared QUIC transports, roster, and discovery.
+	mesh *peer.Manager
 	// quicTLS is the server TLS config (ephemeral self-signed cert) for QUIC.
 	quicTLS *tls.Config
-	// quicDialHosts are local IP strings used to bind ephemeral UDP when dialing
-	// over tsnet (ListenPacket requires a concrete IP). Empty in host/plain.
-	quicDialHosts []string
 	// root confines sync-tree filesystem I/O to cfg.Dir (opened for Run).
 	root *os.Root
 
@@ -200,14 +208,14 @@ type Daemon struct {
 	netMu           sync.Mutex
 	injectNetChange func() // NetModeTSNet: mon.InjectEvent after Up; nil otherwise
 
-	// connWG tracks in-flight handleConn goroutines so Run can drain them
+	// streamWG tracks in-flight handleStream goroutines so Run can drain them
 	// before closing root (avoids nil/use-after-close races on d.root).
-	connWG sync.WaitGroup
-	// notifyWG tracks fire-and-forget notify dials; joined on shutdown before
+	streamWG sync.WaitGroup
+	// notifyWG tracks fire-and-forget notify streams; joined on shutdown before
 	// root/network teardown so handlers never see nil shared resources.
 	notifyWG sync.WaitGroup
 	// pullWG tracks the single-flight pull worker; joined on shutdown with
-	// notifyWG so pullFromConn cannot use root after close.
+	// notifyWG so pull streams cannot use root after close.
 	pullWG sync.WaitGroup
 
 	// nodeID is the protocol identity. Set during listen before accept/sync
@@ -218,12 +226,18 @@ type Daemon struct {
 	// Touched only while holding syncMu.
 	appliesSinceSave int
 
-	// manyPeersWarned is set after the one-time unfiltered-discovery Warn so
-	// pullPeers does not spam every batch on multi-device tailnets.
+	// manyPeersWarned is set after the soft unfiltered-discovery Warn (count >
+	// manyPeersWarnThreshold but still dialing). Separate from refuseWarned.
 	manyPeersWarned atomic.Bool
+	// refuseWarned is set after the fail-closed unfiltered discovery refuse log
+	// (count > maxUnfilteredDiscoveryPeers).
+	refuseWarned atomic.Bool
 
-	// peers is the memory-only hot set (nodeID → addr) learned after Hello.
-	peers *peerMem
+	// pullSem limits concurrent content pull streams across peers.
+	pullSem chan struct{}
+	// serveSem limits concurrent inbound serve ops (manifest/file/delta).
+	serveSem chan struct{}
+
 	// notifySeen dedupes content keys successfully advertised (storm prevention).
 	notifySeen *notifyTracker
 	// needPull is allocated in New and never niled; requestPull coalesces
@@ -311,6 +325,15 @@ func New(cfg Config) (*Daemon, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = DefaultDialTimeout
 	}
+	if cfg.DiscoveryConcurrency <= 0 {
+		cfg.DiscoveryConcurrency = DefaultDiscoveryConcurrency
+	}
+	if cfg.PullStreamConcurrency <= 0 {
+		cfg.PullStreamConcurrency = DefaultPullStreamConcurrency
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = DefaultHeartbeatInterval
+	}
 	if cfg.TombstoneTTL <= 0 {
 		cfg.TombstoneTTL = DefaultTombstoneTTL
 	}
@@ -331,7 +354,8 @@ func New(cfg Config) (*Daemon, error) {
 		cfg:        cfg,
 		log:        log,
 		quicTLS:    quicTLS,
-		peers:      newPeerMem(),
+		pullSem:    make(chan struct{}, cfg.PullStreamConcurrency),
+		serveSem:   make(chan struct{}, cfg.PullStreamConcurrency),
 		notifySeen: newNotifyTracker(),
 		needPull:   newSignal(),
 	}, nil

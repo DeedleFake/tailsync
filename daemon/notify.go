@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/peer"
 	"deedles.dev/tailsync/internal/proto"
 )
 
@@ -154,22 +155,30 @@ func (t *notifyTracker) release(hints []index.ManifestEntry) {
 	}
 }
 
-// scheduleNotify fans out best-effort notifies to candidates. Does not block
-// the caller on peer dials (fire-and-forget). Hints may be empty (wake-only).
-// Returns true when at least one notify goroutine was scheduled.
+// scheduleNotify fans out best-effort notifies to connected peer sessions.
+// Does not block the caller on peer I/O (fire-and-forget). Hints may be empty
+// (wake-only). Returns true when at least one notify goroutine was scheduled.
 //
-// Content keys are claimed while a fan-out is in flight (prevents concurrent
-// double fan-out). The first successful Hello+Notify marks the whole claim set
-// as seen (any success ≡ done advertising this content id for this batch — not
-// full fan-out). If every dial fails, claims are released so peers that appear
-// later can still receive a re-notify. Correctness does not depend on notify
+// Content keys are claimed while a fan-out is in flight. The first successful
+// Notify marks the whole claim set as seen. If every stream fails, claims are
+// released so a later schedule can retry. Correctness does not depend on notify
 // delivery; SyncInterval pull is the backstop.
 func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry) bool {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || d.mesh == nil {
 		return false
 	}
-	addrs := d.candidateAddrs(ctx)
-	if len(addrs) == 0 {
+	snap := d.mesh.Snapshot()
+	var sessions []*peer.Session
+	for _, info := range snap {
+		if !info.Healthy {
+			continue
+		}
+		s := d.mesh.Session(info.NodeID)
+		if s != nil && s.Healthy() {
+			sessions = append(sessions, s)
+		}
+	}
+	if len(sessions) == 0 {
 		// Do not claim/mark keys: no peer could have been reached.
 		return false
 	}
@@ -184,17 +193,14 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 	}
 	// else wake-only (toSend nil)
 
-	d.log.Debug("notify fan-out", "peers", len(addrs), "hints", len(toSend))
+	d.log.Debug("notify fan-out", "peers", len(sessions), "hints", len(toSend))
 
-	// Cap concurrent notify dials; still no barrier on the main loop.
 	sem := make(chan struct{}, maxParallelNotifies)
 	var (
 		batchWG sync.WaitGroup
 		anyOK   atomic.Bool
 	)
-	// Snapshot for goroutines; do not Wait here — main loop must not stall.
-	// notifyWG is joined on shutdown so root/listener stay valid.
-	for _, addr := range addrs {
+	for _, sess := range sessions {
 		batchWG.Add(1)
 		d.notifyWG.Go(func() {
 			defer batchWG.Done()
@@ -207,16 +213,10 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 			case <-ctx.Done():
 				return
 			}
-			if err := d.notifyPeer(ctx, addr, toSend); err != nil {
-				if isDialSoftFail(err) {
-					d.log.Debug("notify peer", "addr", addr, "err", err)
-					d.peers.softFailAddr(addr)
-					return
-				}
-				d.log.Debug("notify peer", "addr", addr, "err", err)
+			if err := d.notifySession(ctx, sess, toSend); err != nil {
+				d.log.Debug("notify peer", "peer", sess.NodeID(), "err", err)
 				return
 			}
-			// First success marks the whole claim set (not full fan-out).
 			anyOK.Store(true)
 			if len(toSend) > 0 {
 				d.notifySeen.mark(toSend)
@@ -224,7 +224,6 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 		})
 	}
 	if len(toSend) > 0 {
-		// Release unconfirmed claims after the batch so a later schedule can retry.
 		d.notifyWG.Go(func() {
 			batchWG.Wait()
 			if !anyOK.Load() {
@@ -235,21 +234,19 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 	return true
 }
 
-// notifyPeer dials addr, Hellos, sends TypeNotify, then closes. Soft-fail on
-// unreachable peers. Learns remote nodeID into the hot set on HelloOK.
-func (d *Daemon) notifyPeer(ctx context.Context, addr string, hints []index.ManifestEntry) error {
-	// Short deadline for notify probes (not full file transfer).
-	conn, remoteNode, err := d.dialHello(ctx, addr, func(c net.Conn) {
-		deadline := time.Now().Add(d.cfg.DialTimeout + 5*time.Second)
-		if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-			deadline = dl
-		}
-		_ = c.SetDeadline(deadline)
-	})
+// notifySession opens a stream on an established session and sends TypeNotify.
+func (d *Daemon) notifySession(ctx context.Context, sess *peer.Session, hints []index.ManifestEntry) error {
+	if sess == nil || sess.Closed() {
+		return net.ErrClosed
+	}
+	nctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, err := sess.OpenStream(nctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	if err := proto.Encode(conn, proto.NewNotify(d.nodeID, d.cfg.Port, hints)); err != nil {
 		return err
@@ -258,20 +255,18 @@ func (d *Daemon) notifyPeer(ctx context.Context, addr string, hints []index.Mani
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	ack, err := proto.Decode(conn)
 	if err == nil && ack.Header.Type == proto.TypeNotifyOK {
-		d.log.Debug("notify ack", "addr", addr, "remote_node", remoteNode)
+		d.log.Debug("notify ack", "peer", sess.NodeID())
 	}
 	return nil
 }
 
-// onNotify handles an inbound TypeNotify: learn membership, content-dedupe,
-// schedule a pull. Never commits index state from notify hints.
-// remotePort is the peer's advertised listen port from Hello/Notify (0 = use cfg.Port).
+// onNotify handles an inbound TypeNotify: content-dedupe, schedule a pull.
+// Never commits index state from notify hints.
+// remotePort is the peer's advertised listen port from Notify (0 = unused).
 func (d *Daemon) onNotify(remoteNode, remoteAddr string, remotePort int, hints []index.ManifestEntry) {
-	if remoteNode != "" && remoteNode != d.nodeID {
-		if dial := dialBackAddr(remoteAddr, remotePort, d.cfg.Port); dial != "" {
-			d.peers.remember(remoteNode, dial)
-		}
-	}
+	_ = remoteAddr
+	_ = remotePort
+	// Session membership is owned by the peer roster (already connected).
 
 	// If no hinted version would win LWW (including meta-only UpdatedAt/mode/mtime),
 	// ignore (no pull, no re-notify).

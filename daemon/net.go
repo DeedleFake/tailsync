@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"crypto/tls"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,12 +11,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
+
+	"deedles.dev/tailsync/internal/peer"
 )
 
 // NetMode selects how the daemon attaches to the network.
@@ -158,192 +157,31 @@ func peersFromStatus(st *ipnstate.Status, port int, serviceName string) []string
 	return addrs
 }
 
-// multiListener accepts connections from multiple underlying listeners.
-// A temporary Accept error on one listener is retried; a permanent error stops
-// only that listener's loop. Accept returns an error only when the multi-listener
-// is closed or every underlying listener has failed permanently.
-type multiListener struct {
-	lns  []net.Listener
-	addr string
-
-	mu     sync.Mutex
-	conns  chan acceptResult
-	closed bool
-	done   chan struct{}
-	alive  int
-}
-
-type acceptResult struct {
-	conn net.Conn
-	err  error
-}
-
-func newMultiListener(lns []net.Listener) *multiListener {
-	parts := make([]string, 0, len(lns))
-	for _, ln := range lns {
-		parts = append(parts, ln.Addr().String())
+// filterSelfHostname drops addresses that clearly refer to the local tsnet hostname.
+func filterSelfHostname(addrs []string, hostname string) []string {
+	if hostname == "" {
+		return addrs
 	}
-	m := &multiListener{
-		lns:   lns,
-		addr:  strings.Join(parts, ","),
-		conns: make(chan acceptResult),
-		done:  make(chan struct{}),
-		alive: len(lns),
-	}
-	for _, ln := range lns {
-		go m.loop(ln)
-	}
-	return m
-}
-
-func (m *multiListener) loop(ln net.Listener) {
-	defer m.listenerExit()
-
-	var tempDelay time.Duration
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			m.mu.Lock()
-			closed := m.closed
-			m.mu.Unlock()
-			if closed || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			// Retry timeout Accept errors (net.Error.Temporary is deprecated).
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
-				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
-				}
-				select {
-				case <-time.After(tempDelay):
-					continue
-				case <-m.done:
-					return
-				}
-			}
-			// Permanent error on this listener only: leave other loops running.
-			return
-		}
-		tempDelay = 0
-		select {
-		case m.conns <- acceptResult{conn: c}:
-		case <-m.done:
-			_ = c.Close()
-			return
-		}
-	}
-}
-
-// listenerExit decrements the alive count. If the multi-listener is still open
-// and no Accept loops remain, signal Accept with an error so the consumer can exit.
-func (m *multiListener) listenerExit() {
-	m.mu.Lock()
-	m.alive--
-	alive := m.alive
-	closed := m.closed
-	m.mu.Unlock()
-	if closed || alive > 0 {
-		return
-	}
-	select {
-	case m.conns <- acceptResult{err: fmt.Errorf("all listeners failed: %w", net.ErrClosed)}:
-	case <-m.done:
-	}
-}
-
-func (m *multiListener) Accept() (net.Conn, error) {
-	select {
-	case <-m.done:
-		return nil, net.ErrClosed
-	case r, ok := <-m.conns:
-		if !ok {
-			return nil, net.ErrClosed
-		}
-		if r.err != nil {
-			return nil, r.err
-		}
-		return r.conn, nil
-	}
-}
-
-func (m *multiListener) Close() error {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	m.closed = true
-	close(m.done)
-	m.mu.Unlock()
-
-	var first error
-	for _, ln := range m.lns {
-		if err := ln.Close(); err != nil && first == nil {
-			first = err
-		}
-	}
-	return first
-}
-
-func (m *multiListener) Addr() net.Addr {
-	if len(m.lns) == 0 {
-		return nil
-	}
-	return multiAddr(m.addr)
-}
-
-// multiAddr is a net.Addr that reports all bound addresses.
-type multiAddr string
-
-func (a multiAddr) Network() string { return "udp" }
-func (a multiAddr) String() string  { return string(a) }
-
-// listenResult is the outcome of binding a set of addresses.
-type listenResult struct {
-	Listener net.Listener
-	Bound    []string // addresses that bound successfully
-	Skipped  []string // addresses that failed to bind (empty if none)
-}
-
-// listenAll binds QUIC (UDP) on each address, keeping successful binds even if
-// some fail. Errors only when every address fails (or addrs is empty). A single
-// successful bind returns that listener directly; multiple binds use multiListener.
-// tlsConf must be non-nil (server certificate for QUIC).
-func listenAll(addrs []string, tlsConf *tls.Config) (listenResult, error) {
-	var res listenResult
-	if len(addrs) == 0 {
-		return res, fmt.Errorf("no listen addresses")
-	}
-	var lns []net.Listener
+	self := strings.ToLower(hostname)
+	var out []string
 	for _, a := range addrs {
-		ln, err := listenQUIC(a, tlsConf)
+		host, _, err := net.SplitHostPort(a)
 		if err != nil {
-			res.Skipped = append(res.Skipped, a)
+			host = a
+		}
+		h := strings.ToLower(host)
+		if h == self || strings.HasPrefix(h, self+".") {
 			continue
 		}
-		lns = append(lns, ln)
-		res.Bound = append(res.Bound, a)
+		out = append(out, a)
 	}
-	if len(lns) == 0 {
-		return res, fmt.Errorf("listen failed on all addresses %v", addrs)
-	}
-	if len(lns) == 1 {
-		res.Listener = lns[0]
-		return res, nil
-	}
-	res.Listener = newMultiListener(lns)
-	return res, nil
+	return out
 }
 
 func (d *Daemon) listen(ctx context.Context) error {
 	switch d.cfg.NetMode {
 	case NetModePlain:
-		return d.listenPlain()
+		return d.listenPlain(ctx)
 	case NetModeTSNet:
 		return d.listenTSNet(ctx)
 	default:
@@ -351,18 +189,136 @@ func (d *Daemon) listen(ctx context.Context) error {
 	}
 }
 
-func (d *Daemon) listenPlain() error {
+func (d *Daemon) newMesh() (*peer.Manager, error) {
+	m, err := peer.NewManager(peer.Config{
+		NodeID:               d.nodeID,
+		Port:                 d.cfg.Port,
+		ServerTLS:            d.quicTLS,
+		ClientTLS:            quicClientTLSConfig(),
+		Logger:               d.log,
+		DiscoveryConcurrency: d.cfg.DiscoveryConcurrency,
+		DialTimeout:          d.cfg.DialTimeout,
+		HeartbeatInterval:    d.cfg.HeartbeatInterval,
+		Candidates:           d.discoveryCandidates,
+	})
+	if err != nil {
+		return nil, err
+	}
+	m.OnStream = d.onPeerStream
+	m.OnPeerUp = func(s *peer.Session) {
+		d.requestPull()
+	}
+	// Bind Hello NodeID to Tailscale identity for host/tsnet (not plain tests).
+	if d.cfg.NetMode != NetModePlain {
+		m.VerifyRemoteID = d.verifyPeerNodeID
+	}
+	return m, nil
+}
+
+// verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
+// remoteAddr. Prevents roster hijack under skip-verify TLS on the tailnet.
+func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
+	lc, err := d.localClient()
+	if err != nil {
+		return err
+	}
+	who, err := lc.WhoIs(ctx, remoteAddr)
+	if err != nil {
+		return fmt.Errorf("whois %s: %w", remoteAddr, err)
+	}
+	if who == nil || who.Node == nil {
+		return fmt.Errorf("whois %s: empty node", remoteAddr)
+	}
+	if !claimedMatchesWhoIs(claimed, who) {
+		return fmt.Errorf("hello node id %q does not match tailscale peer at %s", claimed, remoteAddr)
+	}
+	return nil
+}
+
+// localClient returns the LocalAPI client for host or tsnet mode.
+func (d *Daemon) localClient() (*local.Client, error) {
+	switch d.cfg.NetMode {
+	case NetModeTSNet:
+		if d.server == nil {
+			return nil, fmt.Errorf("tsnet not started")
+		}
+		return d.server.LocalClient()
+	case NetModeHost:
+		if d.local != nil {
+			return d.local, nil
+		}
+		return &local.Client{}, nil
+	default:
+		return nil, fmt.Errorf("no local client in %s mode", d.cfg.NetMode)
+	}
+}
+
+// claimedMatchesWhoIs reports whether claimed Hello NodeID matches a canonical
+// identity for the Tailscale peer. Matching is exact on MagicDNS FQDN (no
+// trailing dot), StableID, HostName, or ComputedName. A short claim may match
+// only as the first label of the peer FQDN (want + "." prefix of c), not the
+// reverse (which would allow multi-identity extensions of a short local id).
+func claimedMatchesWhoIs(claimed string, who *apitype.WhoIsResponse) bool {
+	if claimed == "" || who == nil || who.Node == nil {
+		return false
+	}
+	want := strings.ToLower(strings.TrimSuffix(claimed, "."))
+	n := who.Node
+	candidates := []string{
+		strings.TrimSuffix(n.Name, "."),
+		string(n.StableID),
+	}
+	if n.Hostinfo.Valid() {
+		if hn := n.Hostinfo.Hostname(); hn != "" {
+			candidates = append(candidates, hn)
+		}
+	}
+	if cn := n.ComputedName; cn != "" {
+		candidates = append(candidates, cn)
+	}
+	for _, c := range candidates {
+		c = strings.ToLower(strings.TrimSuffix(c, "."))
+		if c == "" {
+			continue
+		}
+		if c == want {
+			return true
+		}
+		// Short claim "peer" matches FQDN "peer.tailnet.ts.net" only.
+		if strings.HasPrefix(c, want+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Daemon) listenPlain(ctx context.Context) error {
 	host := d.cfg.ListenHost
 	addr := net.JoinHostPort(host, strconv.Itoa(d.cfg.Port))
-	ln, err := listenQUIC(addr, d.quicTLS)
-	if err != nil {
-		return fmt.Errorf("listen quic %s:%d: %w", host, d.cfg.Port, err)
-	}
-	d.ln = ln
 	if d.cfg.Hostname != "" {
 		d.nodeID = d.cfg.Hostname
 	}
-	d.log.Info("listening (plain QUIC)", "addr", ln.Addr().String(), "mode", NetModePlain.String())
+	if d.nodeID == "" {
+		d.nodeID = d.cfg.Hostname
+	}
+
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return fmt.Errorf("listen udp %s: %w", addr, err)
+	}
+
+	m, err := d.newMesh()
+	if err != nil {
+		_ = pc.Close()
+		return err
+	}
+	if err := m.AddPacketConn(pc); err != nil {
+		_ = m.Close()
+		return fmt.Errorf("mesh add packet conn: %w", err)
+	}
+	m.Start(ctx)
+	d.mesh = m
+	d.log.Info("listening (plain QUIC)", "addrs", m.Endpoint().LocalAddrs(), "mode", NetModePlain.String())
 	return nil
 }
 
@@ -465,66 +421,55 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 		d.server = nil
 		return fmt.Errorf("tsnet: no Tailscale IPs after up")
 	}
-	d.quicDialHosts = make([]string, 0, len(ips))
-	for _, ip := range ips {
-		if ip.IsValid() {
-			d.quicDialHosts = append(d.quicDialHosts, ip.String())
-		}
-	}
 
-	addrs := bindAddrsFromTailscaleIPs(ips, d.cfg.Port)
-	res, err := listenAllTSNet(s, addrs, d.quicTLS)
+	d.nodeID = d.cfg.Hostname
+
+	m, err := d.newMesh()
 	if err != nil {
 		d.setInjectNetChange(nil)
 		_ = s.Close()
 		d.server = nil
-		return fmt.Errorf("tsnet quic listen: %w", err)
+		return err
 	}
-	d.ln = res.Listener
-	for _, a := range res.Skipped {
+	// Name resolution via LocalAPI (MagicDNS), not system DNS.
+	m.ResolveAddr = func(ctx context.Context, addr string) (net.Addr, error) {
+		return resolveTSNetUDPAddr(ctx, s, addr)
+	}
+
+	addrs := bindAddrsFromTailscaleIPs(ips, d.cfg.Port)
+	var bound, skipped []string
+	for _, a := range addrs {
+		pc, err := s.ListenPacket("udp", a)
+		if err != nil {
+			skipped = append(skipped, a)
+			continue
+		}
+		if err := m.AddPacketConn(pc); err != nil {
+			_ = pc.Close()
+			skipped = append(skipped, a)
+			continue
+		}
+		bound = append(bound, a)
+	}
+	if len(bound) == 0 {
+		_ = m.Close()
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return fmt.Errorf("tsnet quic listen failed on all addresses %v", addrs)
+	}
+	for _, a := range skipped {
 		d.log.Warn("could not bind tsnet address; continuing with others", "addr", a)
 	}
-	d.nodeID = d.cfg.Hostname
+	m.Start(ctx)
+	d.mesh = m
 	d.log.Info("listening on tailnet (tsnet QUIC)",
-		"addrs", res.Bound,
-		"skipped", res.Skipped,
+		"addrs", bound,
+		"skipped", skipped,
 		"hostname", d.cfg.Hostname,
 		"mode", NetModeTSNet.String(),
 	)
 	return nil
-}
-
-// listenAllTSNet binds QUIC over tsnet UDP PacketConns on each address.
-func listenAllTSNet(s *tsnet.Server, addrs []string, tlsConf *tls.Config) (listenResult, error) {
-	var res listenResult
-	if len(addrs) == 0 {
-		return res, fmt.Errorf("no listen addresses")
-	}
-	var lns []net.Listener
-	for _, a := range addrs {
-		pc, err := s.ListenPacket("udp", a)
-		if err != nil {
-			res.Skipped = append(res.Skipped, a)
-			continue
-		}
-		ln, err := listenQUICPacket(pc, tlsConf)
-		if err != nil {
-			_ = pc.Close()
-			res.Skipped = append(res.Skipped, a)
-			continue
-		}
-		lns = append(lns, ln)
-		res.Bound = append(res.Bound, a)
-	}
-	if len(lns) == 0 {
-		return res, fmt.Errorf("listen failed on all addresses %v", addrs)
-	}
-	if len(lns) == 1 {
-		res.Listener = lns[0]
-		return res, nil
-	}
-	res.Listener = newMultiListener(lns)
-	return res, nil
 }
 
 // ensureAndroidTSLogsDir points Tailscale logpolicy at a writable directory under
@@ -589,17 +534,37 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	d.nodeID = id
 	d.cfg.Hostname = id
 
-	res, err := listenAll(addrs, d.quicTLS)
+	m, err := d.newMesh()
 	if err != nil {
-		return fmt.Errorf("listen on Tailscale IPs: %w", err)
+		return err
 	}
-	d.ln = res.Listener
-	for _, a := range res.Skipped {
+
+	var bound, skipped []string
+	for _, a := range addrs {
+		pc, err := net.ListenPacket("udp", a)
+		if err != nil {
+			skipped = append(skipped, a)
+			continue
+		}
+		if err := m.AddPacketConn(pc); err != nil {
+			_ = pc.Close()
+			skipped = append(skipped, a)
+			continue
+		}
+		bound = append(bound, a)
+	}
+	if len(bound) == 0 {
+		_ = m.Close()
+		return fmt.Errorf("listen on Tailscale IPs failed for all addresses %v", addrs)
+	}
+	for _, a := range skipped {
 		d.log.Warn("could not bind Tailscale address; continuing with others", "addr", a)
 	}
+	m.Start(ctx)
+	d.mesh = m
 	d.log.Info("listening on host tailnet (QUIC)",
-		"addrs", res.Bound,
-		"skipped", res.Skipped,
+		"addrs", bound,
+		"skipped", skipped,
 		"hostname", d.nodeID,
 		"mode", NetModeHost.String(),
 		"backend", st.BackendState,
@@ -607,24 +572,21 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	return nil
 }
 
-// closeNetListener closes the QUIC listener so Accept unblocks. Idempotent.
-// Does not nil d.ln until closeNetworkBackend so a late field read is non-nil
-// if any code still observes it; acceptLoop uses a captured listener value.
-func (d *Daemon) closeNetListener() {
-	if d.ln != nil {
-		_ = d.ln.Close()
+// closeMesh stops the peer manager (accept, discovery, sessions). Idempotent.
+// Call before waiting on stream/pull/notify wait groups so handlers observe
+// closed connections rather than racing root teardown.
+func (d *Daemon) closeMesh() {
+	if d.mesh != nil {
+		_ = d.mesh.Close()
+		d.mesh = nil
 	}
 }
 
-// closeNetworkBackend tears down tsnet/local clients and clears listener state.
-// Call only after acceptLoop has exited (so no concurrent Accept on d.ln).
-// Clears injectNetChange under netMu before Close so concurrent
-// InjectNetworkChange does not race a torn-down monitor pointer after we drop
-// the only remaining reference path from the daemon.
+// closeNetworkBackend tears down tsnet/local clients after mesh and workers.
 func (d *Daemon) closeNetworkBackend() {
 	d.setInjectNetChange(nil)
-	d.ln = nil
-	d.quicDialHosts = nil
+	// Mesh may already be closed; ensure nil.
+	d.closeMesh()
 	if d.server != nil {
 		_ = d.server.Close()
 		d.server = nil
@@ -633,8 +595,6 @@ func (d *Daemon) closeNetworkBackend() {
 }
 
 // listPeers returns online discovery peers from Tailscale status only.
-// It does not consult Config.Peers; candidateAddrs unions pins, the hot set,
-// and this status list (status only when pins are empty for test determinism).
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 	switch d.cfg.NetMode {
 	case NetModePlain:
@@ -665,80 +625,4 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		}
 		return peersFromStatus(st, d.cfg.Port, d.cfg.ServiceName), nil
 	}
-}
-
-// filterSelfHostname drops addresses that clearly refer to the local tsnet hostname.
-func filterSelfHostname(addrs []string, hostname string) []string {
-	if hostname == "" {
-		return addrs
-	}
-	self := strings.ToLower(hostname)
-	var out []string
-	for _, a := range addrs {
-		host, _, err := net.SplitHostPort(a)
-		if err != nil {
-			host = a
-		}
-		h := strings.ToLower(host)
-		if h == self || strings.HasPrefix(h, self+".") {
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
-}
-
-func (d *Daemon) dial(ctx context.Context, addr string) (net.Conn, error) {
-	timeout := d.cfg.DialTimeout
-	if timeout <= 0 {
-		timeout = DefaultDialTimeout
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	switch d.cfg.NetMode {
-	case NetModeTSNet:
-		if d.server != nil {
-			return d.dialTSNetQUIC(dialCtx, addr)
-		}
-		fallthrough
-	default:
-		// Host + plain: system UDP routed by tailscaled (host) or loopback (plain).
-		return dialQUICAddr(dialCtx, addr)
-	}
-}
-
-// dialTSNetQUIC opens an ephemeral tsnet UDP socket and dials a one-stream session.
-// Remote hostnames are resolved via tsnet LocalAPI status (MagicDNS/HostName),
-// not system DNS. Local bind IPs are ordered to match the remote address family.
-func (d *Daemon) dialTSNetQUIC(ctx context.Context, addr string) (net.Conn, error) {
-	if d.server == nil {
-		return nil, fmt.Errorf("tsnet not started")
-	}
-	raddr, err := resolveTSNetUDPAddr(ctx, d.server, addr)
-	if err != nil {
-		return nil, err
-	}
-	hosts := pickDialHostsByFamily(d.quicDialHosts, raddr.IP)
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no local tsnet IP for quic dial")
-	}
-	var lastErr error
-	for _, host := range hosts {
-		pc, err := d.server.ListenPacket("udp", net.JoinHostPort(host, "0"))
-		if err != nil {
-			lastErr = fmt.Errorf("tsnet listen packet for dial (%s): %w", host, err)
-			continue
-		}
-		conn, err := dialQUICPacketTo(ctx, pc, raddr)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return conn, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no local tsnet IP for quic dial")
-	}
-	return nil, lastErr
 }

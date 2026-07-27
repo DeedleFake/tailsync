@@ -16,6 +16,7 @@ import (
 	"deedles.dev/tailsync/internal/atomicfile"
 	"deedles.dev/tailsync/internal/delta"
 	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/peer"
 	"deedles.dev/tailsync/internal/proto"
 )
 
@@ -95,224 +96,65 @@ func decideApply(local index.Entry, hasLocal bool, remote index.Entry, diskPrese
 	return applyDecision{kind: applyContent, remote: remote, local: local, hasLocal: hasLocal, useDelta: useDelta}
 }
 
-// pullPeers dials candidates and pulls manifests/content in parallel, capped by
-// maxParallelPulls (each in-flight content pull may buffer up to MaxFileBytes).
-// Disk and index commits remain serialized via syncMu. Notify fan-out is
-// separate and does not wait on this batch.
-//
-// Sessions are pull-oriented (see pullFrom): Hello, pull manifest/entries,
-// SyncDone, close. Writers wake peers with notify; interval/bootstrap pull
-// catches missed notifies and late joiners.
+// pullPeers pulls manifests/content from connected peer sessions.
+// Content streams are capped by pullSem (PullStreamConcurrency). Disk and
+// index commits remain serialized via syncMu. Discovery is separate; this only
+// uses already-established sessions. Notify fan-out does not wait on this batch.
 func (d *Daemon) pullPeers(ctx context.Context) {
-	peers := d.candidateAddrs(ctx)
-	if len(peers) == 0 {
+	if d.mesh == nil {
 		return
 	}
-
-	// Empty Peers + ServiceName means discovery dials every online tailnet node.
-	// On larger tailnets that includes devices not running tailsync (dials fail
-	// fast via DialTimeout but still add batch latency).
-	if len(d.cfg.Peers) == 0 && d.cfg.ServiceName == "" && len(peers) > manyPeersWarnThreshold {
-		if d.manyPeersWarned.CompareAndSwap(false, true) {
-			d.log.Warn("discovered many peers without -service; dialing all online nodes wastes dial attempts on hosts not running tailsync",
-				"count", len(peers),
-				"hint", "set -service <name-substring> (or -peers for tests/overrides)",
-			)
-		}
+	snap := d.mesh.Snapshot()
+	if len(snap) == 0 {
+		return
 	}
-	d.log.Debug("pull peers", "count", len(peers))
+	d.log.Debug("pull peers", "count", len(snap))
 
-	sem := make(chan struct{}, maxParallelPulls)
-	var (
-		wg         sync.WaitGroup
-		softMu     sync.Mutex
-		softCount  int
-		softSample []string
-	)
-	const softSampleMax = 3
-	for _, addr := range peers {
+	var wg sync.WaitGroup
+	for _, info := range snap {
 		if err := ctx.Err(); err != nil {
 			break
 		}
+		if !info.Healthy {
+			continue
+		}
+		sess := d.mesh.Session(info.NodeID)
+		if sess == nil || !sess.Healthy() {
+			continue
+		}
 		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
-			if err := d.pullFrom(ctx, addr); err != nil {
-				// Dial soft-fails (timeout/refused/unreachable) are expected when
-				// discovery includes non-tailsync nodes: per-peer Debug + batch Info.
-				// Mid-session failures stay Warn. Soft-fail records per-addr backoff
-				// for hot/status candidates (-peers pins still re-dial each batch).
-				if isDialSoftFail(err) {
-					d.log.Debug("pull peer", "addr", addr, "err", err)
-					d.peers.softFailAddr(addr)
-					softMu.Lock()
-					softCount++
-					if len(softSample) < softSampleMax {
-						softSample = append(softSample, addr)
-					}
-					softMu.Unlock()
-					return
-				}
-				d.log.Warn("pull peer", "addr", addr, "err", err)
+			if err := d.pullFromSession(ctx, sess); err != nil {
+				d.log.Warn("pull peer", "peer", info.NodeID, "addr", info.Addr, "err", err)
 			}
 		})
 	}
 	wg.Wait()
-	if softCount > 0 {
-		d.log.Info("peer dial soft-fails", "count", softCount, "sample", softSample)
-	}
 }
 
-// errDial marks failures from the outbound dial phase (not mid-session I/O).
-var errDial = errors.New("dial")
-
-// isDialSoftFail reports dial-phase failures that are expected when discovery
-// includes nodes not running tailsync (timeout, refused, unreachable).
-// Mid-session timeouts/errors are not soft-fails even if they unwrap to the
-// same network conditions.
-func isDialSoftFail(err error) bool {
-	if err == nil || !errors.Is(err, errDial) {
-		return false
+// pullFromSession requests the peer's manifest on a dedicated stream, then
+// applies each entry (opening a stream per file for content). Newly applied
+// content is optionally re-notified (infect-and-die).
+func (d *Daemon) pullFromSession(ctx context.Context, sess *peer.Session) error {
+	if sess == nil || sess.Closed() {
+		return net.ErrClosed
 	}
-	return isSoftDialNetworkErr(err)
-}
-
-// isSoftDialNetworkErr reports network conditions typical of dialing a node that
-// is online on the tailnet but not accepting tailsync (or not reachable).
-func isSoftDialNetworkErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Parent cancel is not a "soft" unreachable peer; leave at Warn if wrapped as dial.
-	if errors.Is(err, context.Canceled) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	if errors.Is(err, syscall.ECONNREFUSED) ||
-		errors.Is(err, syscall.EHOSTUNREACH) ||
-		errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.ECONNABORTED) ||
-		errors.Is(err, syscall.ECONNRESET) {
-		return true
-	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
-		return true
-	}
-	return false
-}
-
-// dialHello dials addr, exchanges Hello/HelloOK, remembers remoteNode→addr in
-// the hot set, and returns the live connection. On error the connection is
-// closed. After success the caller owns conn and must Close it.
-//
-// prepare, if non-nil, runs after dial and before Hello so callers can set
-// deadlines: notify uses a short cap; pull uses setConnDeadline (longer).
-func (d *Daemon) dialHello(ctx context.Context, addr string, prepare func(net.Conn)) (net.Conn, string, error) {
-	conn, err := d.dial(ctx, addr)
-	if err != nil {
-		return nil, "", fmt.Errorf("%w: %w", errDial, err)
-	}
-	ok := false
-	defer func() {
-		if !ok {
-			_ = conn.Close()
-		}
-	}()
-	if prepare != nil {
-		prepare(conn)
-	}
-
-	if err := proto.Encode(conn, proto.NewHello(d.nodeID, d.cfg.Port)); err != nil {
-		return nil, "", err
-	}
-	resp, err := proto.Decode(conn)
-	if err != nil {
-		return nil, "", fmt.Errorf("hello response: %w", err)
-	}
-	if resp.Header.Type == proto.TypeError {
-		return nil, "", fmt.Errorf("hello error: %s", resp.Header.Error)
-	}
-	if resp.Header.Type != proto.TypeHelloOK {
-		return nil, "", fmt.Errorf("unexpected hello response %q", resp.Header.Type)
-	}
-	remoteNode := resp.Header.NodeID
-	if remoteNode == d.nodeID {
-		return nil, "", fmt.Errorf("connected to self")
-	}
-	// Outbound dial addr is authoritative for this peer.
-	d.peers.remember(remoteNode, addr)
-	ok = true
-	return conn, remoteNode, nil
-}
-
-// pullFrom opens a pull-only session with addr:
-//
-//  1. Hello / HelloOK (learns remote nodeID into hot set)
-//  2. Dialer pulls listener (ManifestReq → apply entries, FileReq/DeltaReq)
-//  3. Dialer sends SyncDone and closes
-//
-// Local writes are delivered via notify + peer-initiated pull, not reverse-pull.
-func (d *Daemon) pullFrom(ctx context.Context, addr string) error {
-	conn, remoteNode, err := d.dialHello(ctx, addr, func(c net.Conn) {
-		d.setConnDeadline(c, ctx)
-	})
+	entries, err := d.fetchManifest(ctx, sess)
 	if err != nil {
 		return err
-	}
-	defer conn.Close()
-
-	n, err := d.pullFromConn(ctx, conn)
-	if err != nil {
-		return err
-	}
-	if err := proto.Encode(conn, proto.NewSyncDone()); err != nil {
-		return fmt.Errorf("sync_done: %w", err)
-	}
-	d.log.Info("pulled peer", "addr", addr, "remote_node", remoteNode, "manifest_entries", n)
-	return nil
-}
-
-// pullFromConn requests the peer's manifest and applies each entry (pulling
-// file/delta content as needed on conn). Returns the number of manifest
-// entries received. On transport failure during apply, aborts early.
-// Newly applied content is optionally re-notified (infect-and-die) so peers
-// that missed the original write can still catch up via this node.
-func (d *Daemon) pullFromConn(ctx context.Context, conn net.Conn) (int, error) {
-	if err := proto.Encode(conn, proto.NewManifestReq()); err != nil {
-		return 0, err
-	}
-	man, err := proto.Decode(conn)
-	if err != nil {
-		return 0, fmt.Errorf("manifest: %w", err)
-	}
-	if man.Header.Type == proto.TypeError {
-		return 0, fmt.Errorf("manifest error: %s", man.Header.Error)
-	}
-	if man.Header.Type != proto.TypeManifest {
-		return 0, fmt.Errorf("expected manifest, got %q", man.Header.Type)
 	}
 
 	changed := false
 	var acquired []index.ManifestEntry
 	var transportErr error
-	for _, remote := range man.Header.Entries {
+	for _, remote := range entries {
 		if err := ctx.Err(); err != nil {
-			return len(man.Header.Entries), err
+			return err
 		}
-		d.setConnDeadline(conn, ctx)
-		did, err := d.applyRemote(ctx, conn, remote)
+		did, err := d.applyRemote(ctx, sess, remote)
 		if err != nil {
-			// Per-entry logical errors: continue. Transport/decode failures abort.
 			if isTransportErr(err) {
 				transportErr = err
-				d.log.Warn("peer transport error, aborting pull", "err", err)
+				d.log.Warn("peer transport error, aborting pull", "peer", sess.NodeID(), "err", err)
 				break
 			}
 			d.log.Warn("apply remote entry", "path", remote.Path, "err", err)
@@ -320,7 +162,6 @@ func (d *Daemon) pullFromConn(ctx context.Context, conn net.Conn) (int, error) {
 		}
 		if did {
 			changed = true
-			// Snapshot what we acquired for infect-and-die (from index after apply).
 			if e, ok := d.idx.Get(remote.Path); ok {
 				acquired = append(acquired, e)
 			}
@@ -330,28 +171,51 @@ func (d *Daemon) pullFromConn(ctx context.Context, conn net.Conn) (int, error) {
 		d.syncMu.Lock()
 		if err := d.idx.Save(); err != nil {
 			d.syncMu.Unlock()
-			return len(man.Header.Entries), fmt.Errorf("save index: %w", err)
+			return fmt.Errorf("save index: %w", err)
 		}
 		d.appliesSinceSave = 0
 		d.syncMu.Unlock()
-		// Infect-and-die: soft-notify newly acquired ids only (deduped).
 		if len(acquired) > 0 {
 			d.scheduleNotify(ctx, acquired)
 		}
 	}
 	if transportErr != nil {
-		return len(man.Header.Entries), transportErr
+		return transportErr
 	}
-	return len(man.Header.Entries), nil
+	d.log.Info("pulled peer", "peer", sess.NodeID(), "addr", sess.Addr(), "manifest_entries", len(entries))
+	return nil
 }
 
-// applyRemote reconciles one remote manifest entry.
+func (d *Daemon) fetchManifest(ctx context.Context, sess *peer.Session) ([]index.ManifestEntry, error) {
+	conn, err := sess.OpenStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open manifest stream: %w", err)
+	}
+	defer conn.Close()
+	d.setConnDeadline(conn, ctx)
+	if err := proto.Encode(conn, proto.NewManifestReq()); err != nil {
+		return nil, fmt.Errorf("%w: encode manifest_req: %w", errTransport, err)
+	}
+	man, err := proto.Decode(conn)
+	if err != nil {
+		return nil, fmt.Errorf("%w: manifest: %w", errTransport, err)
+	}
+	if man.Header.Type == proto.TypeError {
+		return nil, peerLogical(man.Header.Error)
+	}
+	if man.Header.Type != proto.TypeManifest {
+		return nil, fmt.Errorf("%w: expected manifest, got %q", errTransport, man.Header.Type)
+	}
+	return man.Header.Entries, nil
+}
+
+// applyRemote reconciles one remote manifest entry via the peer session.
 //
 // Pattern: decide under syncMu → release for network transfer → re-lock,
 // re-check LWW, then atomic write + index commit. Other peer applies may run
 // during the unlocked pull; commits re-take syncMu. Reconcile may run on the
 // main loop concurrently with pull (serialized with apply commits via syncMu).
-func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.ManifestEntry) (bool, error) {
+func (d *Daemon) applyRemote(ctx context.Context, sess *peer.Session, remote index.ManifestEntry) (bool, error) {
 	rel, err := d.relPath(remote.Path)
 	if err != nil {
 		return false, fmt.Errorf("reject path: %w", err)
@@ -409,7 +273,7 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 		useDelta := dec.useDelta
 		d.syncMu.Unlock()
 
-		data, got, err := d.pullAndVerify(ctx, conn, remote, useDelta)
+		data, got, err := d.pullAndVerify(ctx, sess, remote, useDelta)
 		if err != nil {
 			return false, err
 		}
@@ -432,8 +296,8 @@ func (d *Daemon) applyRemote(ctx context.Context, conn net.Conn, remote index.Ma
 // pullAndVerify fetches remote bytes (delta and/or full) and returns data whose
 // SHA-256 matches remote.Hash. On delta success with a hash mismatch (e.g. basis
 // raced with another commit), retries a full pull once before failing.
-func (d *Daemon) pullAndVerify(ctx context.Context, conn net.Conn, remote index.ManifestEntry, useDelta bool) ([]byte, string, error) {
-	data, err := d.pullContent(ctx, conn, remote, useDelta)
+func (d *Daemon) pullAndVerify(ctx context.Context, sess *peer.Session, remote index.ManifestEntry, useDelta bool) ([]byte, string, error) {
+	data, err := d.pullContent(ctx, sess, remote, useDelta)
 	if err != nil {
 		return nil, "", err
 	}
@@ -450,7 +314,7 @@ func (d *Daemon) pullAndVerify(ctx context.Context, conn net.Conn, remote index.
 			"want", remote.Hash,
 			"use_delta", true,
 		)
-		data, err = d.pullFull(ctx, conn, remote)
+		data, err = d.pullFull(ctx, sess, remote)
 		if err != nil {
 			return nil, "", err
 		}
@@ -573,21 +437,80 @@ func (d *Daemon) commitContent(re index.Entry, data []byte, got string) (bool, e
 	return true, nil
 }
 
-// pullContent fetches remote bytes without holding syncMu.
-func (d *Daemon) pullContent(ctx context.Context, conn net.Conn, remote index.ManifestEntry, useDelta bool) ([]byte, error) {
+// errDial aliases peer.ErrDial for tests and soft-fail classification.
+var errDial = peer.ErrDial
+
+// isDialSoftFail reports dial-phase failures that are expected when discovery
+// includes nodes not running tailsync (timeout, refused, unreachable).
+func isDialSoftFail(err error) bool {
+	if err == nil || !errors.Is(err, errDial) {
+		return false
+	}
+	return isSoftDialNetworkErr(err)
+}
+
+func isSoftDialNetworkErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
+
+// pullContent fetches remote bytes without holding syncMu (one stream per file).
+func (d *Daemon) pullContent(ctx context.Context, sess *peer.Session, remote index.ManifestEntry, useDelta bool) ([]byte, error) {
 	if useDelta {
-		data, err := d.pullDelta(ctx, conn, remote)
+		data, err := d.pullDelta(ctx, sess, remote)
 		if err != nil {
 			if isTransportErr(err) {
 				d.log.Debug("delta pull failed, aborting peer apply (transport)", "path", remote.Path, "err", err)
 				return nil, err
 			}
 			d.log.Debug("delta pull failed, falling back to full", "path", remote.Path, "err", err)
-			return d.pullFull(ctx, conn, remote)
+			return d.pullFull(ctx, sess, remote)
 		}
 		return data, nil
 	}
-	return d.pullFull(ctx, conn, remote)
+	return d.pullFull(ctx, sess, remote)
+}
+
+// acquirePullSlot blocks until a global pull stream slot is available.
+func (d *Daemon) acquirePullSlot(ctx context.Context) error {
+	if d.pullSem == nil {
+		return nil
+	}
+	select {
+	case d.pullSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *Daemon) releasePullSlot() {
+	if d.pullSem == nil {
+		return
+	}
+	select {
+	case <-d.pullSem:
+	default:
+	}
 }
 
 // diskMeta returns mode and mtime actually present on disk after a metadata or
@@ -644,10 +567,22 @@ func (d *Daemon) maybeSaveLocked() {
 	}
 }
 
-func (d *Daemon) pullFull(ctx context.Context, conn net.Conn, remote index.ManifestEntry) ([]byte, error) {
+func (d *Daemon) pullFull(ctx context.Context, sess *peer.Session, remote index.ManifestEntry) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := d.acquirePullSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer d.releasePullSlot()
+
+	conn, err := sess.OpenStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open file stream: %w", errTransport, err)
+	}
+	defer conn.Close()
+	d.setConnDeadline(conn, ctx)
+
 	if err := proto.Encode(conn, proto.NewFileReq(remote.Path, remote.Hash)); err != nil {
 		return nil, fmt.Errorf("%w: encode file_req: %w", errTransport, err)
 	}
@@ -664,7 +599,7 @@ func (d *Daemon) pullFull(ctx context.Context, conn net.Conn, remote index.Manif
 	return msg.Payload, nil
 }
 
-func (d *Daemon) pullDelta(ctx context.Context, conn net.Conn, remote index.ManifestEntry) ([]byte, error) {
+func (d *Daemon) pullDelta(ctx context.Context, sess *peer.Session, remote index.ManifestEntry) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -682,6 +617,19 @@ func (d *Daemon) pullDelta(ctx context.Context, conn net.Conn, remote index.Mani
 	if err != nil {
 		return nil, peerLogical(err.Error())
 	}
+
+	if err := d.acquirePullSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer d.releasePullSlot()
+
+	conn, err := sess.OpenStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open delta stream: %w", errTransport, err)
+	}
+	defer conn.Close()
+	d.setConnDeadline(conn, ctx)
+
 	if err := proto.Encode(conn, proto.NewDeltaReq(remote.Path, remote.Hash, d.cfg.BlockSize, sigRaw)); err != nil {
 		return nil, fmt.Errorf("%w: encode delta_req: %w", errTransport, err)
 	}

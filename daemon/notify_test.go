@@ -86,62 +86,16 @@ func TestAlreadyHaveAll(t *testing.T) {
 	}
 }
 
-func TestPeerMemSoftFailNeverDeletes(t *testing.T) {
-	p := newPeerMem()
-	p.remember("n1", "127.0.0.1:1")
-	if ids := p.snapshotIDs(); len(ids) != 1 {
-		t.Fatalf("ids %v", ids)
-	}
-	p.softFailAddr("127.0.0.1:1")
-	// Still present; in addr backoff so hotAddrs empty.
-	if ids := p.snapshotIDs(); len(ids) != 1 || ids[0] != "n1" {
-		t.Fatalf("soft-fail must not delete: %v", ids)
-	}
-	if len(p.hotAddrs()) != 0 {
-		t.Fatal("expected hot addr hidden by backoff")
-	}
-	// remember clears backoff.
-	p.remember("n1", "127.0.0.1:1")
-	addrs := p.hotAddrs()
-	if len(addrs) != 1 || addrs[0] != "127.0.0.1:1" {
-		t.Fatalf("after remember: %v", addrs)
-	}
-}
-
-func TestPeerMemSoftFailAddrAcrossSources(t *testing.T) {
-	p := newPeerMem()
-	// Soft-fail without prior hot entry (status-only peer).
-	p.softFailAddr("127.0.0.1:9")
-	if !p.inBackoff("127.0.0.1:9") {
-		t.Fatal("expected addr backoff without hot set")
-	}
-	p.remember("n1", "127.0.0.1:9")
-	if p.inBackoff("127.0.0.1:9") {
-		t.Fatal("remember must clear addr backoff")
-	}
-	p.softFailAddr("127.0.0.1:9")
-	if len(p.hotAddrs()) != 0 {
-		t.Fatal("expected backoff to hide hot addr")
-	}
-	if len(p.snapshotIDs()) != 1 {
-		t.Fatal("must still remember node")
-	}
-}
-
 func TestScheduleNotifyNoCandidatesDoesNotMark(t *testing.T) {
 	d := testDaemon(t)
 	d.nodeID = "local"
 	d.cfg.NetMode = NetModePlain
 	d.cfg.Peers = nil
-	// No peers, no hot set, plain status empty → zero candidates.
+	// No mesh → zero connected sessions.
 	now := time.Now()
 	hints := []index.ManifestEntry{{Path: "a", Hash: "h", UpdatedAt: now}}
-	addrs := d.candidateAddrs(t.Context())
-	if len(addrs) != 0 {
-		t.Fatalf("expected empty candidates, got %v", addrs)
-	}
 	if d.scheduleNotify(t.Context(), hints) {
-		t.Fatal("expected no fan-out with zero candidates")
+		t.Fatal("expected no fan-out with no mesh")
 	}
 	// Keys must remain pending so a later peer can be notified.
 	if got := d.notifySeen.pending(hints); len(got) != 1 {
@@ -219,7 +173,7 @@ func TestLateRequestPullAndOnNotifyAfterRun(t *testing.T) {
 		t.Fatal("Run did not exit")
 	}
 
-	// Late callbacks after shutdown (handleConn / infect-and-die race with cancel).
+	// Late callbacks after shutdown (handleStream / infect-and-die race with cancel).
 	d.requestPull()
 	d.onNotify("peer-x", "127.0.0.1:9", 9, []index.ManifestEntry{
 		{Path: "late.txt", Hash: "abc", UpdatedAt: time.Now()},
@@ -228,8 +182,14 @@ func TestLateRequestPullAndOnNotifyAfterRun(t *testing.T) {
 	if d.needPull == nil {
 		t.Fatal("needPull was niled after Run")
 	}
-	// Root is closed; ensure we did not leave a dirty panic path. Re-create root
-	// is not required for requestPull; onNotify only touches peers + needPull when
-	// alreadyHaveAll is false (empty index → schedules pull).
-	_ = os.RemoveAll(dir) // dir unused after Run
+	_ = os.RemoveAll(dir)
+}
+
+func TestDiscoveryCandidatesPins(t *testing.T) {
+	d := testDaemon(t)
+	d.cfg.Peers = []string{"127.0.0.1:1", "127.0.0.1:2"}
+	cands := d.discoveryCandidates(context.Background())
+	if len(cands) != 2 {
+		t.Fatalf("pins: %v", cands)
+	}
 }

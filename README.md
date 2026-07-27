@@ -31,9 +31,10 @@ tailsync -dir /path/to/shared
 By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens with **QUIC** (UDP) on port `5960` on the host’s Tailscale IP(s) and:
 
 1. Watches the sync directory for filesystem events (debounced, default 1 s), with a periodic full rescan as a safety net, and reconciles against the on-disk index (adds, modifies, and offline deletions).
-2. When local index content changes, fans out concurrent **best-effort notifies** to candidates (in-memory hot set + status Online peers). Dead peers cannot stall the writer.
-3. On notify (or on the pull interval / bootstrap), each node **pulls** manifests and content from candidates. Notify never commits state; the pull-time manifest (LWW) is truth.
-4. Merges remote manifests using last-writer-wins on `updated_at`.
+2. **Discovers** online tailnet peers in the background and keeps **persistent QUIC connections** (one per peer, Hello once per connection).
+3. When local index content changes, fans out concurrent **best-effort notifies** as cheap streams on already-connected sessions. Dead or not-yet-connected peers cannot stall the writer.
+4. On notify (or on the pull interval / bootstrap / peer-up), each node **pulls** manifests and content from connected peers (one-off streams per op). Notify never commits state; the pull-time manifest (LWW) is truth.
+5. Merges remote manifests using last-writer-wins on `updated_at`.
 
 Keep host clocks roughly in sync (NTP). Conflict resolution uses wall-clock `updated_at`; equal-timestamp ties use a stable total order (deletion preference, then content hash, mode, then mtime).
 
@@ -63,26 +64,28 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-watch-debounce` | `1s` | Debounce wait after FS events before reconcile (`0` = default) |
 | `-no-watch` | `false` | Disable filesystem watching; rely on `-scan-interval` only |
 | `-block-size` | `4096` | Delta block size |
-| `-dial-timeout` | `5s` (`daemon.DefaultDialTimeout`) | Max wait for each outbound peer dial (`0` = daemon default); caps waits on nodes not listening |
+| `-dial-timeout` | `30s` (`daemon.DefaultDialTimeout`) | Max wait for each outbound discovery dial+handshake (`0` = daemon default); caps waits on nodes not listening |
 | `-tsnet` | `false` | Use embedded tsnet instead of host `tailscaled` |
 | `-plain` | `false` | Plain QUIC on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
 | `-v` | `false` | Debug logging |
 
 `-plain` and `-tsnet` are mutually exclusive.
 
-### Peer discovery
+### Peer discovery and connections
 
-Membership is **memory-only** (not persisted):
+Discovery is a **background service** that builds a roster of persistent peer sessions:
 
 | Source | Role |
 |--------|------|
-| **Hot set** | After a successful Hello (notify or pull), remember `nodeID → addr` for fast re-dial |
-| **Status Online** | Bootstrap from Tailscale status (IPs preferred; MagicDNS fallback) |
+| **Status Online** | Candidates from Tailscale status (IPs preferred; MagicDNS fallback) |
 | **`-peers`** | Test/override pin only; when set, status discovery is skipped |
+| **Inbound** | Accept connections from peers that dial us (Hello handshake) |
 
-Candidates for notify and pull are the hot set union status Online peers (plus `-peers` when set). Soft-fail (timeout/refused) applies **per dial address** to hot-set and status-discovered candidates with exponential backoff, but **never permanently bans**; after backoff expires, status Online and successful Hello reintroduce the peer. Explicit `-peers` pins always re-dial each batch (test/override). Offline (status) peers are skipped when possible.
+Once connected, each peer has **at most one** QUIC connection. Hello is **connection-scoped** (not per stream). Application ops (notify, manifest, file, delta, ping) open short-lived streams on that connection. Redundant connections are rejected with `already_connected`; simultaneous dial races pick a deterministic winner by node ID. Unhealthy sessions (failed heartbeats) are replaced and re-discovered with exponential backoff (**never permanently banned**). Discovery dials use an in-flight concurrency semaphore (default 32) that is released **before** backoff sleep so other peers can still dial.
 
-With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures are expected and do not block writers (notifies are fire-and-forget; pulls are capped). **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Prefer:
+Notify and pull use the **connected roster** only (no one-shot dial-per-op). Pull content streams are capped globally (default 8). Offline (status) peers are not dialed. Soft dial failures during discovery are expected on large tailnets and do not block writers.
+
+With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Prefer:
 
 - **`-service <substring>`** to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`), or
 - **`-peers host:port,...`** only for local tests / explicit overrides (not the recommended production path).
@@ -122,15 +125,15 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Index** — JSON under `-state` with size, mtime, mode, content SHA-256, and deletion tombstones (GC’d after 30 days by default). After a tombstone is dropped, a lagging peer that never saw the delete can re-introduce the file; keep the TTL longer than the maximum expected peer offline window.
 - **FS watch + debounce** — Local edits are detected via recursive filesystem events (debounced, default 1 s), then reconciled. Paths under `.tailsync` / `.tailsync-*` are ignored. If watching fails to start (unsupported platform/permissions), tailsync logs a warning and falls back to timer-only scanning.
 - **Scan** — Walks regular files only; live index entries missing on disk become tombstones (offline deletion). Empty directories and symlinks are not synced. `-scan-interval` remains a full safety-net rescan when watch is active.
-- **Notify + pull** — Local peer-visible index changes fan out concurrent best-effort **notifies** (soft hints: path/hash/`updated_at`; not final bytes). Receivers schedule a **pull**; the pull-time manifest and LWW apply are authoritative. After a successful pull, optional **infect-and-die** notifies only newly acquired content ids. Content-identity dedupe avoids notify storms (already-have → ignore; no re-notify loop).
-- **Catch-up** — `-sync-interval` pull (and inbound serve) recovers missed notifies and offline peers. Late joiners dial out and pull. Writers are not blocked waiting on dead peers.
+- **Notify + pull** — Local peer-visible index changes fan out concurrent best-effort **notifies** on connected sessions (soft hints: path/hash/`updated_at`; not final bytes). Receivers schedule a **pull**; the pull-time manifest and LWW apply are authoritative. After a successful pull, optional **infect-and-die** notifies only newly acquired content ids. Content-identity dedupe avoids notify storms (already-have → ignore; no re-notify loop).
+- **Catch-up** — `-sync-interval` pull, peer-up, and inbound serve recover missed notifies and offline peers. Late joiners are discovered, connected, and pull. Writers are not blocked waiting on dead peers.
 - **Hash fast path** — Reuses the stored SHA-256 when size and mtime still match the index. Silent content rewrites that preserve mtime are not detected until another field changes.
 - **Delta** — Adler-style rolling weak checksums and MD5 strong match per block; full-file SHA-256 is authoritative after apply. Whole-file buffers are used for transfers (default max 64 MiB per file).
-- **Concurrency** — Notify fan-out is high-parallelism with no batch barrier on the main loop. Pulls use a separate memory-aware concurrency cap. Local reconcile and peer apply commits share one mutex; network transfer for a content apply runs unlocked (re-LWW on commit).
-- **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single **QUIC** stream per session (`hello`, `notify`, manifest/file/delta, `sync_done`). Wire version **1** is pull-oriented (no reverse-pull) and includes notify. Hello rejects other non-zero versions. QUIC uses ephemeral self-signed TLS (clients skip verify); peer trust is the tailnet mesh, not a public CA.
+- **Concurrency** — Discovery dials (~32 in-flight) are separate from pull content streams (~8 global). Notify fan-out is high-parallelism with no batch barrier on the main loop. Local reconcile and peer apply commits share one mutex; network transfer for a content apply runs unlocked (re-LWW on commit).
+- **Protocol** — Length-prefixed JSON headers with optional binary payloads over **QUIC**. Hello is once per connection; each op uses its own stream (`notify`, `manifest_req`, `file_req`, `delta_req`, `ping`, …). Wire version **1** is pull-oriented and includes notify + `already_connected`. Hello rejects other non-zero versions. QUIC uses ephemeral self-signed TLS (clients skip verify); peer trust is the tailnet mesh, not a public CA.
 - **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge.
 - **Metadata** — Mode and mtime are synchronized end-to-end; peers adopt metadata when the same content hash wins LWW.
-- **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`), bootstraps peers via LocalAPI status + hot set, and dials with the host network stack (routed by `tailscaled`).
+- **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`). Shared UDP `PacketConn`s (via quic-go `Transport`) serve both listen and dial so sessions do not open ephemeral sockets per op. Family-matched dials for dual-stack. tsnet resolves names via LocalAPI status (not system DNS alone).
 - **Sync-tree confinement** — File I/O under `-dir` (scan, serve, apply, deletes) uses Go’s [`os.Root`](https://pkg.go.dev/os#Root) so path traversal and symlink escapes cannot reach outside the sync directory; index/state paths under `-state` are separate trusted local storage. Peer paths under `.tailsync` / `.tailsync-*` are rejected so the default state dir cannot be written via sync. On multi-party tailnets, prefer an explicit `-state` path outside `-dir`.
 
 State directories under the sync tree named `.tailsync` or `.tailsync-*` are ignored by the scanner and cannot be applied from peers.
@@ -143,11 +146,11 @@ The public Go package [`deedles.dev/tailsync/daemon`](https://pkg.go.dev/deedles
 
 | Go | Role |
 |----|------|
-| `daemon.Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, intervals, `DisableWatch`, `BlockSize`, `DialTimeout`, `TombstoneTTL`, `NetMode`, `Logger`, `OnReady`, `OnAuthURL`, … |
+| `daemon.Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, intervals, `DisableWatch`, `BlockSize`, `DialTimeout`, `DiscoveryConcurrency`, `PullStreamConcurrency`, `HeartbeatInterval`, `TombstoneTTL`, `NetMode`, `Logger`, `OnReady`, `OnAuthURL`, … |
 | `daemon.New(cfg)` | Validates config and returns a stopped `*Daemon` (does not start networking) |
 | `(*Daemon).Run(ctx)` | Brings up networking and runs until `ctx` is canceled or a fatal error |
 | `(*Daemon).InjectNetworkChange()` | After host connectivity updates in **tsnet** mode, inject a netmon event (no-op if not running / not yet installed) |
-| `daemon.DefaultPort`, `DefaultScanInterval`, `DefaultSyncInterval`, `DefaultWatchDebounce`, `DefaultBlockSize`, `DefaultDialTimeout`, `DefaultTombstoneTTL`, … | Effective defaults when zero values are left in `Config` |
+| `daemon.DefaultPort`, `DefaultScanInterval`, `DefaultSyncInterval`, `DefaultWatchDebounce`, `DefaultBlockSize`, `DefaultDialTimeout`, `DefaultDiscoveryConcurrency`, `DefaultPullStreamConcurrency`, `DefaultHeartbeatInterval`, `DefaultTombstoneTTL`, … | Effective defaults when zero values are left in `Config` |
 | `daemon.NetModeHost` / `NetModeTSNet` / `NetModePlain` | Network attachment modes (same semantics as CLI flags) |
 
 Minimal embed:

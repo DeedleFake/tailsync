@@ -166,8 +166,9 @@ func TestNotifyPullDeliversFile(t *testing.T) {
 	waitFile(t, filepath.Join(b.Dir, "n.txt"), "from-a", 8*time.Second, meshErrs(a, b)...)
 }
 
-// TestWriterNotBlockedByDeadPeers: reconcile + notify launch finish quickly
-// even when a configured peer is unreachable.
+// TestWriterNotBlockedByDeadPeers: reconcile finishes quickly even when a
+// configured peer is unreachable (discovery dials are background; notify needs
+// connected sessions and is a no-op without them).
 func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
@@ -179,7 +180,7 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 
 	ready := make(chan struct{})
 	var readyOnce sync.Once
-	notified := make(chan struct{}, 8)
+	reconciled := make(chan struct{}, 8)
 
 	d, err := daemon.New(daemon.Config{
 		Dir:           dir,
@@ -196,10 +197,12 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 		OnReady: func() {
 			readyOnce.Do(func() { close(ready) })
 		},
-		AfterNotify: func() {
-			select {
-			case notified <- struct{}{}:
-			default:
+		AfterReconcile: func(changed bool) {
+			if changed {
+				select {
+				case reconciled <- struct{}{}:
+				default:
+				}
 			}
 		},
 	})
@@ -222,16 +225,16 @@ func TestWriterNotBlockedByDeadPeers(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "w.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// AfterNotify must fire without waiting for dead peer dials to finish.
+	// Reconcile must complete without waiting for dead peer discovery dials.
 	select {
-	case <-notified:
+	case <-reconciled:
 	case err := <-errCh:
 		t.Fatalf("Run exited: %v", err)
 	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for AfterNotify (writer blocked?)")
+		t.Fatal("timeout waiting for AfterReconcile (writer blocked?)")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("notify path took %v; writer should not wait on dead peers", elapsed)
+		t.Fatalf("reconcile path took %v; writer should not wait on dead peers", elapsed)
 	}
 
 	cancel()
@@ -456,8 +459,8 @@ func TestMetaOnlyNotifyPull(t *testing.T) {
 	}
 }
 
-// TestNotifyDuringSlowPull: local write schedules AfterNotify while a slow
-// pull batch (dead peers) is in flight — main loop must not wait on pull.
+// TestNotifyDuringSlowPull: local write finishes reconcile quickly while
+// discovery dials dead peers in the background — main loop must not wait.
 func TestNotifyDuringSlowPull(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
@@ -473,7 +476,7 @@ func TestNotifyDuringSlowPull(t *testing.T) {
 
 	ready := make(chan struct{})
 	var readyOnce sync.Once
-	notified := make(chan struct{}, 4)
+	reconciled := make(chan struct{}, 4)
 
 	d, err := daemon.New(daemon.Config{
 		Dir:           dir,
@@ -490,10 +493,12 @@ func TestNotifyDuringSlowPull(t *testing.T) {
 		OnReady: func() {
 			readyOnce.Do(func() { close(ready) })
 		},
-		AfterNotify: func() {
-			select {
-			case notified <- struct{}{}:
-			default:
+		AfterReconcile: func(changed bool) {
+			if changed {
+				select {
+				case reconciled <- struct{}{}:
+				default:
+				}
 			}
 		},
 	})
@@ -517,14 +522,14 @@ func TestNotifyDuringSlowPull(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-notified:
+	case <-reconciled:
 	case err := <-errCh:
 		t.Fatalf("Run: %v", err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("AfterNotify delayed behind pull batch")
+		t.Fatal("AfterReconcile delayed behind discovery/pull")
 	}
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
-		t.Fatalf("notify path took %v; pull should not block reconcile→notify", elapsed)
+		t.Fatalf("reconcile path took %v; discovery should not block main loop", elapsed)
 	}
 
 	cancel()

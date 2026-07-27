@@ -36,9 +36,10 @@ func testDaemon(t *testing.T) *Daemon {
 		log:        slog.Default(),
 		idx:        index.New(),
 		root:       root,
-		peers:      newPeerMem(),
 		notifySeen: newNotifyTracker(),
 		needPull:   newSignal(),
+		pullSem:    make(chan struct{}, DefaultPullStreamConcurrency),
+		serveSem:   make(chan struct{}, DefaultPullStreamConcurrency),
 	}
 }
 

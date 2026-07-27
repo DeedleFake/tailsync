@@ -2,9 +2,7 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -32,9 +30,10 @@ func (s signal) request() {
 // Main loop roles:
 //   - FS watch (debounced) and ScanInterval both request reconcile
 //   - successful reconcile with peer-visible changes fans out best-effort
-//     notifies (fire-and-forget; does not block the loop on peer dials)
+//     notifies on persistent peer sessions (fire-and-forget)
 //   - SyncInterval and inbound notifies schedule pull on a single-flight
 //     background worker so long pull batches do not delay reconcile→notify
+//   - peer discovery and session accept run in the peer manager
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := os.MkdirAll(d.cfg.StateDir, 0o755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
@@ -80,24 +79,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Capture listener for acceptLoop so Close/nil of d.ln cannot race Accept.
-	ln := d.ln
-	acceptDone := make(chan struct{})
-	var acceptErr error
-	go func() {
-		defer close(acceptDone)
-		acceptErr = d.acceptLoop(ctx, ln)
-	}()
-
-	// On every exit path: close the listener to unblock Accept, wait for the
-	// accept goroutine to finish, drain in-flight handleConn, pull worker, and
-	// notify dials, then tear down tsnet/local client state. Registered after
-	// the root-close defer so this runs first (LIFO) and Wait completes before
-	// root.Close. Never nil d.ln / d.root while handlers may still use them.
+	// On every exit path: close mesh first (stops accept/serve, tears down
+	// sessions), then drain handlers that may still finish, then tsnet/local.
+	// Registered after the root-close defer so this runs first (LIFO) and
+	// Wait completes before root.Close.
 	defer func() {
-		d.closeNetListener()
-		<-acceptDone
-		d.connWG.Wait()
+		d.closeMesh()
+		d.streamWG.Wait()
 		d.pullWG.Wait()
 		d.notifyWG.Wait()
 		d.closeNetworkBackend()
@@ -120,6 +108,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"index_entries", d.idx.Len(),
 		"max_file_bytes", d.cfg.MaxFileBytes,
 		"watch", !d.cfg.DisableWatch,
+		"discovery_concurrency", d.cfg.DiscoveryConcurrency,
+		"pull_stream_concurrency", d.cfg.PullStreamConcurrency,
 	)
 	if d.cfg.OnReady != nil {
 		d.cfg.OnReady()
@@ -151,6 +141,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// Notify for initial local changes (if any), then bootstrap pull.
+	// Non-blocking discovery kick (coalesced; discovery.Run also ticks immediately).
+	if d.mesh != nil {
+		d.mesh.KickDiscovery()
+	}
 	if changed {
 		if d.scheduleNotify(ctx, hints) && d.cfg.AfterNotify != nil {
 			d.cfg.AfterNotify()
@@ -185,11 +179,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			d.syncMu.Unlock()
 			return nil
-		case <-acceptDone:
-			if acceptErr != nil && ctx.Err() == nil {
-				return acceptErr
-			}
-			return nil
 		case <-scanTick.C:
 			// Safety-net full rescan (also used when watch is disabled).
 			doReconcile()
@@ -198,32 +187,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			doReconcile()
 		case <-syncTick.C:
 			// Backup/catch-up peer pull (background single-flight).
+			// Discovery interval runs on its own; no Kick needed each sync tick.
 			schedulePull()
 		case <-d.needPull:
 			// Pull scheduled by inbound notify (and coalesced follow-ups).
 			schedulePull()
 		}
-	}
-}
-
-// acceptLoop accepts connections on ln until ln is closed or a fatal Accept
-// error occurs. ln must be non-nil and remain valid for the duration (caller
-// closes it to unblock, then waits for this function to return).
-func (d *Daemon) acceptLoop(ctx context.Context, ln net.Listener) error {
-	if ln == nil {
-		return nil
-	}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			// Closed listener and/or cancelled context are normal shutdown.
-			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("accept: %w", err)
-		}
-		d.connWG.Go(func() {
-			d.handleConn(ctx, conn)
-		})
 	}
 }

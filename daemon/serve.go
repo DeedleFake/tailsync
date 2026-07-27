@@ -11,11 +11,12 @@ import (
 
 	"deedles.dev/tailsync/internal/delta"
 	"deedles.dev/tailsync/internal/index"
+	"deedles.dev/tailsync/internal/peer"
 	"deedles.dev/tailsync/internal/proto"
 )
 
 // errUnexpectedMsgType is returned for protocol message types this node does not
-// handle. It is fatal for the session (confused peer).
+// handle. It is fatal for the stream (confused peer).
 var errUnexpectedMsgType = errors.New("unexpected message type")
 
 func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
@@ -26,89 +27,101 @@ func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
 	_ = conn.SetDeadline(deadline)
 }
 
-// handleConn serves an inbound session (listener side):
+// onPeerStream is the peer.Manager callback for inbound application streams.
+// Hello is connection-scoped (handled by peer package); streams start with the op.
+// Invoked from a per-stream goroutine in the peer session.
+func (d *Daemon) onPeerStream(ctx context.Context, s *peer.Session, stream net.Conn) {
+	d.streamWG.Add(1)
+	defer d.streamWG.Done()
+	d.handleStream(ctx, s, stream)
+}
+
+// handleStream serves one inbound op stream on an established peer session.
 //
-//  1. Hello / HelloOK (learn remote into hot set)
-//     2a. TypeNotify → schedule pull, NotifyOK, close
-//     2b. ManifestReq / FileReq / DeltaReq until SyncDone (serve pull), close
-//
-// Sessions are pull- or notify-oriented; reverse-pull after SyncDone is not used.
-func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
+// First message defines the op: Notify, ManifestReq, FileReq, DeltaReq, Ping
+// (Ping is normally handled in the peer package; tolerate here too).
+func (d *Daemon) handleStream(ctx context.Context, s *peer.Session, conn net.Conn) {
 	defer conn.Close()
 	d.setConnDeadline(conn, ctx)
-	remote := conn.RemoteAddr().String()
-	d.log.Debug("inbound connection", "remote", remote)
+	// Trust session identity only (Hello NodeID), never message header overrides.
+	remote := ""
+	if s != nil {
+		remote = s.NodeID()
+	}
 
-	// Expect Hello first.
 	msg, err := proto.Decode(conn)
 	if err != nil {
-		d.log.Debug("decode hello", "remote", remote, "err", err)
-		return
-	}
-	if msg.Header.Type != proto.TypeHello {
-		_ = proto.Encode(conn, proto.NewError("expected hello"))
-		return
-	}
-	if msg.Header.Version != 0 && msg.Header.Version != proto.Version {
-		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unsupported version %d", msg.Header.Version)))
-		return
-	}
-	remoteNode := msg.Header.NodeID
-	remotePort := msg.Header.Port
-	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID, d.cfg.Port)); err != nil {
-		return
-	}
-	// Learn dial-back using peer's advertised listen port (not the ephemeral QUIC/UDP port).
-	if remoteNode != "" && remoteNode != d.nodeID {
-		if dial := dialBackAddr(remote, remotePort, d.cfg.Port); dial != "" {
-			d.peers.remember(remoteNode, dial)
+		if err != io.EOF {
+			d.log.Debug("decode stream op", "peer", remote, "err", err)
 		}
+		return
 	}
 
-	// Serve until notify, SyncDone, or EOF.
-	for {
-		if err := ctx.Err(); err != nil {
+	switch msg.Header.Type {
+	case proto.TypeNotify:
+		port := msg.Header.Port
+		d.onNotify(remote, sessionRemoteAddr(s), port, msg.Header.Entries)
+		_ = proto.Encode(conn, proto.NewNotifyOK(d.nodeID, d.cfg.Port))
+		d.log.Debug("inbound notify", "peer", remote, "hints", len(msg.Header.Entries))
+		return
+
+	case proto.TypePing:
+		_ = proto.Encode(conn, proto.NewPong())
+		return
+
+	case proto.TypeManifestReq, proto.TypeFileReq, proto.TypeDeltaReq:
+		// Cap concurrent heavy serve ops (same budget as pull streams).
+		if err := d.acquireServeSlot(ctx); err != nil {
+			_ = proto.Encode(conn, proto.NewError("server busy"))
 			return
 		}
-		d.setConnDeadline(conn, ctx)
-		msg, err := proto.Decode(conn)
-		if err != nil {
-			if err != io.EOF {
-				d.log.Debug("session ended", "remote", remote, "err", err)
-			}
-			return
-		}
-		if msg.Header.Type == proto.TypeSyncDone {
-			d.log.Info("inbound pull served", "remote", remote, "remote_node", remoteNode)
-			return
-		}
-		if msg.Header.Type == proto.TypeNotify {
-			// Prefer node id from hello; header may also carry it.
-			n := remoteNode
-			if msg.Header.NodeID != "" {
-				n = msg.Header.NodeID
-			}
-			port := remotePort
-			if msg.Header.Port > 0 {
-				port = msg.Header.Port
-			}
-			d.onNotify(n, remote, port, msg.Header.Entries)
-			_ = proto.Encode(conn, proto.NewNotifyOK(d.nodeID, d.cfg.Port))
-			d.log.Debug("inbound notify", "remote", remote, "remote_node", n, "hints", len(msg.Header.Entries))
-			return
-		}
+		defer d.releaseServeSlot()
 		if err := d.serveMsg(ctx, conn, msg); err != nil {
-			d.log.Debug("serve message", "remote", remote, "type", msg.Header.Type, "err", err)
-			if encodeErr := proto.Encode(conn, proto.NewError(err.Error())); encodeErr != nil {
-				return
-			}
-			// Keep session open for not-found / validation errors; close on
-			// unexpected protocol types so a confused peer does not loop.
-			if msg.Header.Type == "" || errors.Is(err, errUnexpectedMsgType) {
-				return
-			}
+			d.log.Debug("serve message", "peer", remote, "type", msg.Header.Type, "err", err)
+			_ = proto.Encode(conn, proto.NewError(err.Error()))
 		}
+		return
+
+	default:
+		d.log.Debug("unexpected stream op", "peer", remote, "type", msg.Header.Type)
+		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unexpected message type %q", msg.Header.Type)))
 	}
+}
+
+// acquireServeSlot limits concurrent inbound serve work (manifest/file/delta).
+func (d *Daemon) acquireServeSlot(ctx context.Context) error {
+	if d.serveSem == nil {
+		return nil
+	}
+	select {
+	case d.serveSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *Daemon) releaseServeSlot() {
+	if d.serveSem == nil {
+		return
+	}
+	select {
+	case <-d.serveSem:
+	default:
+	}
+}
+
+func sessionRemoteAddr(s *peer.Session) string {
+	if s == nil {
+		return ""
+	}
+	if s.Addr() != "" {
+		return s.Addr()
+	}
+	if c := s.Conn(); c != nil && c.RemoteAddr() != nil {
+		return c.RemoteAddr().String()
+	}
+	return ""
 }
 
 func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message) error {
@@ -117,7 +130,7 @@ func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message)
 	}
 	switch msg.Header.Type {
 	case proto.TypePing:
-		return proto.Encode(conn, proto.Message{Header: proto.Header{Type: proto.TypePong}})
+		return proto.Encode(conn, proto.NewPong())
 	case proto.TypeManifestReq:
 		return proto.Encode(conn, proto.NewManifest(d.idx.Manifest()))
 	case proto.TypeFileReq:
@@ -195,6 +208,12 @@ func (d *Daemon) serveFile(ctx context.Context, conn net.Conn, rel string) error
 	return proto.Encode(conn, proto.NewFileData(rel, e, data))
 }
 
+// Block size bounds for untrusted DeltaReq headers (CPU/memory DoS).
+const (
+	minDeltaBlockSize = 256
+	maxDeltaBlockSize = 1 << 20 // 1 MiB
+)
+
 func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel string, wantHash string, blockSize int, sigRaw []byte) error {
 	e, rel, err := d.serveEntry(ctx, rel)
 	if err != nil {
@@ -217,6 +236,13 @@ func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel string, want
 		if blockSize > 0 && sig.BlockSize > 0 && blockSize != sig.BlockSize {
 			return fmt.Errorf("block size mismatch: header %d signature %d", blockSize, sig.BlockSize)
 		}
+		if err := validateBlockSize(sig.BlockSize); err != nil {
+			return err
+		}
+	} else if blockSize > 0 {
+		if err := validateBlockSize(blockSize); err != nil {
+			return err
+		}
 	}
 	del, err := delta.EncodeBytes(data, sig)
 	if err != nil {
@@ -227,4 +253,11 @@ func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel string, want
 		return err
 	}
 	return proto.Encode(conn, proto.NewDelta(rel, e, raw))
+}
+
+func validateBlockSize(bs int) error {
+	if bs < minDeltaBlockSize || bs > maxDeltaBlockSize {
+		return fmt.Errorf("block size %d out of range [%d, %d]", bs, minDeltaBlockSize, maxDeltaBlockSize)
+	}
+	return nil
 }

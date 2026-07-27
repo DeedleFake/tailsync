@@ -12,9 +12,10 @@ import (
 	"deedles.dev/tailsync/internal/index"
 )
 
-// Protocol version negotiated in Hello.
-// v1: pull-oriented sessions (no reverse-pull after SyncDone) and TypeNotify.
-// Framed over a single QUIC stream per session (see daemon QUIC transport).
+// Protocol version negotiated in Hello (connection-scoped only).
+// v1: persistent QUIC peer connections; Hello once per connection; application
+// streams start with the op type (notify, manifest_req, file_req, …) without a
+// per-stream Hello. Pull-oriented (writers wake peers with TypeNotify).
 const Version = 1
 
 // MaxMessageSize caps a single framed message (headers + payload).
@@ -24,27 +25,30 @@ const MaxMessageSize = 64 << 20 // 64 MiB
 type Type string
 
 const (
-	TypeHello       Type = "hello"
-	TypeHelloOK     Type = "hello_ok"
-	TypeManifest    Type = "manifest"
-	TypeManifestReq Type = "manifest_req"
-	TypeFileReq     Type = "file_req"
-	TypeFileData    Type = "file_data"
+	// Connection handshake (first stream only; not repeated on op streams).
+	TypeHello   Type = "hello"
+	TypeHelloOK Type = "hello_ok"
+	// TypeAlreadyConnected rejects a redundant connection when a healthy
+	// session with this peer already exists (or lost a simultaneous-dial race).
+	TypeAlreadyConnected Type = "already_connected"
+	TypeManifest         Type = "manifest"
+	TypeManifestReq      Type = "manifest_req"
+	TypeFileReq          Type = "file_req"
+	TypeFileData         Type = "file_data"
 	// Delta path: client sends its local block signature; server returns a delta.
 	// (Older TypeSigReq/TypeSig half of the protocol was removed; clients never
 	// requested the peer's signature — only TypeDeltaReq is used.)
 	TypeDeltaReq Type = "delta_req"
 	TypeDelta    Type = "delta"
-	// TypeSyncDone ends a pull phase. After the dialer finishes pulling, it
-	// sends SyncDone and both sides close (sessions are pull-oriented; writers
-	// wake peers with TypeNotify instead of reverse-pull).
+	// TypeSyncDone is retained for compatibility but unused with one-off streams
+	// (each op stream closes when done).
 	TypeSyncDone Type = "sync_done"
 	// TypeNotify is a soft wake-up: the sender has peer-visible index changes.
 	// Payload is optional path/hash/updated_at hints (Header.Entries); never
 	// authoritative bytes. Receiver should schedule a pull; correctness does
 	// not depend on notify delivery.
 	TypeNotify Type = "notify"
-	// TypeNotifyOK acknowledges a notify (optional; dialer may close without it).
+	// TypeNotifyOK acknowledges a notify (optional; sender may close without it).
 	TypeNotifyOK Type = "notify_ok"
 	TypeError    Type = "error"
 	TypePing     Type = "ping"
@@ -170,6 +174,16 @@ func NewHelloOK(nodeID string, port int) Message {
 	}}
 }
 
+// NewAlreadyConnected rejects a redundant peer connection during handshake.
+func NewAlreadyConnected(nodeID string, port int) Message {
+	return Message{Header: Header{
+		Type:    TypeAlreadyConnected,
+		NodeID:  nodeID,
+		Version: Version,
+		Port:    port,
+	}}
+}
+
 // NewManifest builds a manifest message from index entries.
 func NewManifest(entries []index.ManifestEntry) Message {
 	return Message{Header: Header{
@@ -249,6 +263,8 @@ func NewSyncDone() Message {
 
 // NewNotify builds a soft wake-up with optional content hints (path/hash/updated_at).
 // Hints are not authoritative; the receiver must pull a manifest to apply state.
+// On a persistent session stream, nodeID/port/version are optional (connection
+// Hello already identified the peer); they may still be set for logging.
 func NewNotify(nodeID string, port int, hints []index.ManifestEntry) Message {
 	return Message{Header: Header{
 		Type:    TypeNotify,
@@ -267,4 +283,14 @@ func NewNotifyOK(nodeID string, port int) Message {
 		Version: Version,
 		Port:    port,
 	}}
+}
+
+// NewPing builds an application-level heartbeat request.
+func NewPing() Message {
+	return Message{Header: Header{Type: TypePing}}
+}
+
+// NewPong builds an application-level heartbeat response.
+func NewPong() Message {
+	return Message{Header: Header{Type: TypePong}}
 }
