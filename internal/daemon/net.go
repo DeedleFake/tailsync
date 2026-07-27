@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,7 +30,7 @@ const (
 	NetModeHost NetMode = iota
 	// NetModeTSNet runs an embedded tsnet node (registers as a separate machine).
 	NetModeTSNet
-	// NetModePlain uses plain TCP on ListenHost (tests only).
+	// NetModePlain uses plain QUIC (UDP) on ListenHost (tests only).
 	NetModePlain
 )
 
@@ -299,7 +300,7 @@ func (m *multiListener) Addr() net.Addr {
 // multiAddr is a net.Addr that reports all bound addresses.
 type multiAddr string
 
-func (a multiAddr) Network() string { return "tcp" }
+func (a multiAddr) Network() string { return "udp" }
 func (a multiAddr) String() string  { return string(a) }
 
 // listenResult is the outcome of binding a set of addresses.
@@ -309,17 +310,18 @@ type listenResult struct {
 	Skipped  []string // addresses that failed to bind (empty if none)
 }
 
-// listenAll binds TCP on each address, keeping successful binds even if some fail.
-// Errors only when every address fails (or addrs is empty). A single successful
-// bind returns that listener directly; multiple binds use multiListener.
-func listenAll(addrs []string) (listenResult, error) {
+// listenAll binds QUIC (UDP) on each address, keeping successful binds even if
+// some fail. Errors only when every address fails (or addrs is empty). A single
+// successful bind returns that listener directly; multiple binds use multiListener.
+// tlsConf must be non-nil (server certificate for QUIC).
+func listenAll(addrs []string, tlsConf *tls.Config) (listenResult, error) {
 	var res listenResult
 	if len(addrs) == 0 {
 		return res, fmt.Errorf("no listen addresses")
 	}
 	var lns []net.Listener
 	for _, a := range addrs {
-		ln, err := net.Listen("tcp", a)
+		ln, err := listenQUIC(a, tlsConf)
 		if err != nil {
 			res.Skipped = append(res.Skipped, a)
 			continue
@@ -351,15 +353,16 @@ func (d *Daemon) listen(ctx context.Context) error {
 
 func (d *Daemon) listenPlain() error {
 	host := d.cfg.ListenHost
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(d.cfg.Port)))
+	addr := net.JoinHostPort(host, strconv.Itoa(d.cfg.Port))
+	ln, err := listenQUIC(addr, d.quicTLS)
 	if err != nil {
-		return fmt.Errorf("listen %s:%d: %w", host, d.cfg.Port, err)
+		return fmt.Errorf("listen quic %s:%d: %w", host, d.cfg.Port, err)
 	}
 	d.ln = ln
 	if d.cfg.Hostname != "" {
 		d.nodeID = d.cfg.Hostname
 	}
-	d.log.Info("listening (plain TCP)", "addr", ln.Addr().String(), "mode", NetModePlain.String())
+	d.log.Info("listening (plain QUIC)", "addr", ln.Addr().String(), "mode", NetModePlain.String())
 	return nil
 }
 
@@ -435,18 +438,93 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 		mon.InjectEvent()
 	}
 
-	addr := ":" + strconv.Itoa(d.cfg.Port)
-	ln, err := s.Listen("tcp", addr)
+	// tsnet.ListenPacket requires a concrete IP (not ":port"). Prefer Self IPs.
+	lc, err := s.LocalClient()
 	if err != nil {
 		d.setInjectNetChange(nil)
 		_ = s.Close()
 		d.server = nil
-		return fmt.Errorf("tsnet listen %s: %w", addr, err)
+		return fmt.Errorf("tsnet local client: %w", err)
 	}
-	d.ln = ln
+	st, err := lc.Status(ctx)
+	if err != nil {
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return fmt.Errorf("tsnet status: %w", err)
+	}
+	var ips []netip.Addr
+	if st.Self != nil && len(st.Self.TailscaleIPs) > 0 {
+		ips = st.Self.TailscaleIPs
+	} else if len(st.TailscaleIPs) > 0 {
+		ips = st.TailscaleIPs
+	}
+	if len(ips) == 0 {
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return fmt.Errorf("tsnet: no Tailscale IPs after up")
+	}
+	d.quicDialHosts = make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if ip.IsValid() {
+			d.quicDialHosts = append(d.quicDialHosts, ip.String())
+		}
+	}
+
+	addrs := bindAddrsFromTailscaleIPs(ips, d.cfg.Port)
+	res, err := listenAllTSNet(s, addrs, d.quicTLS)
+	if err != nil {
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return fmt.Errorf("tsnet quic listen: %w", err)
+	}
+	d.ln = res.Listener
+	for _, a := range res.Skipped {
+		d.log.Warn("could not bind tsnet address; continuing with others", "addr", a)
+	}
 	d.nodeID = d.cfg.Hostname
-	d.log.Info("listening on tailnet (tsnet)", "addr", ln.Addr().String(), "hostname", d.cfg.Hostname, "mode", NetModeTSNet.String())
+	d.log.Info("listening on tailnet (tsnet QUIC)",
+		"addrs", res.Bound,
+		"skipped", res.Skipped,
+		"hostname", d.cfg.Hostname,
+		"mode", NetModeTSNet.String(),
+	)
 	return nil
+}
+
+// listenAllTSNet binds QUIC over tsnet UDP PacketConns on each address.
+func listenAllTSNet(s *tsnet.Server, addrs []string, tlsConf *tls.Config) (listenResult, error) {
+	var res listenResult
+	if len(addrs) == 0 {
+		return res, fmt.Errorf("no listen addresses")
+	}
+	var lns []net.Listener
+	for _, a := range addrs {
+		pc, err := s.ListenPacket("udp", a)
+		if err != nil {
+			res.Skipped = append(res.Skipped, a)
+			continue
+		}
+		ln, err := listenQUICPacket(pc, tlsConf)
+		if err != nil {
+			_ = pc.Close()
+			res.Skipped = append(res.Skipped, a)
+			continue
+		}
+		lns = append(lns, ln)
+		res.Bound = append(res.Bound, a)
+	}
+	if len(lns) == 0 {
+		return res, fmt.Errorf("listen failed on all addresses %v", addrs)
+	}
+	if len(lns) == 1 {
+		res.Listener = lns[0]
+		return res, nil
+	}
+	res.Listener = newMultiListener(lns)
+	return res, nil
 }
 
 // ensureAndroidTSLogsDir points Tailscale logpolicy at a writable directory under
@@ -511,7 +589,7 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	d.nodeID = id
 	d.cfg.Hostname = id
 
-	res, err := listenAll(addrs)
+	res, err := listenAll(addrs, d.quicTLS)
 	if err != nil {
 		return fmt.Errorf("listen on Tailscale IPs: %w", err)
 	}
@@ -519,7 +597,7 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	for _, a := range res.Skipped {
 		d.log.Warn("could not bind Tailscale address; continuing with others", "addr", a)
 	}
-	d.log.Info("listening on host tailnet",
+	d.log.Info("listening on host tailnet (QUIC)",
 		"addrs", res.Bound,
 		"skipped", res.Skipped,
 		"hostname", d.nodeID,
@@ -529,7 +607,7 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	return nil
 }
 
-// closeNetListener closes the TCP listener so Accept unblocks. Idempotent.
+// closeNetListener closes the QUIC listener so Accept unblocks. Idempotent.
 // Does not nil d.ln until closeNetworkBackend so a late field read is non-nil
 // if any code still observes it; acceptLoop uses a captured listener value.
 func (d *Daemon) closeNetListener() {
@@ -546,6 +624,7 @@ func (d *Daemon) closeNetListener() {
 func (d *Daemon) closeNetworkBackend() {
 	d.setInjectNetChange(nil)
 	d.ln = nil
+	d.quicDialHosts = nil
 	if d.server != nil {
 		_ = d.server.Close()
 		d.server = nil
@@ -620,11 +699,46 @@ func (d *Daemon) dial(ctx context.Context, addr string) (net.Conn, error) {
 	switch d.cfg.NetMode {
 	case NetModeTSNet:
 		if d.server != nil {
-			return d.server.Dial(dialCtx, "tcp", addr)
+			return d.dialTSNetQUIC(dialCtx, addr)
 		}
 		fallthrough
 	default:
-		var nd net.Dialer
-		return nd.DialContext(dialCtx, "tcp", addr)
+		// Host + plain: system UDP routed by tailscaled (host) or loopback (plain).
+		return dialQUICAddr(dialCtx, addr)
 	}
+}
+
+// dialTSNetQUIC opens an ephemeral tsnet UDP socket and dials a one-stream session.
+// Remote hostnames are resolved via tsnet LocalAPI status (MagicDNS/HostName),
+// not system DNS. Local bind IPs are ordered to match the remote address family.
+func (d *Daemon) dialTSNetQUIC(ctx context.Context, addr string) (net.Conn, error) {
+	if d.server == nil {
+		return nil, fmt.Errorf("tsnet not started")
+	}
+	raddr, err := resolveTSNetUDPAddr(ctx, d.server, addr)
+	if err != nil {
+		return nil, err
+	}
+	hosts := pickDialHostsByFamily(d.quicDialHosts, raddr.IP)
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("no local tsnet IP for quic dial")
+	}
+	var lastErr error
+	for _, host := range hosts {
+		pc, err := d.server.ListenPacket("udp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			lastErr = fmt.Errorf("tsnet listen packet for dial (%s): %w", host, err)
+			continue
+		}
+		conn, err := dialQUICPacketTo(ctx, pc, raddr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return conn, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no local tsnet IP for quic dial")
+	}
+	return nil, lastErr
 }

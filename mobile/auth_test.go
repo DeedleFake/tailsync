@@ -248,15 +248,15 @@ func TestPlainStartDoesNotEmitAuth(t *testing.T) {
 	}
 }
 
-// mustFreePortLocal reserves an ephemeral port for plain-mode tests.
+// mustFreePortLocal reserves an ephemeral UDP port for plain-mode QUIC tests.
 func mustFreePortLocal(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	if err := pc.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return port

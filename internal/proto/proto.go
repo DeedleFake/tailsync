@@ -13,8 +13,9 @@ import (
 )
 
 // Protocol version negotiated in Hello.
-// v2: pull-oriented sessions (no reverse-pull after SyncDone) and TypeNotify.
-const Version = 2
+// v1: pull-oriented sessions (no reverse-pull after SyncDone) and TypeNotify.
+// Framed over a single QUIC stream per session (see daemon QUIC transport).
+const Version = 1
 
 // MaxMessageSize caps a single framed message (headers + payload).
 const MaxMessageSize = 64 << 20 // 64 MiB
@@ -59,7 +60,7 @@ type Header struct {
 	NodeID  string `json:"node_id,omitempty"`
 	Version int    `json:"version,omitempty"`
 	// Port is the sender's tailsync listen port (Hello/HelloOK), used by peers
-	// to build a dial-back address when the TCP remote port is ephemeral.
+	// to build a dial-back address when the QUIC remote port is ephemeral.
 	Port  int    `json:"port,omitempty"`
 	Path  string `json:"path,omitempty"`
 	Hash  string `json:"hash,omitempty"`

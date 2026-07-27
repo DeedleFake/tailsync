@@ -417,13 +417,14 @@ func TestNotifyNetworkChangeConcurrentWithStop(t *testing.T) {
 }
 
 // mustFreePort is shared with mobile_test via duplicate — defined here for
-// package mobile tests. Uses ephemeral bind.
+// package mobile tests. Uses ephemeral UDP bind (plain mode is QUIC).
 func mustFreePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
+	return port
 }

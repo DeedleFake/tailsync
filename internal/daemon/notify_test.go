@@ -173,12 +173,12 @@ func TestRequestPullSafeAfterNilDaemon(t *testing.T) {
 func TestLateRequestPullAndOnNotifyAfterRun(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
 
 	ready := make(chan struct{})
 	d, err := New(Config{

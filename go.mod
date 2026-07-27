@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/quic-go/quic-go v0.61.0
 	tailscale.com v1.102.0
 )
 

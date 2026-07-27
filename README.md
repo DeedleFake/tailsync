@@ -28,7 +28,7 @@ On each machine (with [Tailscale](https://tailscale.com/) already running and lo
 tailsync -dir /path/to/shared
 ```
 
-By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens on TCP port `5960` on the host’s Tailscale IP(s) and:
+By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens with **QUIC** (UDP) on port `5960` on the host’s Tailscale IP(s) and:
 
 1. Watches the sync directory for filesystem events (debounced, default 1 s), with a periodic full rescan as a safety net, and reconciles against the on-disk index (adds, modifies, and offline deletions).
 2. When local index content changes, fans out concurrent **best-effort notifies** to candidates (in-memory hot set + status Online peers). Dead peers cannot stall the writer.
@@ -45,7 +45,7 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 |------|------|----------|
 | **host** (default) | *(none)* | Use the system Tailscale daemon. Listen on the host’s Tailscale IP(s) (IPv4 and IPv6 when bindable; unavailable address families are skipped). Dial peers by Tailscale IP (MagicDNS only if no IP is known). No auth key. Requires `tailscaled` running and logged in. |
 | **tsnet** | `-tsnet` | Embed a [tsnet](https://pkg.go.dev/tailscale.com/tsnet) node that registers as a **separate** machine on the tailnet. Useful in containers without host Tailscale. Supports `-hostname` and `-authkey`. |
-| **plain** | `-plain` | Localhost TCP only, for testing. Requires `TAILSYNC_TESTING=1`. |
+| **plain** | `-plain` | Localhost QUIC only, for testing. Requires `TAILSYNC_TESTING=1`. |
 
 ### Flags
 
@@ -55,7 +55,7 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-state` | `<dir>/.tailsync` | Index directory (also holds tsnet state when `-tsnet`) |
 | `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname; in host mode, identity comes from LocalAPI |
 | `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; **empty discovery may dial all online peers** (see [Peer discovery](#peer-discovery)) |
-| `-port` | `5960` | TCP port for peer connections |
+| `-port` | `5960` | UDP port for QUIC peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
 | `-peers` | (discover) | Comma-separated `host:port` peers (**test/override only**; skips status discovery). Prefer hot set + `-service` in production |
 | `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
@@ -65,7 +65,7 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-block-size` | `4096` | Delta block size |
 | `-dial-timeout` | `5s` (`daemon.DefaultDialTimeout`) | Max wait for each outbound peer dial (`0` = daemon default); caps waits on nodes not listening |
 | `-tsnet` | `false` | Use embedded tsnet instead of host `tailscaled` |
-| `-plain` | `false` | Plain TCP on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
+| `-plain` | `false` | Plain QUIC on `127.0.0.1` (requires `TAILSYNC_TESTING=1`) |
 | `-v` | `false` | Debug logging |
 
 `-plain` and `-tsnet` are mutually exclusive.
@@ -127,7 +127,7 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Hash fast path** — Reuses the stored SHA-256 when size and mtime still match the index. Silent content rewrites that preserve mtime are not detected until another field changes.
 - **Delta** — Adler-style rolling weak checksums and MD5 strong match per block; full-file SHA-256 is authoritative after apply. Whole-file buffers are used for transfers (default max 64 MiB per file).
 - **Concurrency** — Notify fan-out is high-parallelism with no batch barrier on the main loop. Pulls use a separate memory-aware concurrency cap. Local reconcile and peer apply commits share one mutex; network transfer for a content apply runs unlocked (re-LWW on commit).
-- **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single TCP session (`hello`, `notify`, manifest/file/delta, `sync_done`). Wire version **2** is pull-oriented (no reverse-pull) and includes notify. **v2 is a breaking change:** Hello rejects other non-zero versions, so mixed v1/v2 meshes are unsupported—upgrade all nodes together.
+- **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single **QUIC** stream per session (`hello`, `notify`, manifest/file/delta, `sync_done`). Wire version **1** is pull-oriented (no reverse-pull) and includes notify. Hello rejects other non-zero versions. QUIC uses ephemeral self-signed TLS (clients skip verify); peer trust is the tailnet mesh, not a public CA.
 - **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge.
 - **Metadata** — Mode and mtime are synchronized end-to-end; peers adopt metadata when the same content hash wins LWW.
 - **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`), bootstraps peers via LocalAPI status + hot set, and dials with the host network stack (routed by `tailscaled`).
@@ -167,7 +167,7 @@ gomobile bind -target=android -o tailsync.aar deedles.dev/tailsync/mobile
 | `SetDefaultRouteInterface` / `SetDefaultGateway` | Default route/gateway from `ConnectivityManager` / `LinkProperties` |
 | `NotifyNetworkChange` / `Node.NotifyNetworkChange` | After interface/route updates while running, inject a netmon event (no-op if not running) |
 
-`NetMode` values: `"tsnet"` (default), `"host"`, `"plain"` (localhost TCP for tests only).
+`NetMode` values: `"tsnet"` (default), `"host"`, `"plain"` (localhost QUIC for tests only).
 
 `IsRunning()` is true while starting, serving, or stopping (resources may still be held after a timed-out `Stop`). `StatusJSON`’s `running` field is true only while serving after a successful `Start`. `phase` is one of `idle`, `starting`, `running`, or `stopping`.
 

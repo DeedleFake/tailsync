@@ -287,8 +287,8 @@ func (d *Daemon) onNotify(remoteNode, remoteAddr string, remotePort int, hints [
 // dialBackAddr builds host:port for re-dialing a peer from an accepted connection.
 // advertisedPort is the peer's listen port from Hello (preferred); if zero, uses
 // localDefault only when it is the shared mesh port convention.
-func dialBackAddr(remoteTCP string, advertisedPort, localDefault int) string {
-	host, _, err := net.SplitHostPort(remoteTCP)
+func dialBackAddr(remoteAddr string, advertisedPort, localDefault int) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil || host == "" {
 		return ""
 	}

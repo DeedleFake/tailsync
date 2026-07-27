@@ -292,12 +292,13 @@ func TestFailedStartSingleErrorEvent(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Hold a UDP port so plain QUIC listen fails (peers use QUIC/UDP).
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
+	defer pc.Close()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
 
 	lis := &recordingListener{}
 	n, err := mobile.NewNode(&mobile.Config{
@@ -469,12 +470,12 @@ func TestStartFailsWhenPortInUse(t *testing.T) {
 	dir := t.TempDir()
 	state := t.TempDir()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
+	defer pc.Close()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
 
 	n, err := mobile.NewNode(&mobile.Config{
 		Dir:      dir,
@@ -496,16 +497,16 @@ func TestStartFailsWhenPortInUse(t *testing.T) {
 	}
 }
 
-// mustFreePort reserves an ephemeral port, closes the listener, and returns
-// the port number. A small race remains until Start binds it.
+// mustFreePort reserves an ephemeral UDP port, closes the socket, and returns
+// the port number. A small race remains until Start binds it (QUIC uses UDP).
 func mustFreePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	if err := pc.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return port

@@ -2,8 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -193,19 +193,35 @@ func TestFilterSelfHostname(t *testing.T) {
 	}
 }
 
-func TestListenAllPartialSuccess(t *testing.T) {
-	// One bindable localhost address and one that should fail (TEST-NET-3).
-	lnProbe, err := net.Listen("tcp", "127.0.0.1:0")
+func testQUICTLS(t *testing.T) *tls.Config {
+	t.Helper()
+	cfg, err := generateQUICTLSConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := lnProbe.Addr().(*net.TCPAddr).Port
-	_ = lnProbe.Close()
+	return cfg
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	_ = pc.Close()
+	return port
+}
+
+func TestListenAllPartialSuccess(t *testing.T) {
+	// One bindable localhost address and one that should fail (TEST-NET-3).
+	port := freeUDPPort(t)
 
 	good := fmt.Sprintf("127.0.0.1:%d", port)
 	bad := fmt.Sprintf("203.0.113.1:%d", port) // documentation range; typically not local
+	tlsConf := testQUICTLS(t)
 
-	res, err := listenAll([]string{bad, good})
+	res, err := listenAll([]string{bad, good}, tlsConf)
 	if err != nil {
 		t.Fatalf("listenAll: %v", err)
 	}
@@ -218,12 +234,18 @@ func TestListenAllPartialSuccess(t *testing.T) {
 		t.Fatalf("skipped=%v want [%s]", res.Skipped, bad)
 	}
 
-	// Dial the successful bind.
-	c, err := net.Dial("tcp", good)
+	// Dial the successful bind over QUIC and open a stream (required for Accept).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := dialQUICAddr(ctx, good)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	// Write a byte so AcceptStream on the server unblocks (stream signaling).
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	sc, err := res.Listener.Accept()
 	if err != nil {
 		t.Fatal(err)
@@ -232,25 +254,26 @@ func TestListenAllPartialSuccess(t *testing.T) {
 }
 
 func TestListenAllAllFail(t *testing.T) {
-	_, err := listenAll([]string{"203.0.113.1:1", "203.0.113.2:1"})
+	_, err := listenAll([]string{"203.0.113.1:1", "203.0.113.2:1"}, testQUICTLS(t))
 	if err == nil {
 		t.Fatal("expected error when all binds fail")
 	}
 }
 
 func TestListenAllEmpty(t *testing.T) {
-	_, err := listenAll(nil)
+	_, err := listenAll(nil, testQUICTLS(t))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestMultiListenerAcceptAndClose(t *testing.T) {
-	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	tlsConf := testQUICTLS(t)
+	ln1, err := listenQUIC("127.0.0.1:0", tlsConf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	ln2, err := listenQUIC("127.0.0.1:0", tlsConf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,20 +283,31 @@ func TestMultiListenerAcceptAndClose(t *testing.T) {
 	ml := newMultiListener([]net.Listener{ln1, ln2})
 	defer ml.Close()
 
-	// Concurrent dials to both underlying listeners.
-	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	// Concurrent dials to both underlying listeners. Keep client conns open
+	// until the server accepts: closing the QUIC session early can race with
+	// AcceptStream (stream is only visible after the first write).
+	var (
+		wg      sync.WaitGroup
+		errCh   = make(chan error, 2)
+		clients = make(chan net.Conn, 2)
+	)
 	for _, addr := range []string{addr1, addr2} {
 		wg.Add(1)
 		go func(a string) {
 			defer wg.Done()
-			c, err := net.DialTimeout("tcp", a, 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c, err := dialQUICAddr(ctx, a)
 			if err != nil {
 				errCh <- err
 				return
 			}
-			_, _ = c.Write([]byte("x"))
-			_ = c.Close()
+			if _, err := c.Write([]byte("x")); err != nil {
+				_ = c.Close()
+				errCh <- err
+				return
+			}
+			clients <- c
 		}(addr)
 	}
 
@@ -296,7 +330,11 @@ func TestMultiListenerAcceptAndClose(t *testing.T) {
 			if a.err != nil {
 				t.Fatalf("accept: %v", a.err)
 			}
-			io.Copy(io.Discard, a.c)
+			// Client held the session open (no FIN); read the priming byte only.
+			var buf [1]byte
+			if _, err := a.c.Read(buf[:]); err != nil {
+				t.Fatalf("read: %v", err)
+			}
 			_ = a.c.Close()
 			accepted++
 		}
@@ -305,6 +343,10 @@ func TestMultiListenerAcceptAndClose(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+	close(clients)
+	for c := range clients {
+		_ = c.Close()
 	}
 
 	// Close should unblock Accept with a closed error.
@@ -329,11 +371,12 @@ func TestMultiListenerAcceptAndClose(t *testing.T) {
 }
 
 func TestMultiListenerOneSideClosedStillAccepts(t *testing.T) {
-	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	tlsConf := testQUICTLS(t)
+	ln1, err := listenQUIC("127.0.0.1:0", tlsConf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	ln2, err := listenQUIC("127.0.0.1:0", tlsConf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,11 +392,16 @@ func TestMultiListenerOneSideClosedStillAccepts(t *testing.T) {
 	// Brief pause so the ln1 Accept loop exits.
 	time.Sleep(20 * time.Millisecond)
 
-	c, err := net.DialTimeout("tcp", addr2, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := dialQUICAddr(ctx, addr2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
 
 	sc, err := ml.Accept()
 	if err != nil {
@@ -392,17 +440,18 @@ func TestDialTimeout(t *testing.T) {
 }
 
 func TestDialClosedPortFailsQuickly(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Bind then close a UDP port so the dial target is not listening for QUIC.
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := pc.LocalAddr().String()
+	_ = pc.Close()
 
 	d := &Daemon{
 		cfg: Config{
 			NetMode:     NetModePlain,
-			DialTimeout: time.Second,
+			DialTimeout: 500 * time.Millisecond,
 		},
 		log: slog.Default(),
 	}
@@ -410,14 +459,15 @@ func TestDialClosedPortFailsQuickly(t *testing.T) {
 	_, err = d.dial(context.Background(), addr)
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("expected connection refused")
+		t.Fatal("expected dial error")
 	}
+	// QUIC handshake to a closed UDP port typically times out (no ICMP required).
 	if elapsed > 2*time.Second {
 		t.Fatalf("closed-port dial took %v", elapsed)
 	}
 	// Match the wrap used by dialHello/pullFrom/notifyPeer so soft-fail classification stays accurate.
 	if !isDialSoftFail(fmt.Errorf("%w: %w", errDial, err)) {
-		t.Fatalf("expected soft fail for connection refused: %v", err)
+		t.Fatalf("expected soft fail for closed-port dial: %v", err)
 	}
 }
 

@@ -53,9 +53,9 @@ func waitGone(t *testing.T, path string, timeout time.Duration) {
 	}
 }
 
-// TestTwoNodesPlainTCP spins up two daemons on localhost and verifies
+// TestTwoNodesPlain spins up two daemons on localhost QUIC and verifies
 // file sync, content update, and deletion propagation.
-func TestTwoNodesPlainTCP(t *testing.T) {
+func TestTwoNodesPlain(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 	stateA := t.TempDir()
@@ -274,12 +274,12 @@ func TestRunCancelAcceptLoopRace(t *testing.T) {
 	for i := range 30 {
 		dir := t.TempDir()
 		state := t.TempDir()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		port := ln.Addr().(*net.TCPAddr).Port
-		_ = ln.Close()
+		port := pc.LocalAddr().(*net.UDPAddr).Port
+		_ = pc.Close()
 
 		ready := make(chan struct{})
 		var readyOnce sync.Once
@@ -332,27 +332,28 @@ func freePort(t *testing.T) int {
 	return freePorts(t, 1)[0]
 }
 
-// freePorts reserves n distinct TCP ports (held open until all are chosen, then
+// freePorts reserves n distinct UDP ports (held open until all are chosen, then
 // closed) so sequential freePort calls cannot collapse to the same port.
+// Peers use QUIC over UDP.
 func freePorts(t *testing.T, n int) []int {
 	t.Helper()
 	if n <= 0 {
 		return nil
 	}
-	lns := make([]net.Listener, 0, n)
+	pcs := make([]net.PacketConn, 0, n)
 	ports := make([]int, 0, n)
 	defer func() {
-		for _, ln := range lns {
-			_ = ln.Close()
+		for _, pc := range pcs {
+			_ = pc.Close()
 		}
 	}()
 	for range n {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		lns = append(lns, ln)
-		ports = append(ports, ln.Addr().(*net.TCPAddr).Port)
+		pcs = append(pcs, pc)
+		ports = append(ports, pc.LocalAddr().(*net.UDPAddr).Port)
 	}
 	return ports
 }

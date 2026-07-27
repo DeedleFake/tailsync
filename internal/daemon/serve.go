@@ -58,7 +58,7 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID, d.cfg.Port)); err != nil {
 		return
 	}
-	// Learn dial-back using peer's advertised listen port (not the ephemeral TCP port).
+	// Learn dial-back using peer's advertised listen port (not the ephemeral QUIC/UDP port).
 	if remoteNode != "" && remoteNode != d.nodeID {
 		if dial := dialBackAddr(remote, remotePort, d.cfg.Port); dial != "" {
 			d.peers.remember(remoteNode, dial)

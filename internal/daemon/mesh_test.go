@@ -20,7 +20,7 @@ type meshNode struct {
 	Err        chan error
 }
 
-// startMesh launches n fully-meshed plain TCP daemons on 127.0.0.1 and waits
+// startMesh launches n fully-meshed plain QUIC daemons on 127.0.0.1 and waits
 // until all OnReady callbacks fire. configure may adjust intervals/hooks per
 // node (i = 0..n-1); Port/Peers/ListenHost/NetMode/OnReady are set after
 // configure so wiring stays consistent. Uses freePorts and waitFile helpers

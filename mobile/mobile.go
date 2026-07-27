@@ -89,7 +89,7 @@ type Config struct {
 	// When empty, first run may require browser login (see "auth" events);
 	// subsequent runs reuse enrolled state under StateDir without re-prompting.
 	AuthKey string
-	// Port is the TCP listen/dial port (0 = daemon default).
+	// Port is the UDP listen/dial port for QUIC peer sessions (0 = daemon default).
 	Port int
 	// Peers is a comma-separated list of host:port peers (optional test/override;
 	// empty = in-memory hot set after Hello union status Online discovery).
@@ -112,7 +112,7 @@ type Config struct {
 	// Caps hangs against online nodes that are not running tailsync.
 	DialTimeoutMs int64
 	// NetMode selects networking: "tsnet" (default for mobile), "host", or "plain".
-	// Android apps should use "tsnet". "plain" is for testing only (localhost TCP).
+	// Android apps should use "tsnet". "plain" is for testing only (localhost QUIC).
 	// "host" requires a system tailscaled (not typical on Android).
 	NetMode string
 }

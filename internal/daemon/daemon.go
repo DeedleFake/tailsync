@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -70,7 +71,7 @@ type Config struct {
 	// setting this or Peers so outbound sync does not waste time on them.
 	// Ignored when Peers is set.
 	ServiceName string
-	// Port is the TCP port to listen on over the tailnet (or localhost in plain mode).
+	// Port is the UDP port for QUIC peer sessions over the tailnet (or localhost in plain mode).
 	Port int
 	// AuthKey is an optional Tailscale auth key for NetModeTSNet
 	// (else interactive login / existing tsnet state). Unused in host mode.
@@ -94,7 +95,7 @@ type Config struct {
 	BlockSize int
 	// MaxFileBytes rejects local files larger than this for serve/pull (0 = default).
 	MaxFileBytes int64
-	// DialTimeout is the max wait for an outbound peer TCP dial (0 = DefaultDialTimeout).
+	// DialTimeout is the max wait for an outbound peer QUIC dial (0 = DefaultDialTimeout).
 	// Caps hangs against online nodes that are not listening for tailsync.
 	DialTimeout time.Duration
 	// TombstoneTTL drops old deletion tombstones from the index (0 = default 30d).
@@ -158,6 +159,11 @@ type Daemon struct {
 	server *tsnet.Server // NetModeTSNet only
 	local  *local.Client // NetModeHost
 	ln     net.Listener
+	// quicTLS is the server TLS config (ephemeral self-signed cert) for QUIC.
+	quicTLS *tls.Config
+	// quicDialHosts are local IP strings used to bind ephemeral UDP when dialing
+	// over tsnet (ListenPacket requires a concrete IP). Empty in host/plain.
+	quicDialHosts []string
 	// root confines sync-tree filesystem I/O to cfg.Dir (opened for Run).
 	root *os.Root
 
@@ -290,9 +296,15 @@ func New(cfg Config) (*Daemon, error) {
 		cfg.ListenHost = "127.0.0.1"
 	}
 
+	quicTLS, err := generateQUICTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Daemon{
 		cfg:        cfg,
 		log:        log,
+		quicTLS:    quicTLS,
 		peers:      newPeerMem(),
 		notifySeen: newNotifyTracker(),
 		needPull:   newSignal(),
