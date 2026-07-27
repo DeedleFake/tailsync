@@ -59,7 +59,7 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery). Prefer this or `-service` when the tailnet has devices not running tailsync |
 | `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer sync period (local changes also open a bidirectional session) |
-| `-watch-debounce` | `300ms` | Debounce wait after FS events before reconcile (`0` = default) |
+| `-watch-debounce` | `1s` | Debounce wait after FS events before reconcile (`0` = default) |
 | `-no-watch` | `false` | Disable filesystem watching; rely on `-scan-interval` only |
 | `-block-size` | `4096` | Delta block size |
 | `-dial-timeout` | `5s` (`daemon.DefaultDialTimeout`) | Max wait for each outbound peer dial (`0` = daemon default); caps waits on nodes not listening |
@@ -109,7 +109,7 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 ## How it works
 
 - **Index** — JSON under `-state` with size, mtime, mode, content SHA-256, and deletion tombstones (GC’d after 30 days by default). After a tombstone is dropped, a lagging peer that never saw the delete can re-introduce the file; keep the TTL longer than the maximum expected peer offline window.
-- **FS watch + debounce** — Local edits are detected via recursive filesystem events (debounced, default 300 ms), then reconciled. Paths under `.tailsync` / `.tailsync-*` are ignored. If watching fails to start (unsupported platform/permissions), tailsync logs a warning and falls back to timer-only scanning.
+- **FS watch + debounce** — Local edits are detected via recursive filesystem events (debounced, default 1 s), then reconciled. Paths under `.tailsync` / `.tailsync-*` are ignored. If watching fails to start (unsupported platform/permissions), tailsync logs a warning and falls back to timer-only scanning.
 - **Scan** — Walks regular files only; live index entries missing on disk become tombstones (offline deletion). Empty directories and symlinks are not synced. `-scan-interval` remains a full safety-net rescan when watch is active.
 - **Sync-on-change** — When reconcile applies peer-visible local index changes, a coalesced bidirectional peer session is opened: the dialer pulls the peer’s manifest, then the peer reverse-pulls the dialer’s, so a local write is delivered without waiting for the peer’s `-sync-interval`. That interval remains backup/catch-up for offline peers. End-to-end lag is typically on the order of watch debounce plus one dial/RTT (not a full sync interval).
 - **Hash fast path** — Reuses the stored SHA-256 when size and mtime still match the index. Silent content rewrites that preserve mtime are not detected until another field changes.

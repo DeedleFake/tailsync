@@ -27,7 +27,7 @@ const (
 	DefaultSyncInterval = 45 * time.Second
 	// DefaultWatchDebounce is how long to wait after an FS event before
 	// reconciling when filesystem watching is active.
-	DefaultWatchDebounce = 300 * time.Millisecond
+	DefaultWatchDebounce = time.Second
 	// DefaultMaxFileBytes is the max single-file size loaded into memory for
 	// transfer/delta (v1 keeps whole-file buffers). Wire framing is also capped
 	// by proto.MaxMessageSize.
