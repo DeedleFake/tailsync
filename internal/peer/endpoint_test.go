@@ -49,7 +49,7 @@ func testTLS(t *testing.T) *tls.Config {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{quicALPN},
+		NextProtos:   []string{ALPN},
 		MinVersion:   tls.VersionTLS13,
 	}
 }
@@ -58,7 +58,7 @@ func TestSharedTransportDialAndAccept(t *testing.T) {
 	serverTLS := testTLS(t)
 	clientTLS := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{quicALPN},
+		NextProtos:         []string{ALPN},
 		MinVersion:         tls.VersionTLS13,
 	}
 
@@ -149,7 +149,7 @@ func TestSessionDoesNotClosePacketConn(t *testing.T) {
 	serverTLS := testTLS(t)
 	clientTLS := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{quicALPN},
+		NextProtos:         []string{ALPN},
 		MinVersion:         tls.VersionTLS13,
 	}
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")

@@ -103,18 +103,6 @@ func TestScheduleNotifyNoCandidatesDoesNotMark(t *testing.T) {
 	}
 }
 
-func TestDialBackAddrUsesAdvertisedPort(t *testing.T) {
-	got := dialBackAddr("127.0.0.1:54321", 19001, 5960)
-	if got != "127.0.0.1:19001" {
-		t.Fatalf("got %q", got)
-	}
-	// Missing advertised port falls back to local default (same-port mesh).
-	got = dialBackAddr("100.64.0.2:9999", 0, 5960)
-	if got != "100.64.0.2:5960" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestRequestPullSafeAfterNilDaemon(t *testing.T) {
 	var d *Daemon
 	d.requestPull() // must not panic
@@ -175,7 +163,7 @@ func TestLateRequestPullAndOnNotifyAfterRun(t *testing.T) {
 
 	// Late callbacks after shutdown (handleStream / infect-and-die race with cancel).
 	d.requestPull()
-	d.onNotify("peer-x", "127.0.0.1:9", 9, []index.ManifestEntry{
+	d.onNotify("peer-x", []index.ManifestEntry{
 		{Path: "late.txt", Hash: "abc", UpdatedAt: time.Now()},
 	})
 	// needPull must still be the channel from New (never niled).

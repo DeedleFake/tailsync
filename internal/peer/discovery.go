@@ -33,9 +33,8 @@ type Candidate struct {
 // dial while a failed address waits. Ticks are single-flighted; Kick is
 // non-blocking.
 type Discovery struct {
-	endpoint *Endpoint
-	roster   *Roster
-	log      *slog.Logger
+	roster *Roster
+	log    *slog.Logger
 
 	concurrency int
 	interval    time.Duration
@@ -79,7 +78,7 @@ type DiscoveryConfig struct {
 	Log              *slog.Logger
 }
 
-func newDiscovery(endpoint *Endpoint, roster *Roster, cfg DiscoveryConfig) *Discovery {
+func newDiscovery(roster *Roster, cfg DiscoveryConfig) *Discovery {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
@@ -96,7 +95,6 @@ func newDiscovery(endpoint *Endpoint, roster *Roster, cfg DiscoveryConfig) *Disc
 		cfg.HandshakeTimeout = DefaultDialTimeout
 	}
 	return &Discovery{
-		endpoint:    endpoint,
 		roster:      roster,
 		log:         cfg.Log,
 		concurrency: cfg.Concurrency,
@@ -180,9 +178,7 @@ func (d *Discovery) tick(ctx context.Context) {
 				continue
 			}
 		}
-		if d.shouldSkip(c.Addr) {
-			continue
-		}
+		// tryBeginDial is the single gate: checks inflight + backoff atomically.
 		if !d.tryBeginDial(c.Addr) {
 			continue
 		}
@@ -219,19 +215,8 @@ func (d *Discovery) dialWithTimeout(ctx context.Context, c Candidate) error {
 	return d.dialPeer(dctx, c)
 }
 
-func (d *Discovery) shouldSkip(addr string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if _, ok := d.inflight[addr]; ok {
-		return true
-	}
-	ab, ok := d.backoff[addr]
-	if !ok || ab.until.IsZero() {
-		return false
-	}
-	return time.Now().Before(ab.until)
-}
-
+// tryBeginDial claims addr for dialing if it is not already in-flight and not
+// in backoff. Returns false when the dial should be skipped.
 func (d *Discovery) tryBeginDial(addr string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -281,14 +266,13 @@ func (d *Discovery) ClearBackoff(addr string) {
 
 // InBackoff reports whether addr is currently backed off (tests).
 func (d *Discovery) InBackoff(addr string) bool {
-	return d.shouldSkip(addr) && !d.isInflight(addr)
-}
-
-func (d *Discovery) isInflight(addr string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, ok := d.inflight[addr]
-	return ok
+	ab, ok := d.backoff[addr]
+	if !ok || ab.until.IsZero() {
+		return false
+	}
+	return time.Now().Before(ab.until)
 }
 
 // BackoffStreak returns the failure streak for addr (tests).

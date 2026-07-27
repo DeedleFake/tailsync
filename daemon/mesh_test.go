@@ -252,7 +252,7 @@ func TestThreeNodeNotifyDedupe(t *testing.T) {
 	})
 	defer stopMesh(cancel, nodes...)
 
-	// Let bootstrap pulls settle so hot sets form.
+	// Let bootstrap pulls settle so sessions form.
 	time.Sleep(200 * time.Millisecond)
 
 	if err := os.WriteFile(filepath.Join(nodes[0].Dir, "mesh.txt"), []byte("mesh-content"), 0o644); err != nil {

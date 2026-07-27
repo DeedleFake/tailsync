@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"time"
@@ -28,19 +27,27 @@ func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
 }
 
 // onPeerStream is the peer.Manager callback for inbound application streams.
-// Hello is connection-scoped (handled by peer package); streams start with the op.
+// Hello is connection-scoped (handled by peer package); first is already decoded
+// (Ping is handled in the peer package and never reaches here).
 // Invoked from a per-stream goroutine in the peer session.
-func (d *Daemon) onPeerStream(ctx context.Context, s *peer.Session, stream net.Conn) {
+//
+// streamWG here is intentional and distinct from Session.streamWG: the session
+// Wait drains dispatch; this Wait (after mesh close) keeps Root/index live for
+// finishing serve work.
+func (d *Daemon) onPeerStream(ctx context.Context, s *peer.Session, first proto.Message, stream net.Conn) {
 	d.streamWG.Add(1)
 	defer d.streamWG.Done()
-	d.handleStream(ctx, s, stream)
+	d.handleStream(ctx, s, first, stream)
 }
 
 // handleStream serves one inbound op stream on an established peer session.
 //
-// First message defines the op: Notify, ManifestReq, FileReq, DeltaReq, Ping
-// (Ping is normally handled in the peer package; tolerate here too).
-func (d *Daemon) handleStream(ctx context.Context, s *peer.Session, conn net.Conn) {
+// first defines the op: Notify, ManifestReq, FileReq, DeltaReq (and optionally
+// Ping if a peer package path is bypassed in tests).
+//
+// Closes conn on return. When invoked via OnStream, the peer package also
+// closes after the handler returns; double-close is safe (idempotent).
+func (d *Daemon) handleStream(ctx context.Context, s *peer.Session, first proto.Message, conn net.Conn) {
 	defer conn.Close()
 	d.setConnDeadline(conn, ctx)
 	// Trust session identity only (Hello NodeID), never message header overrides.
@@ -49,20 +56,11 @@ func (d *Daemon) handleStream(ctx context.Context, s *peer.Session, conn net.Con
 		remote = s.NodeID()
 	}
 
-	msg, err := proto.Decode(conn)
-	if err != nil {
-		if err != io.EOF {
-			d.log.Debug("decode stream op", "peer", remote, "err", err)
-		}
-		return
-	}
-
-	switch msg.Header.Type {
+	switch first.Header.Type {
 	case proto.TypeNotify:
-		port := msg.Header.Port
-		d.onNotify(remote, sessionRemoteAddr(s), port, msg.Header.Entries)
+		d.onNotify(remote, first.Header.Entries)
 		_ = proto.Encode(conn, proto.NewNotifyOK(d.nodeID, d.cfg.Port))
-		d.log.Debug("inbound notify", "peer", remote, "hints", len(msg.Header.Entries))
+		d.log.Debug("inbound notify", "peer", remote, "hints", len(first.Header.Entries))
 		return
 
 	case proto.TypePing:
@@ -76,15 +74,15 @@ func (d *Daemon) handleStream(ctx context.Context, s *peer.Session, conn net.Con
 			return
 		}
 		defer d.releaseServeSlot()
-		if err := d.serveMsg(ctx, conn, msg); err != nil {
-			d.log.Debug("serve message", "peer", remote, "type", msg.Header.Type, "err", err)
+		if err := d.serveMsg(ctx, conn, first); err != nil {
+			d.log.Debug("serve message", "peer", remote, "type", first.Header.Type, "err", err)
 			_ = proto.Encode(conn, proto.NewError(err.Error()))
 		}
 		return
 
 	default:
-		d.log.Debug("unexpected stream op", "peer", remote, "type", msg.Header.Type)
-		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unexpected message type %q", msg.Header.Type)))
+		d.log.Debug("unexpected stream op", "peer", remote, "type", first.Header.Type)
+		_ = proto.Encode(conn, proto.NewError(fmt.Sprintf("unexpected message type %q", first.Header.Type)))
 	}
 }
 
@@ -109,19 +107,6 @@ func (d *Daemon) releaseServeSlot() {
 	case <-d.serveSem:
 	default:
 	}
-}
-
-func sessionRemoteAddr(s *peer.Session) string {
-	if s == nil {
-		return ""
-	}
-	if s.Addr() != "" {
-		return s.Addr()
-	}
-	if c := s.Conn(); c != nil && c.RemoteAddr() != nil {
-		return c.RemoteAddr().String()
-	}
-	return ""
 }
 
 func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message) error {

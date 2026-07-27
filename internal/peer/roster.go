@@ -137,6 +137,13 @@ func (r *Roster) Install(sess *Session) (result installResult, old *Session) {
 	return installRejected, nil
 }
 
+// PreferredDialer returns the node ID that should initiate the connection
+// between local and remote (lexicographically smaller). Shared by inbound
+// decide and simultaneous-dial race resolution so the rule cannot drift.
+func PreferredDialer(localID, remoteID string) string {
+	return min(localID, remoteID)
+}
+
 // preferNewSession reports whether newS should replace cur when both claim the
 // same peer. Prefer the connection dialed by the smaller node ID (consistent on
 // both sides). If dialer roles match, keep existing.
@@ -147,13 +154,10 @@ func preferNewSession(newS, cur *Session) bool {
 	if local == "" || remote == "" {
 		return false
 	}
-	preferredDialer := min(local, remote)
+	preferred := PreferredDialer(local, remote)
 	newDialer := dialerNodeID(newS)
 	curDialer := dialerNodeID(cur)
-	if newDialer == preferredDialer && curDialer != preferredDialer {
-		return true
-	}
-	return false
+	return newDialer == preferred && curDialer != preferred
 }
 
 func dialerNodeID(s *Session) string {
@@ -161,15 +165,6 @@ func dialerNodeID(s *Session) string {
 		return s.localID
 	}
 	return s.NodeID()
-}
-
-// Remove drops the session for nodeID if it is still the registered instance.
-func (r *Roster) Remove(nodeID string, sess *Session) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cur, ok := r.sessions[nodeID]; ok && (sess == nil || cur == sess) {
-		delete(r.sessions, nodeID)
-	}
 }
 
 // RemoveIfCurrent removes sess only if it is still the mapped session.

@@ -14,8 +14,9 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// quicALPN is the TLS NextProto for tailsync peer sessions.
-const quicALPN = "tailsync"
+// ALPN is the TLS NextProto for tailsync peer sessions.
+// Required by quic-go; not a wire-protocol version (that is proto.Version).
+const ALPN = "tailsync"
 
 // DefaultMaxIncomingStreams allows concurrent op streams (notify, pull, heartbeat).
 // Inbound heavy serve work is also capped by the daemon serveSem.
@@ -62,7 +63,7 @@ func NewEndpoint(serverTLS, clientTLS *tls.Config, log *slog.Logger) (*Endpoint,
 	if clientTLS == nil {
 		clientTLS = &tls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         []string{quicALPN},
+			NextProtos:         []string{ALPN},
 			MinVersion:         tls.VersionTLS13,
 		}
 	}
@@ -195,29 +196,7 @@ func (e *Endpoint) Dial(ctx context.Context, addr string) (*quic.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return nil, net.ErrClosed
-	}
-	binds := pickBindsByFamily(e.binds, raddr.IP)
-	e.mu.Unlock()
-	if len(binds) == 0 {
-		return nil, fmt.Errorf("no local transport for dial %s", addr)
-	}
-	var lastErr error
-	for _, b := range binds {
-		conn, err := b.transport.Dial(ctx, raddr, e.clientTLS, e.quicConf)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return conn, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("dial %s: no transport", addr)
-	}
-	return nil, lastErr
+	return e.DialAddr(ctx, raddr)
 }
 
 // DialAddr dials a pre-resolved UDP address (e.g. after tsnet name resolution).

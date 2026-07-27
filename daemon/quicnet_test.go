@@ -1,31 +1,12 @@
 package daemon
 
 import (
-	"net"
 	"net/netip"
 	"testing"
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/types/key"
 )
-
-func TestPickDialHostsByFamily(t *testing.T) {
-	hosts := []string{"100.64.0.1", "fd7a:115c:a1e0::1", "100.64.0.2"}
-	v4 := net.ParseIP("100.64.0.9")
-	v6 := net.ParseIP("fd7a:115c:a1e0::9")
-
-	got := pickDialHostsByFamily(hosts, v4)
-	if len(got) != 3 || got[0] != "100.64.0.1" || got[1] != "100.64.0.2" || got[2] != "fd7a:115c:a1e0::1" {
-		t.Fatalf("v4 order: %v", got)
-	}
-	got = pickDialHostsByFamily(hosts, v6)
-	if len(got) != 3 || got[0] != "fd7a:115c:a1e0::1" || got[1] != "100.64.0.1" {
-		t.Fatalf("v6 order: %v", got)
-	}
-	if pickDialHostsByFamily(nil, v4) != nil {
-		t.Fatal("empty hosts")
-	}
-}
 
 func TestPeerIPFromStatus(t *testing.T) {
 	st := &ipnstate.Status{

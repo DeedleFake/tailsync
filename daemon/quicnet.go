@@ -18,15 +18,14 @@ import (
 
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
-)
 
-// quicALPN is the TLS NextProto for tailsync peer sessions.
-// Required by quic-go; not a wire-protocol version (that is proto.Version).
-const quicALPN = "tailsync"
+	"deedles.dev/tailsync/internal/peer"
+)
 
 // generateQUICTLSConfig builds an ephemeral self-signed server certificate.
 // Peer authentication is the tailnet (or localhost in plain tests); the cert
 // only satisfies QUIC/TLS requirements. Clients use InsecureSkipVerify.
+// NextProtos must match peer.ALPN (owned by the peer package).
 func generateQUICTLSConfig() (*tls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -59,7 +58,7 @@ func generateQUICTLSConfig() (*tls.Config, error) {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{quicALPN},
+		NextProtos:   []string{peer.ALPN},
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
@@ -67,32 +66,9 @@ func generateQUICTLSConfig() (*tls.Config, error) {
 func quicClientTLSConfig() *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify: true, // tailnet (or localhost test) provides peer trust
-		NextProtos:         []string{quicALPN},
+		NextProtos:         []string{peer.ALPN},
 		MinVersion:         tls.VersionTLS13,
 	}
-}
-
-// pickDialHostsByFamily orders local bind IPs so the remote's address family
-// is tried first (avoids v4 local + v6 peer bind mismatches on tsnet).
-func pickDialHostsByFamily(hosts []string, remote net.IP) []string {
-	if len(hosts) == 0 || remote == nil {
-		return hosts
-	}
-	remote4 := remote.To4() != nil
-	var same, other []string
-	for _, h := range hosts {
-		ip := net.ParseIP(h)
-		if ip == nil {
-			other = append(other, h)
-			continue
-		}
-		if (ip.To4() != nil) == remote4 {
-			same = append(same, h)
-		} else {
-			other = append(other, h)
-		}
-	}
-	return append(same, other...)
 }
 
 // peerIPFromStatus resolves a peer host name (MagicDNS or HostName) to a

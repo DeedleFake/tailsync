@@ -17,6 +17,15 @@ import (
 	"deedles.dev/tailsync/internal/proto"
 )
 
+// StreamHandler is invoked for each inbound application stream after the first
+// message has been decoded. Ping is handled internally and never reaches the
+// handler.
+//
+// Lifecycle: the peer accept path always closes stream when the handler returns
+// (see handleInboundStream). Handlers may Close earlier when finished; Close is
+// idempotent (streamConn closeOnce). Do not use stream after the handler returns.
+type StreamHandler func(ctx context.Context, s *Session, first proto.Message, stream net.Conn)
+
 // Session is one persistent QUIC connection to a peer after a successful Hello.
 type Session struct {
 	nodeID  string
@@ -41,6 +50,9 @@ type Session struct {
 
 	// streamWG tracks in-flight handleInboundStream goroutines; Close waits
 	// so Manager.Close does not return while handlers still run.
+	// Daemon also has its own streamWG around application handlers: session
+	// Wait drains peer-side dispatch; daemon Wait drains after mesh close so
+	// Root/index stay live for finishing serve/pull work (intentional dual).
 	streamWG sync.WaitGroup
 
 	closeOnce sync.Once
@@ -55,6 +67,12 @@ type SessionConfig struct {
 	Conn    *quic.Conn
 	Log     *slog.Logger
 	OnClose func(*Session)
+}
+
+// SessionForTest builds a healthy session with no QUIC connection for unit tests
+// that exercise Healthy/Closed/Invalidate without a live transport.
+func SessionForTest(nodeID, localID string) *Session {
+	return newSession(SessionConfig{NodeID: nodeID, LocalID: localID, Dialer: true})
 }
 
 // newSession builds a session with a serve context ready so Close is always
@@ -90,12 +108,6 @@ func (s *Session) Closed() bool     { return s.closed.Load() }
 func (s *Session) Since() time.Time { return s.since }
 func (s *Session) Conn() *quic.Conn { return s.qconn }
 
-func (s *Session) SetAddr(addr string) {
-	if addr != "" {
-		s.addr = addr
-	}
-}
-
 // setOnClose updates the close callback under lock (clear before discard).
 func (s *Session) setOnClose(f func(*Session)) {
 	s.mu.Lock()
@@ -122,25 +134,28 @@ func (s *Session) info() SessionInfo {
 // Context cancel/deadline on the open call does not tear down the session
 // (short notify timeouts must not kill healthy peers). Connection-level
 // failures mark unhealthy and Close so discovery can replace the session.
+//
+// Heartbeat pings use a separate internal open path (see ping) that does not
+// call OpenStream: ping failures always Invalidate the session, while
+// OpenStream preserves soft caller cancel/timeout.
 func (s *Session) OpenStream(ctx context.Context) (net.Conn, error) {
 	if s.Closed() {
 		return nil, net.ErrClosed
 	}
 	str, err := s.qconn.OpenStreamSync(ctx)
 	if err != nil {
-		if isSoftStreamOpenErr(err) {
+		if IsSoftStreamErr(err) {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
-		s.markUnhealthy()
-		s.Close()
+		s.Invalidate()
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
 	return newStreamConn(str, s.qconn), nil
 }
 
-// isSoftStreamOpenErr reports caller-side cancel/timeout that should not
-// tear down the peer connection (heartbeat handles soft unreachability).
-func isSoftStreamOpenErr(err error) bool {
+// IsSoftStreamErr reports caller-side cancel/timeout that should not tear down
+// the peer connection (heartbeat handles soft unreachability).
+func IsSoftStreamErr(err error) bool {
 	return errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded)
@@ -149,6 +164,14 @@ func isSoftStreamOpenErr(err error) bool {
 // markUnhealthy flags the session so discovery/roster can replace it.
 func (s *Session) markUnhealthy() {
 	s.healthy.Store(false)
+}
+
+// Invalidate marks the session unhealthy and closes it so discovery can
+// replace it. Idempotent. Callers should not use this for soft cancel/timeout
+// (see IsSoftStreamErr); use it for mid-stream framing/connection failures.
+func (s *Session) Invalidate() {
+	s.markUnhealthy()
+	s.Close()
 }
 
 // Close tears down the QUIC connection (not the shared PacketConn). Idempotent.
@@ -185,7 +208,7 @@ func (s *Session) Close() {
 // spawnStreamHandler registers and starts an inbound stream handler, or drops
 // the stream if Close has already begun. Add is only called while holding mu
 // and closed is false, so it cannot race after Close's Wait.
-func (s *Session) spawnStreamHandler(conn net.Conn, onStream func(context.Context, *Session, net.Conn)) {
+func (s *Session) spawnStreamHandler(conn net.Conn, onStream StreamHandler) {
 	s.mu.Lock()
 	if s.closed.Load() {
 		s.mu.Unlock()
@@ -203,7 +226,7 @@ func (s *Session) spawnStreamHandler(conn net.Conn, onStream func(context.Contex
 // startServe accepts inbound streams and dispatches them. Ping is handled
 // locally; other ops go to onStream. Runs until ctx done or connection dies.
 // serveCancel is already set in newSession; this links the parent context.
-func (s *Session) startServe(ctx context.Context, onStream func(context.Context, *Session, net.Conn)) {
+func (s *Session) startServe(ctx context.Context, onStream StreamHandler) {
 	if s.Closed() {
 		return
 	}
@@ -237,7 +260,7 @@ func (s *Session) startServe(ctx context.Context, onStream func(context.Context,
 	}()
 }
 
-func (s *Session) handleInboundStream(ctx context.Context, conn net.Conn, onStream func(context.Context, *Session, net.Conn)) {
+func (s *Session) handleInboundStream(ctx context.Context, conn net.Conn, onStream StreamHandler) {
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
@@ -253,56 +276,9 @@ func (s *Session) handleInboundStream(ctx context.Context, conn net.Conn, onStre
 		return
 	}
 	if onStream != nil {
-		onStream(ctx, s, &prefixConn{Conn: conn, first: msg, readFirst: true})
+		// Pass the already-decoded first message; do not re-encode for a second Decode.
+		onStream(ctx, s, msg, conn)
 	}
-}
-
-// prefixConn replays a pre-decoded first message as framed bytes then delegates.
-type prefixConn struct {
-	net.Conn
-	first     proto.Message
-	readFirst bool
-	buf       []byte
-	bufPos    int
-}
-
-func (c *prefixConn) Read(p []byte) (int, error) {
-	if c.readFirst {
-		if c.buf == nil {
-			var err error
-			c.buf, err = encodeToBytes(c.first)
-			if err != nil {
-				return 0, err
-			}
-			c.bufPos = 0
-		}
-		if c.bufPos < len(c.buf) {
-			n := copy(p, c.buf[c.bufPos:])
-			c.bufPos += n
-			if c.bufPos >= len(c.buf) {
-				c.readFirst = false
-				c.buf = nil
-			}
-			return n, nil
-		}
-		c.readFirst = false
-	}
-	return c.Conn.Read(p)
-}
-
-func encodeToBytes(msg proto.Message) ([]byte, error) {
-	w := &sliceWriter{}
-	if err := proto.Encode(w, msg); err != nil {
-		return nil, err
-	}
-	return w.b, nil
-}
-
-type sliceWriter struct{ b []byte }
-
-func (w *sliceWriter) Write(p []byte) (int, error) {
-	w.b = append(w.b, p...)
-	return len(p), nil
 }
 
 // startHeartbeat sends periodic Ping streams; failures mark unhealthy and Close.
@@ -328,8 +304,7 @@ func (s *Session) startHeartbeat(ctx context.Context, interval, timeout time.Dur
 				}
 				if err := s.ping(ctx, timeout); err != nil {
 					s.log.Debug("heartbeat failed", "peer", s.nodeID, "err", err)
-					s.markUnhealthy()
-					s.Close()
+					s.Invalidate()
 					return
 				}
 			}
@@ -337,10 +312,11 @@ func (s *Session) startHeartbeat(ctx context.Context, interval, timeout time.Dur
 	}()
 }
 
+// ping opens a stream and exchanges Ping/Pong. Unlike OpenStream, any failure
+// (including timeout) is treated as a hard health failure by the heartbeat loop.
 func (s *Session) ping(ctx context.Context, timeout time.Duration) error {
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// Open stream without Close-on-failure for ping path — we Close after.
 	if s.Closed() {
 		return net.ErrClosed
 	}

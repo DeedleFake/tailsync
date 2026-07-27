@@ -140,6 +140,7 @@ func (d *Daemon) pullFromSession(ctx context.Context, sess *peer.Session) error 
 	}
 	entries, err := d.fetchManifest(ctx, sess)
 	if err != nil {
+		d.invalidateSessionOnTransport(sess, err)
 		return err
 	}
 
@@ -180,10 +181,30 @@ func (d *Daemon) pullFromSession(ctx context.Context, sess *peer.Session) error 
 		}
 	}
 	if transportErr != nil {
+		d.invalidateSessionOnTransport(sess, transportErr)
 		return transportErr
 	}
 	d.log.Info("pulled peer", "peer", sess.NodeID(), "addr", sess.Addr(), "manifest_entries", len(entries))
 	return nil
+}
+
+// invalidateSessionOnHardIO closes the session on non-soft I/O failures so
+// discovery can replace it. Soft caller cancel/timeout is ignored (mirrors
+// OpenStream's IsSoftStreamErr policy). Used by pull and notify paths.
+func (d *Daemon) invalidateSessionOnHardIO(sess *peer.Session, err error) {
+	if sess == nil || err == nil || peer.IsSoftStreamErr(err) {
+		return
+	}
+	sess.Invalidate()
+}
+
+// invalidateSessionOnTransport closes the session on hard framing/connection
+// failures (errTransport / EOF). Soft cancel/timeout is ignored.
+func (d *Daemon) invalidateSessionOnTransport(sess *peer.Session, err error) {
+	if !isTransportErr(err) {
+		return
+	}
+	d.invalidateSessionOnHardIO(sess, err)
 }
 
 func (d *Daemon) fetchManifest(ctx context.Context, sess *peer.Session) ([]index.ManifestEntry, error) {

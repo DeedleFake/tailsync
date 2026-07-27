@@ -13,10 +13,11 @@ import (
 )
 
 // Protocol version negotiated in Hello (connection-scoped only).
-// v1: persistent QUIC peer connections; Hello once per connection; application
-// streams start with the op type (notify, manifest_req, file_req, …) without a
-// per-stream Hello. Pull-oriented (writers wake peers with TypeNotify).
-const Version = 1
+// v2: connection-scoped Hello + AlreadyConnected; one-off op streams without
+// per-stream Hello; Ping handled on the session accept path. Wire-incompatible
+// with v1 (session model and stream framing assumptions differ).
+// v1: early stream-per-op Hello experiments (no longer supported).
+const Version = 2
 
 // MaxMessageSize caps a single framed message (headers + payload).
 const MaxMessageSize = 64 << 20 // 64 MiB

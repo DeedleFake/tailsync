@@ -49,7 +49,7 @@ func managerTLS(t *testing.T) *tls.Config {
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{quicALPN},
+		NextProtos:   []string{ALPN},
 		MinVersion:   tls.VersionTLS13,
 	}
 }
@@ -58,7 +58,7 @@ func TestManagerPersistentSessionAndStream(t *testing.T) {
 	serverTLS := managerTLS(t)
 	clientTLS := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{quicALPN},
+		NextProtos:         []string{ALPN},
 		MinVersion:         tls.VersionTLS13,
 	}
 
@@ -91,13 +91,9 @@ func TestManagerPersistentSessionAndStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ma.OnStream = func(ctx context.Context, s *Session, stream net.Conn) {
+	ma.OnStream = func(ctx context.Context, s *Session, first proto.Message, stream net.Conn) {
 		defer stream.Close()
-		msg, err := proto.Decode(stream)
-		if err != nil {
-			return
-		}
-		if msg.Header.Type == proto.TypeNotify {
+		if first.Header.Type == proto.TypeNotify {
 			_ = proto.Encode(stream, proto.NewNotifyOK("node-a", portA))
 		}
 	}
@@ -120,13 +116,9 @@ func TestManagerPersistentSessionAndStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mb.OnStream = func(ctx context.Context, s *Session, stream net.Conn) {
+	mb.OnStream = func(ctx context.Context, s *Session, first proto.Message, stream net.Conn) {
 		defer stream.Close()
-		msg, err := proto.Decode(stream)
-		if err != nil {
-			return
-		}
-		if msg.Header.Type == proto.TypeNotify {
+		if first.Header.Type == proto.TypeNotify {
 			_ = proto.Encode(stream, proto.NewNotifyOK("node-b", portB))
 		}
 	}
@@ -196,6 +188,41 @@ func TestManagerPersistentSessionAndStream(t *testing.T) {
 	}
 	_, _ = proto.Decode(stream2)
 	_ = stream2.Close()
+}
+
+// TestActivateIfCurrentRejectsNonCurrent covers the post-Install race path:
+// activate must not report success for a session that is no longer roster current.
+func TestActivateIfCurrentRejectsNonCurrent(t *testing.T) {
+	r := NewRoster()
+	m := &Manager{
+		roster: r,
+		log:    nil,
+		cfg: Config{
+			HeartbeatInterval: time.Hour,
+			HeartbeatTimeout:  time.Second,
+		},
+		ctx: context.Background(),
+	}
+	s1 := newSession(SessionConfig{NodeID: "b", LocalID: "a", Dialer: true})
+	s2 := newSession(SessionConfig{NodeID: "b", LocalID: "a", Dialer: true})
+	if res, _ := r.Install(s1); res != installAccepted {
+		t.Fatal("install s1")
+	}
+	s1.markUnhealthy()
+	res, old := r.Install(s2)
+	if res != installReplaced || old != s1 {
+		t.Fatalf("replace: res=%v old=%v", res, old)
+	}
+	if m.activateIfCurrent(context.Background(), s1) {
+		t.Fatal("must reject non-current session")
+	}
+	if !s1.Closed() {
+		t.Fatal("discard should close non-current")
+	}
+	// Winner remains current and not closed by discard of loser.
+	if r.Get("b") != s2 {
+		t.Fatal("s2 should remain current")
+	}
 }
 
 func itoa(n int) string {

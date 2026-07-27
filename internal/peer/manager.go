@@ -33,8 +33,8 @@ type Manager struct {
 	VerifyRemoteID func(ctx context.Context, remoteAddr, claimedNodeID string) error
 
 	// OnStream is invoked for each inbound application stream after the first
-	// message has been framed for re-read (Ping is handled internally).
-	OnStream func(ctx context.Context, s *Session, stream net.Conn)
+	// message has been decoded (Ping is handled internally).
+	OnStream StreamHandler
 
 	// OnPeerUp is called after a session is installed (inbound or outbound).
 	OnPeerUp func(s *Session)
@@ -102,7 +102,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		roster:   r,
 		log:      cfg.Logger,
 	}
-	m.disc = newDiscovery(ep, r, DiscoveryConfig{
+	m.disc = newDiscovery(r, DiscoveryConfig{
 		Concurrency:      cfg.DiscoveryConcurrency,
 		Interval:         cfg.DiscoveryInterval,
 		DialTimeout:      cfg.DialTimeout,
@@ -211,8 +211,7 @@ func (m *Manager) handleInbound(ctx context.Context, qconn *quic.Conn) {
 		}
 		// Healthy existing: allow only if this inbound is preferred (remote is
 		// the preferred dialer — they dialed us and remoteID < localID).
-		preferredDialer := min(m.cfg.NodeID, remoteID)
-		return preferredDialer == remoteID
+		return PreferredDialer(m.cfg.NodeID, remoteID) == remoteID
 	}
 
 	verify := func(ctx context.Context, remoteID string) error {
@@ -245,24 +244,7 @@ func (m *Manager) handleInbound(ctx context.Context, qconn *quic.Conn) {
 		OnClose: m.onSessionClose,
 	})
 
-	result, old := m.roster.Install(sess)
-	if result == installRejected {
-		m.log.Debug("inbound install rejected", "peer", remoteID)
-		// Not in roster: tear down without onClose (would remove wrong entry).
-		sess.setOnClose(nil)
-		sess.Close()
-		return
-	}
-	if old != nil {
-		// Install already swapped the map entry; discard previous session.
-		old.setOnClose(nil)
-		old.Close()
-		if m.OnPeerDown != nil {
-			m.OnPeerDown(old.NodeID(), old.Addr())
-		}
-	}
-
-	if !m.activateIfCurrent(ctx, sess) {
+	if err := m.installAndActivate(ctx, sess); err != nil {
 		return
 	}
 	m.log.Info("peer connected", "peer", remoteID, "addr", addr, "dir", "inbound")
@@ -336,31 +318,40 @@ func (m *Manager) dialAndInstall(ctx context.Context, c Candidate) error {
 		OnClose: m.onSessionClose,
 	})
 
+	// installAndActivate closes sess (and thus qconn) on reject/race; clear ownership.
+	ownConn = false
+	if err := m.installAndActivate(ctx, sess); err != nil {
+		return fmt.Errorf("%w: %w", ErrDial, err)
+	}
+	m.disc.ClearBackoff(c.Addr)
+	m.log.Info("peer connected", "peer", remoteID, "addr", addr, "dir", "outbound")
+	if m.OnPeerUp != nil {
+		m.OnPeerUp(sess)
+	}
+	return nil
+}
+
+// installAndActivate installs sess into the roster, tears down any replaced
+// session, and starts serve/heartbeat only if sess is still the roster entry.
+// On reject or lost race, sess is closed without roster onClose.
+func (m *Manager) installAndActivate(ctx context.Context, sess *Session) error {
 	result, old := m.roster.Install(sess)
 	if result == installRejected {
-		// Session not installed: Close tears down qconn once; clear ownership.
+		// Not in roster: tear down without onClose (would remove wrong entry).
 		sess.setOnClose(nil)
 		sess.Close()
-		ownConn = false
-		return fmt.Errorf("%w: %w", ErrDial, errAlreadyConnected)
+		return errAlreadyConnected
 	}
-	// Session owns the connection from here (including replace of old).
-	ownConn = false
 	if old != nil {
+		// Install already swapped the map entry; discard previous session.
 		old.setOnClose(nil)
 		old.Close()
 		if m.OnPeerDown != nil {
 			m.OnPeerDown(old.NodeID(), old.Addr())
 		}
 	}
-
 	if !m.activateIfCurrent(ctx, sess) {
-		return fmt.Errorf("%w: session replaced during activate", ErrDial)
-	}
-	m.disc.ClearBackoff(c.Addr)
-	m.log.Info("peer connected", "peer", remoteID, "addr", addr, "dir", "outbound")
-	if m.OnPeerUp != nil {
-		m.OnPeerUp(sess)
+		return fmt.Errorf("session replaced during activate")
 	}
 	return nil
 }
@@ -387,11 +378,11 @@ func (m *Manager) dialQUIC(ctx context.Context, addr string) (*quic.Conn, error)
 
 // activateIfCurrent starts serve/heartbeat only if sess is still the roster
 // entry (another install may have won the race after our Install returned).
+// Re-checks after starting loops so a concurrent Install that replaced/closed
+// sess cannot leave installAndActivate reporting success for a dead session.
 func (m *Manager) activateIfCurrent(ctx context.Context, sess *Session) bool {
-	if m.roster.Get(sess.NodeID()) != sess {
-		// Lost race after Install; discard without roster onClose.
-		sess.setOnClose(nil)
-		sess.Close()
+	if !m.stillCurrent(sess) {
+		m.discardSession(sess)
 		return false
 	}
 	m.mu.Lock()
@@ -401,15 +392,32 @@ func (m *Manager) activateIfCurrent(ctx context.Context, sess *Session) bool {
 		runCtx = ctx
 	}
 	if runCtx.Err() != nil || sess.Closed() {
-		sess.setOnClose(nil)
-		// Remove if still current so we do not leave a closed session in roster.
-		m.roster.RemoveIfCurrent(sess)
-		sess.Close()
+		m.discardSession(sess)
 		return false
 	}
 	sess.startServe(runCtx, m.OnStream)
 	sess.startHeartbeat(runCtx, m.cfg.HeartbeatInterval, m.cfg.HeartbeatTimeout)
+	// Window after startServe: another Install may have cleared onClose, swapped
+	// the roster entry, and Closed this session. Do not report success then.
+	if !m.stillCurrent(sess) || sess.Closed() {
+		m.discardSession(sess)
+		return false
+	}
 	return true
+}
+
+// stillCurrent reports whether sess is the live roster entry for its node ID.
+func (m *Manager) stillCurrent(sess *Session) bool {
+	return m.roster.Get(sess.NodeID()) == sess
+}
+
+// discardSession drops sess without firing roster onClose (not the current
+// entry, or lost activate race). Removes if still mapped so a closed session
+// cannot linger in the roster.
+func (m *Manager) discardSession(sess *Session) {
+	sess.setOnClose(nil)
+	m.roster.RemoveIfCurrent(sess)
+	sess.Close()
 }
 
 func (m *Manager) onSessionClose(sess *Session) {

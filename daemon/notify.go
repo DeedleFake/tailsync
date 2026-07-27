@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -235,6 +234,9 @@ func (d *Daemon) scheduleNotify(ctx context.Context, hints []index.ManifestEntry
 }
 
 // notifySession opens a stream on an established session and sends TypeNotify.
+// OpenStream hard failures Invalidate inside peer.Session; mid-stream Encode
+// failures Invalidate here so a half-dead session is not left until heartbeat.
+// Soft open/timeout (15s) remains non-fatal for the session.
 func (d *Daemon) notifySession(ctx context.Context, sess *peer.Session, hints []index.ManifestEntry) error {
 	if sess == nil || sess.Closed() {
 		return net.ErrClosed
@@ -243,15 +245,18 @@ func (d *Daemon) notifySession(ctx context.Context, sess *peer.Session, hints []
 	defer cancel()
 	conn, err := sess.OpenStream(nctx)
 	if err != nil {
+		// OpenStream already applied soft-vs-hard Invalidate policy.
 		return err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	if err := proto.Encode(conn, proto.NewNotify(d.nodeID, d.cfg.Port, hints)); err != nil {
+		d.invalidateSessionOnHardIO(sess, err)
 		return err
 	}
-	// Optional NotifyOK; ignore errors (peer may just close).
+	// Optional NotifyOK; ignore errors (peer may just close without ack).
+	// Do not Invalidate on missing/failed ack — notify is best-effort.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	ack, err := proto.Decode(conn)
 	if err == nil && ack.Header.Type == proto.TypeNotifyOK {
@@ -261,13 +266,9 @@ func (d *Daemon) notifySession(ctx context.Context, sess *peer.Session, hints []
 }
 
 // onNotify handles an inbound TypeNotify: content-dedupe, schedule a pull.
-// Never commits index state from notify hints.
-// remotePort is the peer's advertised listen port from Notify (0 = unused).
-func (d *Daemon) onNotify(remoteNode, remoteAddr string, remotePort int, hints []index.ManifestEntry) {
-	_ = remoteAddr
-	_ = remotePort
-	// Session membership is owned by the peer roster (already connected).
-
+// Never commits index state from notify hints. Session membership is owned by
+// the peer roster (the sender is already connected).
+func (d *Daemon) onNotify(remoteNode string, hints []index.ManifestEntry) {
 	// If no hinted version would win LWW (including meta-only UpdatedAt/mode/mtime),
 	// ignore (no pull, no re-notify).
 	if len(hints) > 0 && d.alreadyHaveAll(hints) {
@@ -277,24 +278,6 @@ func (d *Daemon) onNotify(remoteNode, remoteAddr string, remotePort int, hints [
 	}
 
 	d.requestPull()
-}
-
-// dialBackAddr builds host:port for re-dialing a peer from an accepted connection.
-// advertisedPort is the peer's listen port from Hello (preferred); if zero, uses
-// localDefault only when it is the shared mesh port convention.
-func dialBackAddr(remoteAddr string, advertisedPort, localDefault int) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil || host == "" {
-		return ""
-	}
-	port := advertisedPort
-	if port <= 0 {
-		port = localDefault
-	}
-	if port <= 0 {
-		return ""
-	}
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
 }
 
 // alreadyHaveAll reports whether every hint is fully covered by the local index

@@ -31,7 +31,7 @@ func TestDiscoverySemaphoreReleasedBeforeBackoff(t *testing.T) {
 	block := make(chan struct{})
 	firstStarted := make(chan struct{})
 
-	d := newDiscovery(nil, roster, DiscoveryConfig{
+	d := newDiscovery(roster, DiscoveryConfig{
 		Concurrency: 1, // single in-flight slot
 		Interval:    time.Hour,
 		DialTimeout: time.Second,
@@ -86,7 +86,7 @@ func TestDiscoverySkipsConnected(t *testing.T) {
 	roster.Install(s)
 
 	var dials atomic.Int32
-	d := newDiscovery(nil, roster, DiscoveryConfig{
+	d := newDiscovery(roster, DiscoveryConfig{
 		Concurrency: 4,
 		Candidates: func(ctx context.Context) []Candidate {
 			return []Candidate{{Addr: "127.0.0.1:9"}, {Addr: "127.0.0.1:10"}}
@@ -103,7 +103,7 @@ func TestDiscoverySkipsConnected(t *testing.T) {
 }
 
 func TestDiscoveryNeverPermanentBan(t *testing.T) {
-	d := newDiscovery(nil, NewRoster(), DiscoveryConfig{})
+	d := newDiscovery(NewRoster(), DiscoveryConfig{})
 	for range 20 {
 		d.softFail("x:1")
 	}
@@ -113,13 +113,18 @@ func TestDiscoveryNeverPermanentBan(t *testing.T) {
 	ab.until = time.Now().Add(-time.Second)
 	d.backoff["x:1"] = ab
 	d.mu.Unlock()
-	if d.shouldSkip("x:1") {
+	if d.InBackoff("x:1") {
 		t.Fatal("expired backoff must allow re-dial")
 	}
+	// tryBeginDial should succeed after expiry.
+	if !d.tryBeginDial("x:1") {
+		t.Fatal("expired backoff must allow tryBeginDial")
+	}
+	d.endDial("x:1")
 }
 
 func TestDiscoveryKickNonBlocking(t *testing.T) {
-	d := newDiscovery(nil, NewRoster(), DiscoveryConfig{
+	d := newDiscovery(NewRoster(), DiscoveryConfig{
 		Candidates: func(ctx context.Context) []Candidate { return nil },
 		DialPeer:   func(ctx context.Context, c Candidate) error { return nil },
 	})
@@ -144,7 +149,7 @@ func TestDiscoveryTickSingleFlight(t *testing.T) {
 	block := make(chan struct{})
 	started := make(chan struct{})
 
-	d := newDiscovery(nil, NewRoster(), DiscoveryConfig{
+	d := newDiscovery(NewRoster(), DiscoveryConfig{
 		Concurrency: 4,
 		Candidates: func(ctx context.Context) []Candidate {
 			return []Candidate{{Addr: "a:1"}}
