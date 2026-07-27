@@ -95,13 +95,11 @@ func isMullvadPeer(p *ipnstate.PeerStatus) bool {
 // peersFromStatus returns dial addresses (host:port) for online peers excluding self.
 // Prefers the first Tailscale IP for reliable dialing with the host net stack
 // (does not depend on MagicDNS); falls back to MagicDNS when no IP is known.
-// When serviceName is non-empty, only peers whose HostName or DNSName contains
-// that substring (case-insensitive) are included.
 // Mullvad VPN exit nodes (tag:mullvad-exit-node) are always skipped.
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
-func peersFromStatus(st *ipnstate.Status, port int, serviceName string) []string {
+func peersFromStatus(st *ipnstate.Status, port int) []string {
 	if st == nil {
 		return nil
 	}
@@ -113,7 +111,6 @@ func peersFromStatus(st *ipnstate.Status, port int, serviceName string) []string
 		selfID = string(st.Self.ID)
 		selfDNS = strings.TrimSuffix(st.Self.DNSName, ".")
 	}
-	svc := strings.ToLower(serviceName)
 	portStr := strconv.Itoa(port)
 	var addrs []string
 	for _, p := range st.Peer {
@@ -141,14 +138,6 @@ func peersFromStatus(st *ipnstate.Status, port int, serviceName string) []string
 		// Skip ourselves by MagicDNS when present (StableID is primary).
 		if selfDNS != "" && dns != "" {
 			if strings.EqualFold(dns, selfDNS) || strings.HasPrefix(strings.ToLower(dns), strings.ToLower(selfDNS)+".") {
-				continue
-			}
-		}
-		if svc != "" {
-			hn := strings.ToLower(p.HostName)
-			dn := strings.ToLower(dns)
-			// Filter on hostname/DNS labels, not the dial target (which may be an IP).
-			if !strings.Contains(hn, svc) && !strings.Contains(dn, svc) {
 				continue
 			}
 		}
@@ -612,7 +601,7 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		// Also skip by configured tsnet hostname (Self may use a different DNS form).
-		addrs := peersFromStatus(st, d.cfg.Port, d.cfg.ServiceName)
+		addrs := peersFromStatus(st, d.cfg.Port)
 		return filterSelfHostname(addrs, d.cfg.Hostname), nil
 	default: // host
 		lc := d.local
@@ -623,6 +612,6 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return peersFromStatus(st, d.cfg.Port, d.cfg.ServiceName), nil
+		return peersFromStatus(st, d.cfg.Port), nil
 	}
 }

@@ -19,7 +19,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"tailscale.com/client/local"
@@ -63,9 +62,6 @@ const (
 	// set cannot open unbounded streams per local change. Fan-out is still
 	// fire-and-forget w.r.t. the main loop (no batch Wait).
 	maxParallelNotifies = 16
-	// manyPeersWarnThreshold is how many discovered peers trigger a one-time
-	// recommendation for -service (or test -peers) when discovery is unfiltered.
-	manyPeersWarnThreshold = 8
 )
 
 // Config holds daemon configuration.
@@ -81,13 +77,6 @@ type Config struct {
 	//     StableID); any configured value is ignored for protocol identity.
 	//   - NetModePlain: wire-protocol node id when set.
 	Hostname string
-	// ServiceName, when non-empty, filters discovered peers to those whose
-	// HostName or DNSName contains this substring (not a path prefix).
-	// Empty means dial all online tailnet peers except self. On large tailnets
-	// that dials phones, TVs, and other nodes not running tailsync; prefer
-	// setting this or Peers so outbound sync does not waste time on them.
-	// Ignored when Peers is set.
-	ServiceName string
 	// Port is the UDP port for QUIC peer sessions over the tailnet (or localhost in plain mode).
 	Port int
 	// AuthKey is an optional Tailscale auth key for NetModeTSNet
@@ -133,9 +122,10 @@ type Config struct {
 	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port) for tests
-	// and overrides. When empty, discovery uses Tailscale status Online peers.
-	// Prefer ServiceName on large tailnets; Peers is not the recommended
-	// production path. When set, status discovery is skipped (test determinism).
+	// and overrides. When empty, discovery uses Tailscale status Online peers
+	// (minus self and Mullvad exit nodes). When set, status discovery is skipped
+	// (test determinism). Soft dial failures and backoff handle nodes that are
+	// Online but not running tailsync.
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
@@ -226,13 +216,6 @@ type Daemon struct {
 	// Touched only while holding syncMu.
 	appliesSinceSave int
 
-	// manyPeersWarned is set after the soft unfiltered-discovery Warn (count >
-	// manyPeersWarnThreshold but still dialing). Separate from refuseWarned.
-	manyPeersWarned atomic.Bool
-	// refuseWarned is set after the fail-closed unfiltered discovery refuse log
-	// (count > maxUnfilteredDiscoveryPeers).
-	refuseWarned atomic.Bool
-
 	// pullSem limits concurrent content pull streams across peers.
 	pullSem chan struct{}
 	// serveSem limits concurrent inbound serve ops (manifest/file/delta).
@@ -303,7 +286,6 @@ func New(cfg Config) (*Daemon, error) {
 			cfg.Hostname = host
 		}
 	}
-	// ServiceName stays empty by default: discover all online peers.
 	if cfg.Port == 0 {
 		cfg.Port = DefaultPort
 	}

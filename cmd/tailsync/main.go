@@ -19,7 +19,6 @@ func main() {
 		dir           = flag.String("dir", "", "directory to synchronize (required)")
 		stateDir      = flag.String("state", "", "state directory for index (and tsnet state when -tsnet); default: <dir>/.tailsync")
 		hostname      = flag.String("hostname", "", "tsnet hostname when -tsnet (default: tailsync-<os-hostname>); ignored for protocol identity in host mode")
-		service       = flag.String("service", "", "discovery filter: only dial hosts whose name contains this substring; empty uses hot set + all online peers (prefer -service on large tailnets)")
 		port          = flag.Int("port", daemon.DefaultPort, "UDP port for QUIC peer sessions on the tailnet (or localhost with -plain)")
 		authKey       = flag.String("authkey", "", "Tailscale auth key for -tsnet (or set TS_AUTHKEY); unused in host mode")
 		scanEvery     = flag.Duration("scan-interval", daemon.DefaultScanInterval, "safety-net full rescan period (FS watch handles most local edits)")
@@ -83,7 +82,6 @@ func main() {
 		Dir:           *dir,
 		StateDir:      *stateDir,
 		Hostname:      *hostname,
-		ServiceName:   *service,
 		Port:          *port,
 		AuthKey:       auth,
 		ScanInterval:  *scanEvery,

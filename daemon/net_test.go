@@ -103,7 +103,7 @@ func TestPeersFromStatus(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960, "")
+	got := peersFromStatus(st, 5960)
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":            true, // prefers IP over MagicDNS
 		"laptop.tailnet.ts.net:5960": true, // DNS fallback when no IP
@@ -116,12 +116,6 @@ func TestPeersFromStatus(t *testing.T) {
 		if !wantSet[a] {
 			t.Errorf("unexpected addr %q", a)
 		}
-	}
-
-	// Service filter matches HostName/DNS, not dial IP.
-	got = peersFromStatus(st, 5960, "tailsync")
-	if len(got) != 1 || got[0] != "100.64.0.2:5960" {
-		t.Fatalf("service filter: %v", got)
 	}
 }
 
@@ -170,7 +164,7 @@ func TestPeersFromStatusSkipsMullvad(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960, "")
+	got := peersFromStatus(st, 5960)
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
 		"100.64.0.60:5960": true,

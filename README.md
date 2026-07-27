@@ -55,10 +55,9 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-dir` | (required) | Directory to synchronize |
 | `-state` | `<dir>/.tailsync` | Index directory (also holds tsnet state when `-tsnet`) |
 | `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname; in host mode, identity comes from LocalAPI |
-| `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; **empty discovery may dial all online peers** (see [Peer discovery](#peer-discovery)) |
 | `-port` | `5960` | UDP port for QUIC peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
-| `-peers` | (discover) | Comma-separated `host:port` peers (**test/override only**; skips status discovery). Prefer hot set + `-service` in production |
+| `-peers` | (discover) | Comma-separated `host:port` peers (**test/override only**; skips status discovery) |
 | `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer **pull** period (local changes notify; peers pull on notify or this interval) |
 | `-watch-debounce` | `1s` | Debounce wait after FS events before reconcile (`0` = default) |
@@ -83,20 +82,14 @@ Discovery is a **background service** that builds a roster of persistent peer se
 
 Once connected, each peer has **at most one** QUIC connection. Hello is **connection-scoped** (not per stream). Application ops (notify, manifest, file, delta, ping) open short-lived streams on that connection. Redundant connections are rejected with `already_connected`; simultaneous dial races pick a deterministic winner by node ID. Unhealthy sessions (failed heartbeats) are replaced and re-discovered with exponential backoff (**never permanently banned**). Discovery dials use an in-flight concurrency semaphore (default 32) that is released **before** backoff sleep so other peers can still dial.
 
-Notify and pull use the **connected roster** only (no one-shot dial-per-op). Pull content streams are capped globally (default 8). Offline (status) peers are not dialed. Soft dial failures during discovery are expected on large tailnets and do not block writers.
+Notify and pull use the **connected roster** only (no one-shot dial-per-op). Pull content streams are capped globally (default 8). Offline (status) peers are not dialed.
 
-With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Prefer:
-
-- **`-service <substring>`** to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`), or
-- **`-peers host:port,...`** only for local tests / explicit overrides (not the recommended production path).
+With empty `-peers`, discovery may attempt **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures and exponential backoff are expected; they do not block writers. **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Use **`-peers host:port,...`** only for local tests / explicit overrides.
 
 ```bash
 # two machines (each uses its host Tailscale identity; zero-config mesh)
 tailsync -dir ~/shared   # machine a
 tailsync -dir ~/shared   # machine b
-
-# filter discovery on a large tailnet
-tailsync -dir ~/shared -service tailsync
 ```
 
 ### Embedded tsnet
@@ -146,7 +139,7 @@ The public Go package [`deedles.dev/tailsync/daemon`](https://pkg.go.dev/deedles
 
 | Go | Role |
 |----|------|
-| `daemon.Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, `ServiceName`, intervals, `DisableWatch`, `BlockSize`, `DialTimeout`, `DiscoveryConcurrency`, `PullStreamConcurrency`, `HeartbeatInterval`, `TombstoneTTL`, `NetMode`, `Logger`, `OnReady`, `OnAuthURL`, … |
+| `daemon.Config` | Settings: `Dir`, `StateDir`, `Hostname`, `AuthKey`, `Port`, `Peers`, intervals, `DisableWatch`, `BlockSize`, `DialTimeout`, `DiscoveryConcurrency`, `PullStreamConcurrency`, `HeartbeatInterval`, `TombstoneTTL`, `NetMode`, `Logger`, `OnReady`, `OnAuthURL`, … |
 | `daemon.New(cfg)` | Validates config and returns a stopped `*Daemon` (does not start networking) |
 | `(*Daemon).Run(ctx)` | Brings up networking and runs until `ctx` is canceled or a fatal error |
 | `(*Daemon).InjectNetworkChange()` | After host connectivity updates in **tsnet** mode, inject a netmon event (no-op if not running / not yet installed) |
