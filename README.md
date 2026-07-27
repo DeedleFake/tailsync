@@ -6,7 +6,7 @@ Synchronize a directory between your Tailscale machines.
 
 > **Warning:** tailsync is **alpha** software. The protocol, on-disk index format, flags, and APIs may change without compatibility guarantees. Do not rely on it as the sole copy of important data; keep independent backups.
 
-tailsync is a small daemon that runs on each machine. Instances discover each other on your tailnet (or via an explicit peer list), exchange file manifests, and pull missing or updated files. Transfers use rsync-style block signatures so only changed regions are sent when a local basis exists. A persistent local index records known file state so deletions made while the daemon was stopped are still detected and propagated.
+tailsync is a small daemon that runs on each machine. Instances discover each other on your tailnet, wake peers with best-effort **notifies**, and **pull** missing or updated files (pull is authoritative; notify is optional wake-up). Transfers use rsync-style block signatures so only changed regions are sent when a local basis exists. A persistent local index records known file state so deletions made while the daemon was stopped are still detected and propagated.
 
 ## Install
 
@@ -30,9 +30,10 @@ tailsync -dir /path/to/shared
 
 By default, tailsync uses the system **`tailscaled`** (LocalAPI). It does not register a separate machine in the Tailscale admin console; it is just a process on the existing node. It listens on TCP port `5960` on the host’s Tailscale IP(s) and:
 
-1. Watches the sync directory for filesystem events (debounced), with a periodic full rescan as a safety net, and reconciles against the on-disk index (adds, modifies, and offline deletions).
-2. When local index content changes, opens an immediate **bidirectional** peer session (both sides pull on one connection, coalesced); a periodic sync interval remains as catch-up for offline peers.
-3. Merges remote manifests using last-writer-wins on `updated_at`.
+1. Watches the sync directory for filesystem events (debounced, default 1 s), with a periodic full rescan as a safety net, and reconciles against the on-disk index (adds, modifies, and offline deletions).
+2. When local index content changes, fans out concurrent **best-effort notifies** to candidates (in-memory hot set + status Online peers). Dead peers cannot stall the writer.
+3. On notify (or on the pull interval / bootstrap), each node **pulls** manifests and content from candidates. Notify never commits state; the pull-time manifest (LWW) is truth.
+4. Merges remote manifests using last-writer-wins on `updated_at`.
 
 Keep host clocks roughly in sync (NTP). Conflict resolution uses wall-clock `updated_at`; equal-timestamp ties use a stable total order (deletion preference, then content hash, mode, then mtime).
 
@@ -53,12 +54,12 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 | `-dir` | (required) | Directory to synchronize |
 | `-state` | `<dir>/.tailsync` | Index directory (also holds tsnet state when `-tsnet`) |
 | `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname; in host mode, identity comes from LocalAPI |
-| `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; **empty discovery dials all online peers** (see [Peer discovery](#peer-discovery)) |
+| `-service` | (empty) | Only dial peers whose hostname or DNS name contains this substring; **empty discovery may dial all online peers** (see [Peer discovery](#peer-discovery)) |
 | `-port` | `5960` | TCP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
-| `-peers` | (discover) | Comma-separated `host:port` peers (skips discovery). Prefer this or `-service` when the tailnet has devices not running tailsync |
+| `-peers` | (discover) | Comma-separated `host:port` peers (**test/override only**; skips status discovery). Prefer hot set + `-service` in production |
 | `-scan-interval` | `30s` | Safety-net full rescan period (FS watch handles most local edits) |
-| `-sync-interval` | `45s` | Backup peer sync period (local changes also open a bidirectional session) |
+| `-sync-interval` | `45s` | Backup peer **pull** period (local changes notify; peers pull on notify or this interval) |
 | `-watch-debounce` | `1s` | Debounce wait after FS events before reconcile (`0` = default) |
 | `-no-watch` | `false` | Disable filesystem watching; rely on `-scan-interval` only |
 | `-block-size` | `4096` | Delta block size |
@@ -71,18 +72,28 @@ For regular files, permission bits (`mode`) and modification time (`mtime`) are 
 
 ### Peer discovery
 
-With host or tsnet mode and no `-peers` list, tailsync dials online tailnet peers on `-port` each sync interval, using Tailscale IPs from status (falling back to MagicDNS when needed). By default that includes **every** online peer—phones, TVs, unrelated servers—not only machines running tailsync. That is fine on a small personal tailnet, but nodes that are online and not listening for tailsync still consume a dial attempt each batch (capped by `-dial-timeout`, default 5s) and can delay outbound sync until those dials finish. Inbound connections still work in that case (e.g. phone→PC succeeds while PC→phone waits), so prefer:
+Membership is **memory-only** (not persisted):
 
-- `-peers host:port,...` to pin exact addresses and skip discovery (recommended when only a few machines sync), or
-- `-service <substring>` to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`).
+| Source | Role |
+|--------|------|
+| **Hot set** | After a successful Hello (notify or pull), remember `nodeID → addr` for fast re-dial |
+| **Status Online** | Bootstrap from Tailscale status (IPs preferred; MagicDNS fallback) |
+| **`-peers`** | Test/override pin only; when set, status discovery is skipped |
+
+Candidates for notify and pull are the hot set union status Online peers (plus `-peers` when set). Soft-fail (timeout/refused) applies **per dial address** to hot-set and status-discovered candidates with exponential backoff, but **never permanently bans**; after backoff expires, status Online and successful Hello reintroduce the peer. Explicit `-peers` pins always re-dial each batch (test/override). Offline (status) peers are skipped when possible.
+
+With empty `-peers` and empty `-service`, discovery may include **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures are expected and do not block writers (notifies are fire-and-forget; pulls are capped). Prefer:
+
+- **`-service <substring>`** to only dial hosts whose Tailscale hostname or DNS name contains that string (for example `-service tailsync` with tsnet names like `tailsync-*`), or
+- **`-peers host:port,...`** only for local tests / explicit overrides (not the recommended production path).
 
 ```bash
-# two machines (each uses its host Tailscale identity)
+# two machines (each uses its host Tailscale identity; zero-config mesh)
 tailsync -dir ~/shared   # machine a
 tailsync -dir ~/shared   # machine b
 
-# pin peers explicitly (avoids dialing the rest of the tailnet)
-tailsync -dir ~/shared -peers other-host:5960,100.x.y.z:5960
+# filter discovery on a large tailnet
+tailsync -dir ~/shared -service tailsync
 ```
 
 ### Embedded tsnet
@@ -111,14 +122,15 @@ TAILSYNC_TESTING=1 tailsync -plain -dir /tmp/sync-b -state /tmp/state-b -port 59
 - **Index** — JSON under `-state` with size, mtime, mode, content SHA-256, and deletion tombstones (GC’d after 30 days by default). After a tombstone is dropped, a lagging peer that never saw the delete can re-introduce the file; keep the TTL longer than the maximum expected peer offline window.
 - **FS watch + debounce** — Local edits are detected via recursive filesystem events (debounced, default 1 s), then reconciled. Paths under `.tailsync` / `.tailsync-*` are ignored. If watching fails to start (unsupported platform/permissions), tailsync logs a warning and falls back to timer-only scanning.
 - **Scan** — Walks regular files only; live index entries missing on disk become tombstones (offline deletion). Empty directories and symlinks are not synced. `-scan-interval` remains a full safety-net rescan when watch is active.
-- **Sync-on-change** — When reconcile applies peer-visible local index changes, a coalesced bidirectional peer session is opened: the dialer pulls the peer’s manifest, then the peer reverse-pulls the dialer’s, so a local write is delivered without waiting for the peer’s `-sync-interval`. That interval remains backup/catch-up for offline peers. End-to-end lag is typically on the order of watch debounce plus one dial/RTT (not a full sync interval).
+- **Notify + pull** — Local peer-visible index changes fan out concurrent best-effort **notifies** (soft hints: path/hash/`updated_at`; not final bytes). Receivers schedule a **pull**; the pull-time manifest and LWW apply are authoritative. After a successful pull, optional **infect-and-die** notifies only newly acquired content ids. Content-identity dedupe avoids notify storms (already-have → ignore; no re-notify loop).
+- **Catch-up** — `-sync-interval` pull (and inbound serve) recovers missed notifies and offline peers. Late joiners dial out and pull. Writers are not blocked waiting on dead peers.
 - **Hash fast path** — Reuses the stored SHA-256 when size and mtime still match the index. Silent content rewrites that preserve mtime are not detected until another field changes.
 - **Delta** — Adler-style rolling weak checksums and MD5 strong match per block; full-file SHA-256 is authoritative after apply. Whole-file buffers are used for transfers (default max 64 MiB per file).
-- **Concurrency** — Local reconcile and peer apply share one mutex, including during network transfers (correctness over throughput; a slow peer can delay scans).
-- **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single TCP session.
+- **Concurrency** — Notify fan-out is high-parallelism with no batch barrier on the main loop. Pulls use a separate memory-aware concurrency cap. Local reconcile and peer apply commits share one mutex; network transfer for a content apply runs unlocked (re-LWW on commit).
+- **Protocol** — Length-prefixed JSON headers with optional binary payloads over a single TCP session (`hello`, `notify`, manifest/file/delta, `sync_done`). Wire version **2** is pull-oriented (no reverse-pull) and includes notify. **v2 is a breaking change:** Hello rejects other non-zero versions, so mixed v1/v2 meshes are unsupported—upgrade all nodes together.
 - **Conflicts** — Last-writer-wins on `updated_at`; equal clocks use a stable total order (deletion, hash, mode, mtime) so peers converge.
 - **Metadata** — Mode and mtime are synchronized end-to-end; peers adopt metadata when the same content hash wins LWW.
-- **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`), discovers peers via LocalAPI status, and dials with the host network stack (routed by `tailscaled`).
+- **Networking** — Host mode binds only to Tailscale addresses (not `0.0.0.0`), bootstraps peers via LocalAPI status + hot set, and dials with the host network stack (routed by `tailscaled`).
 - **Sync-tree confinement** — File I/O under `-dir` (scan, serve, apply, deletes) uses Go’s [`os.Root`](https://pkg.go.dev/os#Root) so path traversal and symlink escapes cannot reach outside the sync directory; index/state paths under `-state` are separate trusted local storage. Peer paths under `.tailsync` / `.tailsync-*` are rejected so the default state dir cannot be written via sync. On multi-party tailnets, prefer an explicit `-state` path outside `-dir`.
 
 State directories under the sync tree named `.tailsync` or `.tailsync-*` are ignored by the scanner and cannot be applied from peers.

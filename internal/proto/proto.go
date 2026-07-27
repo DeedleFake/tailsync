@@ -13,7 +13,8 @@ import (
 )
 
 // Protocol version negotiated in Hello.
-const Version = 1
+// v2: pull-oriented sessions (no reverse-pull after SyncDone) and TypeNotify.
+const Version = 2
 
 // MaxMessageSize caps a single framed message (headers + payload).
 const MaxMessageSize = 64 << 20 // 64 MiB
@@ -33,10 +34,17 @@ const (
 	// requested the peer's signature — only TypeDeltaReq is used.)
 	TypeDeltaReq Type = "delta_req"
 	TypeDelta    Type = "delta"
-	// TypeSyncDone ends one pull phase of a bidirectional session. After the
-	// dialer finishes pulling, it sends SyncDone; the listener then pulls from
-	// the dialer and sends SyncDone when finished. Both sides close after that.
+	// TypeSyncDone ends a pull phase. After the dialer finishes pulling, it
+	// sends SyncDone and both sides close (sessions are pull-oriented; writers
+	// wake peers with TypeNotify instead of reverse-pull).
 	TypeSyncDone Type = "sync_done"
+	// TypeNotify is a soft wake-up: the sender has peer-visible index changes.
+	// Payload is optional path/hash/updated_at hints (Header.Entries); never
+	// authoritative bytes. Receiver should schedule a pull; correctness does
+	// not depend on notify delivery.
+	TypeNotify Type = "notify"
+	// TypeNotifyOK acknowledges a notify (optional; dialer may close without it).
+	TypeNotifyOK Type = "notify_ok"
 	TypeError    Type = "error"
 	TypePing     Type = "ping"
 	TypePong     Type = "pong"
@@ -50,10 +58,13 @@ type Header struct {
 	// Common fields (set per type as needed).
 	NodeID  string `json:"node_id,omitempty"`
 	Version int    `json:"version,omitempty"`
-	Path    string `json:"path,omitempty"`
-	Hash    string `json:"hash,omitempty"`
-	Size    int64  `json:"size,omitempty"`
-	Error   string `json:"error,omitempty"`
+	// Port is the sender's tailsync listen port (Hello/HelloOK), used by peers
+	// to build a dial-back address when the TCP remote port is ephemeral.
+	Port  int    `json:"port,omitempty"`
+	Path  string `json:"path,omitempty"`
+	Hash  string `json:"hash,omitempty"`
+	Size  int64  `json:"size,omitempty"`
+	Error string `json:"error,omitempty"`
 	// File metadata for transfers.
 	ModTime   time.Time `json:"mod_time"`
 	Mode      uint32    `json:"mode,omitempty"`
@@ -138,21 +149,23 @@ func Decode(r io.Reader) (Message, error) {
 	return Message{Header: h, Payload: payload}, nil
 }
 
-// NewHello builds a hello message.
-func NewHello(nodeID string) Message {
+// NewHello builds a hello message. port is the sender's listen port for dial-back.
+func NewHello(nodeID string, port int) Message {
 	return Message{Header: Header{
 		Type:    TypeHello,
 		NodeID:  nodeID,
 		Version: Version,
+		Port:    port,
 	}}
 }
 
-// NewHelloOK builds a hello response.
-func NewHelloOK(nodeID string) Message {
+// NewHelloOK builds a hello response. port is the responder's listen port.
+func NewHelloOK(nodeID string, port int) Message {
 	return Message{Header: Header{
 		Type:    TypeHelloOK,
 		NodeID:  nodeID,
 		Version: Version,
+		Port:    port,
 	}}
 }
 
@@ -228,7 +241,29 @@ func NewError(err string) Message {
 	return Message{Header: Header{Type: TypeError, Error: err}}
 }
 
-// NewSyncDone marks the end of a pull phase in a bidirectional session.
+// NewSyncDone marks the end of a pull phase.
 func NewSyncDone() Message {
 	return Message{Header: Header{Type: TypeSyncDone}}
+}
+
+// NewNotify builds a soft wake-up with optional content hints (path/hash/updated_at).
+// Hints are not authoritative; the receiver must pull a manifest to apply state.
+func NewNotify(nodeID string, port int, hints []index.ManifestEntry) Message {
+	return Message{Header: Header{
+		Type:    TypeNotify,
+		NodeID:  nodeID,
+		Version: Version,
+		Port:    port,
+		Entries: hints,
+	}}
+}
+
+// NewNotifyOK acknowledges a notify.
+func NewNotifyOK(nodeID string, port int) Message {
+	return Message{Header: Header{
+		Type:    TypeNotifyOK,
+		NodeID:  nodeID,
+		Version: Version,
+		Port:    port,
+	}}
 }

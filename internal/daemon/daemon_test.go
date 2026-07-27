@@ -329,19 +329,37 @@ func TestRunCancelAcceptLoopRace(t *testing.T) {
 // freePort binds 127.0.0.1:0 and returns the chosen port after closing.
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
+	return freePorts(t, 1)[0]
 }
 
-// TestFSWatchSyncOnChange verifies watch + sync-on-change deliver a post-start
+// freePorts reserves n distinct TCP ports (held open until all are chosen, then
+// closed) so sequential freePort calls cannot collapse to the same port.
+func freePorts(t *testing.T, n int) []int {
+	t.Helper()
+	if n <= 0 {
+		return nil
+	}
+	lns := make([]net.Listener, 0, n)
+	ports := make([]int, 0, n)
+	defer func() {
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
+	}()
+	for range n {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lns = append(lns, ln)
+		ports = append(ports, ln.Addr().(*net.TCPAddr).Port)
+	}
+	return ports
+}
+
+// TestFSWatchSyncOnChange verifies watch + notify+pull deliver a post-start
 // write to a peer when BOTH sides use a very long SyncInterval (and ScanInterval).
-// That only passes with a bidirectional session: A dials after local change and
-// B reverse-pulls A's file without waiting for B's sync ticker.
+// A notifies after local change; B pulls without waiting for B's sync ticker.
 func TestFSWatchSyncOnChange(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
@@ -361,7 +379,7 @@ func TestFSWatchSyncOnChange(t *testing.T) {
 	}
 
 	// Long intervals on both sides: success under 5s proves watch → reconcile →
-	// sync-on-change bidirectional delivery, not peer tickers.
+	// notify → peer pull, not peer tickers.
 	cfgA := daemon.Config{
 		Dir:           dirA,
 		StateDir:      stateA,
@@ -426,7 +444,8 @@ func TestFSWatchSyncOnChange(t *testing.T) {
 }
 
 // TestSyncOnChangeDeliversToPeer asserts that a local write on A reaches B via
-// sync-on-change when both SyncIntervals are hours (B never dials on its ticker).
+// notify+pull when both SyncIntervals are hours (B never dials on its ticker
+// for catch-up; notify schedules B's pull).
 func TestSyncOnChangeDeliversToPeer(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
@@ -439,7 +458,7 @@ func TestSyncOnChangeDeliversToPeer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Barrier: first AfterSyncPeers after OnReady is the initial post-listen sync.
+	// Barrier: first AfterSyncPeers after OnReady is the initial post-listen pull.
 	initialSyncDone := make(chan struct{})
 	var initialOnce sync.Once
 	ready := make(chan struct{})
@@ -464,16 +483,18 @@ func TestSyncOnChangeDeliversToPeer(t *testing.T) {
 		},
 	}
 	cfgB := daemon.Config{
-		Dir:          dirB,
-		StateDir:     stateB,
-		Hostname:     "sync-b",
-		Port:         portB,
-		NetMode:      daemon.NetModePlain,
-		ListenHost:   "127.0.0.1",
-		Peers:        []string{"127.0.0.1:" + strconv.Itoa(portA)},
-		ScanInterval: time.Hour,
-		SyncInterval: time.Hour,
-		DisableWatch: true,
+		Dir:           dirB,
+		StateDir:      stateB,
+		Hostname:      "sync-b",
+		Port:          portB,
+		NetMode:       daemon.NetModePlain,
+		ListenHost:    "127.0.0.1",
+		Peers:         []string{"127.0.0.1:" + strconv.Itoa(portA)},
+		ScanInterval:  time.Hour,
+		SyncInterval:  time.Hour,
+		WatchDebounce: 50 * time.Millisecond,
+		// Watch enabled so B can also notify; delivery still depends on B pulling
+		// after A's notify when SyncInterval is huge.
 	}
 
 	da, err := daemon.New(cfgA)
@@ -507,14 +528,14 @@ func TestSyncOnChangeDeliversToPeer(t *testing.T) {
 	case err := <-errB:
 		t.Fatalf("B exited before initial sync: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for initial syncPeers")
+		t.Fatal("timeout waiting for initial pullPeers")
 	}
 
 	if err := os.WriteFile(filepath.Join(dirA, "kick.txt"), []byte("kick"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// B must receive content via A's sync-on-change reverse-pull phase.
-	waitFile(t, filepath.Join(dirB, "kick.txt"), "kick", 5*time.Second, errA, errB)
+	// B must receive content via A's notify + B's pull (not reverse-pull).
+	waitFile(t, filepath.Join(dirB, "kick.txt"), "kick", 8*time.Second, errA, errB)
 
 	cancel()
 	<-errA

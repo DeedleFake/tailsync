@@ -91,16 +91,16 @@ type Config struct {
 	AuthKey string
 	// Port is the TCP listen/dial port (0 = daemon default).
 	Port int
-	// Peers is a comma-separated list of host:port peers (optional; empty = discovery
-	// of all online tailnet peers — prefer an explicit list when many devices are online).
+	// Peers is a comma-separated list of host:port peers (optional test/override;
+	// empty = in-memory hot set after Hello union status Online discovery).
 	Peers string
 	// ServiceName filters discovered peers by hostname/DNS substring.
-	// Empty with empty Peers dials every online peer; set this or Peers on large tailnets.
+	// Empty with empty Peers may dial every online peer; prefer ServiceName on large tailnets.
 	ServiceName string
 	// ScanIntervalMs is the safety-net full rescan period in milliseconds (0 = default).
 	ScanIntervalMs int64
-	// SyncIntervalMs is the backup peer sync period in milliseconds (0 = default).
-	// Local index changes also open an immediate coalesced bidirectional peer session.
+	// SyncIntervalMs is the backup peer pull period in milliseconds (0 = default).
+	// Local index changes fan out best-effort notifies; peers pull on notify or interval.
 	SyncIntervalMs int64
 	// WatchDebounceMs is the FS-event debounce before reconcile (0 = default).
 	WatchDebounceMs int64

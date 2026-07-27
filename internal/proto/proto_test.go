@@ -59,7 +59,7 @@ func TestManifestMessage(t *testing.T) {
 
 func TestHello(t *testing.T) {
 	var buf bytes.Buffer
-	if err := proto.Encode(&buf, proto.NewHello("node-a")); err != nil {
+	if err := proto.Encode(&buf, proto.NewHello("node-a", 5960)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := proto.Decode(&buf)
@@ -68,6 +68,29 @@ func TestHello(t *testing.T) {
 	}
 	if got.Header.Type != proto.TypeHello || got.Header.NodeID != "node-a" || got.Header.Version != proto.Version {
 		t.Fatalf("%+v", got.Header)
+	}
+	if got.Header.Port != 5960 {
+		t.Fatalf("port %d", got.Header.Port)
+	}
+}
+
+func TestNotifyRoundTrip(t *testing.T) {
+	hints := []index.ManifestEntry{
+		{Path: "a.txt", Hash: "abc", UpdatedAt: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	var buf bytes.Buffer
+	if err := proto.Encode(&buf, proto.NewNotify("node-a", 5960, hints)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := proto.Decode(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Type != proto.TypeNotify || got.Header.NodeID != "node-a" {
+		t.Fatalf("%+v", got.Header)
+	}
+	if len(got.Header.Entries) != 1 || got.Header.Entries[0].Path != "a.txt" {
+		t.Fatalf("entries %+v", got.Header.Entries)
 	}
 }
 

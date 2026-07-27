@@ -33,9 +33,12 @@ func testDaemon(t *testing.T) *Daemon {
 			MaxFileBytes: DefaultMaxFileBytes,
 			BlockSize:    4096,
 		},
-		log:  slog.Default(),
-		idx:  index.New(),
-		root: root,
+		log:        slog.Default(),
+		idx:        index.New(),
+		root:       root,
+		peers:      newPeerMem(),
+		notifySeen: newNotifyTracker(),
+		needPull:   newSignal(),
 	}
 }
 

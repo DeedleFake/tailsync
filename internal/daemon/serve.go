@@ -26,14 +26,13 @@ func (d *Daemon) setConnDeadline(conn net.Conn, ctx context.Context) {
 	_ = conn.SetDeadline(deadline)
 }
 
-// handleConn serves a bidirectional sync session (listener side):
+// handleConn serves an inbound session (listener side):
 //
-//  1. Hello / HelloOK
-//  2. Serve dialer's pull (ManifestReq / FileReq / DeltaReq) until SyncDone
-//  3. Reverse-pull from dialer (ManifestReq → apply)
-//  4. Send SyncDone; close
+//  1. Hello / HelloOK (learn remote into hot set)
+//     2a. TypeNotify → schedule pull, NotifyOK, close
+//     2b. ManifestReq / FileReq / DeltaReq until SyncDone (serve pull), close
 //
-// See syncWith for the dialer-side sequence.
+// Sessions are pull- or notify-oriented; reverse-pull after SyncDone is not used.
 func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	d.setConnDeadline(conn, ctx)
@@ -55,12 +54,18 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	remoteNode := msg.Header.NodeID
-	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID)); err != nil {
+	remotePort := msg.Header.Port
+	if err := proto.Encode(conn, proto.NewHelloOK(d.nodeID, d.cfg.Port)); err != nil {
 		return
 	}
+	// Learn dial-back using peer's advertised listen port (not the ephemeral TCP port).
+	if remoteNode != "" && remoteNode != d.nodeID {
+		if dial := dialBackAddr(remote, remotePort, d.cfg.Port); dial != "" {
+			d.peers.remember(remoteNode, dial)
+		}
+	}
 
-	// Phase 1: serve dialer's pull until SyncDone.
-	// Recoverable per-request errors send TypeError and keep the session open.
+	// Serve until notify, SyncDone, or EOF.
 	for {
 		if err := ctx.Err(); err != nil {
 			return
@@ -74,7 +79,23 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		if msg.Header.Type == proto.TypeSyncDone {
-			break
+			d.log.Info("inbound pull served", "remote", remote, "remote_node", remoteNode)
+			return
+		}
+		if msg.Header.Type == proto.TypeNotify {
+			// Prefer node id from hello; header may also carry it.
+			n := remoteNode
+			if msg.Header.NodeID != "" {
+				n = msg.Header.NodeID
+			}
+			port := remotePort
+			if msg.Header.Port > 0 {
+				port = msg.Header.Port
+			}
+			d.onNotify(n, remote, port, msg.Header.Entries)
+			_ = proto.Encode(conn, proto.NewNotifyOK(d.nodeID, d.cfg.Port))
+			d.log.Debug("inbound notify", "remote", remote, "remote_node", n, "hints", len(msg.Header.Entries))
+			return
 		}
 		if err := d.serveMsg(ctx, conn, msg); err != nil {
 			d.log.Debug("serve message", "remote", remote, "type", msg.Header.Type, "err", err)
@@ -88,19 +109,6 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			}
 		}
 	}
-
-	// Phase 2: reverse-pull dialer's state so their local changes land here
-	// without waiting for our SyncInterval.
-	n, err := d.pullFromConn(ctx, conn)
-	if err != nil {
-		d.log.Warn("inbound reverse pull", "remote", remote, "remote_node", remoteNode, "err", err)
-		return
-	}
-	if err := proto.Encode(conn, proto.NewSyncDone()); err != nil {
-		d.log.Warn("inbound sync_done", "remote", remote, "remote_node", remoteNode, "err", err)
-		return
-	}
-	d.log.Info("inbound sync", "remote", remote, "remote_node", remoteNode, "pulled_entries", n)
 }
 
 func (d *Daemon) serveMsg(ctx context.Context, conn net.Conn, msg proto.Message) error {
@@ -187,7 +195,7 @@ func (d *Daemon) serveFile(ctx context.Context, conn net.Conn, rel string) error
 	return proto.Encode(conn, proto.NewFileData(rel, e, data))
 }
 
-func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel, wantHash string, blockSize int, sigRaw []byte) error {
+func (d *Daemon) serveDelta(ctx context.Context, conn net.Conn, rel string, wantHash string, blockSize int, sigRaw []byte) error {
 	e, rel, err := d.serveEntry(ctx, rel)
 	if err != nil {
 		return err

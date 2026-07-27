@@ -34,14 +34,19 @@ const (
 	DefaultMaxFileBytes = 64 << 20 // 64 MiB
 	// DefaultDialTimeout is how long an outbound peer dial may block before
 	// failing. Without this, dials to online nodes that are not running tailsync
-	// (or are unreachable) can hang for a long time and stall syncPeers.
+	// (or are unreachable) can hang for a long time and stall pull batches.
 	DefaultDialTimeout = 5 * time.Second
-	// maxParallelPeerSyncs caps concurrent peer dial/sync workers so N online
-	// peers cannot each hold up to MaxFileBytes in memory at once.
-	maxParallelPeerSyncs = 4
+	// maxParallelPulls caps concurrent peer pull workers so N online peers
+	// cannot each hold up to MaxFileBytes in memory at once. Notify fan-out is
+	// separate (see maxParallelNotifies).
+	maxParallelPulls = 4
+	// maxParallelNotifies caps concurrent Hello+Notify probe dials so a large
+	// candidate set cannot open unbounded sockets per local change. Fan-out is
+	// still fire-and-forget w.r.t. the main loop (no batch Wait).
+	maxParallelNotifies = 16
 	// manyPeersWarnThreshold is how many discovered peers trigger a one-time
-	// recommendation for -peers or -service when discovery is unfiltered.
-	// Independent of maxParallelPeerSyncs (concurrency/memory cap).
+	// recommendation for -service (or test -peers) when discovery is unfiltered.
+	// Independent of maxParallelPulls (concurrency/memory cap).
 	manyPeersWarnThreshold = 8
 )
 
@@ -74,10 +79,9 @@ type Config struct {
 	// watching is active, local edits are reconciled via debounced FS events;
 	// this interval still walks the tree to catch missed events.
 	ScanInterval time.Duration
-	// SyncInterval is the backup peer sync period for catch-up (offline peers,
-	// missed notifications). Local index changes also request an immediate
-	// coalesced bidirectional peer session (both sides pull on one connection)
-	// without waiting for this ticker.
+	// SyncInterval is the backup peer pull period for catch-up (offline peers,
+	// missed notifies). Local index changes fan out best-effort notifies; peers
+	// pull on their own. Correctness does not depend on notify delivery.
 	SyncInterval time.Duration
 	// WatchDebounce is how long to wait after an FS event before reconciling
 	// (0 = DefaultWatchDebounce). Ignored when DisableWatch is set or watch
@@ -101,10 +105,10 @@ type Config struct {
 	NetMode NetMode
 	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
-	// Peers is an optional explicit list of peer addresses (host:port). When empty,
-	// peers are discovered from Tailscale status (all online nodes other than self).
-	// Discovery will dial nodes that are not running tailsync; use Peers or
-	// ServiceName on multi-device tailnets to avoid slow outbound batches.
+	// Peers is an optional explicit list of peer addresses (host:port) for tests
+	// and overrides. When empty, candidates are the in-memory hot set (after
+	// successful Hello) union Tailscale status Online peers. Prefer ServiceName
+	// on large tailnets; Peers is not the recommended production path.
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library wrappers (e.g. mobile) so Start can wait for
@@ -121,10 +125,15 @@ type Config struct {
 	// whether peer-visible local index content changed. For tests. Must return
 	// quickly and must not call back into the daemon.
 	AfterReconcile func(changed bool)
-	// AfterSyncPeers, if non-nil, is called after each syncPeers batch completes
+	// AfterSyncPeers, if non-nil, is called after each pullPeers batch completes
 	// (including empty peer lists). For tests. Must return quickly and must not
 	// call back into the daemon.
 	AfterSyncPeers func()
+	// AfterNotify, if non-nil, is called when scheduleNotify actually schedules
+	// at least one notify goroutine (not when deduped or no candidates; not
+	// after each peer dial finishes). For tests. Must return quickly and must
+	// not call back into the daemon.
+	AfterNotify func()
 }
 
 // Daemon is the synchronization service.
@@ -134,9 +143,10 @@ type Config struct {
 //   - syncMu serializes multi-step local reconcile and remote apply (decide →
 //     optional network → re-check LWW → disk/index commit). Concurrent peer
 //     applies may run network I/O in parallel while unlocked; only decide and
-//     commit hold syncMu. The main Run loop does not start reconcile until
-//     syncPeers returns, so reconcile signals cannot interleave with an
-//     in-flight peer sync batch.
+//     commit hold syncMu. The main Run loop keeps reconcile→notify responsive;
+//     pull batches run on a single-flight worker (pullWG) and do not block
+//     notify scheduling. Notify fan-out is fire-and-forget and does not hold
+//     syncMu.
 //   - index.Index has its own RWMutex for map access. Holding syncMu does not
 //     replace index locks; index methods still lock internally. Callers that
 //     need a stable multi-step view of the index relative to disk must hold
@@ -162,6 +172,12 @@ type Daemon struct {
 	// connWG tracks in-flight handleConn goroutines so Run can drain them
 	// before closing root (avoids nil/use-after-close races on d.root).
 	connWG sync.WaitGroup
+	// notifyWG tracks fire-and-forget notify dials; joined on shutdown before
+	// root/network teardown so handlers never see nil shared resources.
+	notifyWG sync.WaitGroup
+	// pullWG tracks the single-flight pull worker; joined on shutdown with
+	// notifyWG so pullFromConn cannot use root after close.
+	pullWG sync.WaitGroup
 
 	// nodeID is the protocol identity. Set during listen before accept/sync
 	// goroutines run; treated as immutable for the rest of Run.
@@ -172,8 +188,19 @@ type Daemon struct {
 	appliesSinceSave int
 
 	// manyPeersWarned is set after the one-time unfiltered-discovery Warn so
-	// syncPeers does not spam every batch on multi-device tailnets.
+	// pullPeers does not spam every batch on multi-device tailnets.
 	manyPeersWarned atomic.Bool
+
+	// peers is the memory-only hot set (nodeID → addr) learned after Hello.
+	peers *peerMem
+	// notifySeen dedupes content keys successfully advertised (storm prevention).
+	notifySeen *notifyTracker
+	// needPull is allocated in New and never niled; requestPull coalesces
+	// pull wake-ups safely concurrent with onNotify and Run shutdown.
+	needPull signal
+
+	// pullFlight single-flights background pull batches (see schedulePull).
+	pullFlight pullFlight
 }
 
 // InjectNetworkChange signals tsnet's netmon that host connectivity changed
@@ -264,8 +291,11 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		cfg: cfg,
-		log: log,
+		cfg:        cfg,
+		log:        log,
+		peers:      newPeerMem(),
+		notifySeen: newNotifyTracker(),
+		needPull:   newSignal(),
 	}, nil
 }
 
@@ -275,4 +305,40 @@ func fileMode(mode os.FileMode) os.FileMode {
 		return 0o644
 	}
 	return mode
+}
+
+// pullFlight single-flights background pull batches so the main loop can keep
+// reconcile→notify responsive while a pull is in flight. A request that arrives
+// during a running batch sets pending and runs once more after the current batch.
+type pullFlight struct {
+	mu      sync.Mutex
+	running bool
+	pending bool
+}
+
+// tryStart returns true if the caller should run a pull batch. If a batch is
+// already running, marks pending and returns false.
+func (f *pullFlight) tryStart() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.running {
+		f.pending = true
+		return false
+	}
+	f.running = true
+	return true
+}
+
+// finish clears running, or returns true if another batch should run immediately
+// because work was requested while the previous batch was in flight.
+func (f *pullFlight) finish() (runAgain bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pending {
+		f.pending = false
+		// keep running true for the follow-up batch
+		return true
+	}
+	f.running = false
+	return false
 }

@@ -31,10 +31,10 @@ func (s signal) request() {
 //
 // Main loop roles:
 //   - FS watch (debounced) and ScanInterval both request reconcile
-//   - successful reconcile with peer-visible changes requests peer sync
-//   - SyncInterval is a backup/catch-up peer sync
-//   - sync requests are single-flighted by the sequential select loop; a
-//     request that arrives during syncPeers stays pending for a follow-up run
+//   - successful reconcile with peer-visible changes fans out best-effort
+//     notifies (fire-and-forget; does not block the loop on peer dials)
+//   - SyncInterval and inbound notifies schedule pull on a single-flight
+//     background worker so long pull batches do not delay reconcile→notify
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := os.MkdirAll(d.cfg.StateDir, 0o755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
@@ -65,10 +65,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.nodeID = d.cfg.Hostname
 
 	// Initial reconcile: detect offline deletions and local changes.
-	// Peer sync runs after listen; if this applied offline changes, the
-	// immediate bidirectional syncPeers below exchanges with peers without
-	// waiting for SyncInterval.
-	changed, err := d.reconcile(ctx)
+	// Peer pull runs after listen; if this applied offline changes, the
+	// immediate pull + notify catch-up exchanges without waiting for
+	// SyncInterval alone.
+	changed, hints, err := d.reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("initial reconcile: %w", err)
 	}
@@ -90,19 +90,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 
 	// On every exit path: close the listener to unblock Accept, wait for the
-	// accept goroutine to finish, drain in-flight handleConn, then tear down
-	// tsnet/local client state. Registered after the root-close defer so this
-	// runs first (LIFO) and connWG.Wait completes before root.Close.
-	// Never nil d.ln while acceptLoop may still call Accept on a shared field.
+	// accept goroutine to finish, drain in-flight handleConn, pull worker, and
+	// notify dials, then tear down tsnet/local client state. Registered after
+	// the root-close defer so this runs first (LIFO) and Wait completes before
+	// root.Close. Never nil d.ln / d.root while handlers may still use them.
 	defer func() {
 		d.closeNetListener()
 		<-acceptDone
 		d.connWG.Wait()
+		d.pullWG.Wait()
+		d.notifyWG.Wait()
 		d.closeNetworkBackend()
 	}()
 
 	needReconcile := newSignal()
-	needSync := newSignal()
+	// needPull is allocated in New and never niled (avoids races with onNotify).
 
 	// FS watch goroutine: must stop before root closes. stop waits for the
 	// watcher to exit and Close itself (no use-after-close).
@@ -128,18 +130,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 	syncTick := time.NewTicker(d.cfg.SyncInterval)
 	defer syncTick.Stop()
 
-	doSync := func() {
-		d.syncPeers(ctx)
-		if d.cfg.AfterSyncPeers != nil {
-			d.cfg.AfterSyncPeers()
+	// schedulePull runs pullPeers on a background single-flight worker so the
+	// main loop can keep reconcile→notify responsive during long dial batches.
+	schedulePull := func() {
+		if !d.pullFlight.tryStart() {
+			return
 		}
+		d.pullWG.Go(func() {
+			for {
+				d.pullPeers(ctx)
+				if d.cfg.AfterSyncPeers != nil {
+					d.cfg.AfterSyncPeers()
+				}
+				if !d.pullFlight.finish() {
+					return
+				}
+				// Follow-up batch for work coalesced while we were pulling.
+			}
+		})
 	}
 
-	// Immediate peer sync attempt (covers initial offline changes).
-	doSync()
+	// Notify for initial local changes (if any), then bootstrap pull.
+	if changed {
+		if d.scheduleNotify(ctx, hints) && d.cfg.AfterNotify != nil {
+			d.cfg.AfterNotify()
+		}
+	}
+	schedulePull()
 
 	doReconcile := func() {
-		changed, err := d.reconcile(ctx)
+		changed, hints, err := d.reconcile(ctx)
 		if err != nil {
 			d.log.Error("reconcile", "err", err)
 			return
@@ -148,10 +168,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.cfg.AfterReconcile(changed)
 		}
 		if changed {
-			// Must not run syncPeers while holding syncMu; reconcile already
-			// released the lock. Coalesce via buffered signal so rapid edits
-			// share one bidirectional peer session.
-			needSync.request()
+			// Fire-and-forget notify; independent of in-flight pull batches.
+			if d.scheduleNotify(ctx, hints) && d.cfg.AfterNotify != nil {
+				d.cfg.AfterNotify()
+			}
 		}
 	}
 
@@ -177,12 +197,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Debounced FS events.
 			doReconcile()
 		case <-syncTick.C:
-			// Backup/catch-up peer sync.
-			doSync()
-		case <-needSync:
-			// Sync-on-change (and coalesced follow-up if more changes arrived
-			// during a prior syncPeers).
-			doSync()
+			// Backup/catch-up peer pull (background single-flight).
+			schedulePull()
+		case <-d.needPull:
+			// Pull scheduled by inbound notify (and coalesced follow-ups).
+			schedulePull()
 		}
 	}
 }
