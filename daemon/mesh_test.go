@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"deedles.dev/tailsync/internal/daemon"
+	"deedles.dev/tailsync/daemon"
 )
 
 // meshNode is one plain-mode daemon in a mesh fixture.

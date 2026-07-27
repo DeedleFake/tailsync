@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"deedles.dev/tailsync/internal/daemon"
+	"deedles.dev/tailsync/daemon"
 	"deedles.dev/tailsync/internal/index"
 	"deedles.dev/tailsync/internal/scan"
 )

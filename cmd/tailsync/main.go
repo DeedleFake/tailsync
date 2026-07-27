@@ -11,7 +11,7 @@ import (
 	"strings"
 	"syscall"
 
-	"deedles.dev/tailsync/internal/daemon"
+	"deedles.dev/tailsync/daemon"
 )
 
 func main() {

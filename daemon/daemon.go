@@ -1,4 +1,15 @@
-// Package daemon runs the tailsync synchronization service.
+// Package daemon is the public library API for running the tailsync
+// synchronization service. Embedders (CLI, Android app wrappers, other hosts)
+// construct a [Daemon] with [New] and call [Daemon.Run].
+//
+// The CLI lives in cmd/tailsync. Android/gomobile bind packages should live in
+// the app repository and depend on this package rather than a bind surface here.
+//
+// # Unstable hooks
+//
+// [Config.AfterReconcile], [Config.AfterSyncPeers], and [Config.AfterNotify]
+// exist for in-module tests. They are not a supported production embedder API
+// and may change or be removed without notice.
 package daemon
 
 import (
@@ -15,13 +26,12 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
-	"deedles.dev/tailsync/internal/delta"
 	"deedles.dev/tailsync/internal/index"
 )
 
 // Default configuration values applied by [New] when the corresponding
-// Config field is zero. CLI flags and mobile StatusJSON should reference
-// these rather than re-hardcoding.
+// Config field is zero. CLI flags and embedder UIs should reference these
+// rather than re-hardcoding.
 const (
 	DefaultPort         = 5960
 	DefaultScanInterval = 30 * time.Second
@@ -29,14 +39,20 @@ const (
 	// DefaultWatchDebounce is how long to wait after an FS event before
 	// reconciling when filesystem watching is active.
 	DefaultWatchDebounce = time.Second
+	// DefaultBlockSize is the rsync-style delta block size when Config.BlockSize
+	// is zero (4096 bytes).
+	DefaultBlockSize = 4096
 	// DefaultMaxFileBytes is the max single-file size loaded into memory for
-	// transfer/delta (v1 keeps whole-file buffers). Wire framing is also capped
-	// by proto.MaxMessageSize.
+	// transfer/delta (v1 keeps whole-file buffers). Wire framing is capped
+	// separately so peer messages cannot allocate unboundedly.
 	DefaultMaxFileBytes = 64 << 20 // 64 MiB
 	// DefaultDialTimeout is how long an outbound peer dial may block before
 	// failing. Without this, dials to online nodes that are not running tailsync
 	// (or are unreachable) can hang for a long time and stall pull batches.
 	DefaultDialTimeout = 5 * time.Second
+	// DefaultTombstoneTTL is how long deletion tombstones are retained before
+	// garbage collection when Config.TombstoneTTL is zero (30 days).
+	DefaultTombstoneTTL = 30 * 24 * time.Hour
 	// maxParallelPulls caps concurrent peer pull workers so N online peers
 	// cannot each hold up to MaxFileBytes in memory at once. Notify fan-out is
 	// separate (see maxParallelNotifies).
@@ -98,7 +114,7 @@ type Config struct {
 	// DialTimeout is the max wait for an outbound peer QUIC dial (0 = DefaultDialTimeout).
 	// Caps hangs against online nodes that are not listening for tailsync.
 	DialTimeout time.Duration
-	// TombstoneTTL drops old deletion tombstones from the index (0 = default 30d).
+	// TombstoneTTL drops old deletion tombstones from the index (0 = DefaultTombstoneTTL).
 	TombstoneTTL time.Duration
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
@@ -112,8 +128,8 @@ type Config struct {
 	// on large tailnets; Peers is not the recommended production path.
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
-	// the main loop. Used by library wrappers (e.g. mobile) so Start can wait for
-	// listen success or a fast failure. Must not block indefinitely.
+	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
+	// for listen success or a fast failure. Must not block indefinitely.
 	OnReady func()
 	// OnAuthURL, if non-nil, is called when interactive Tailscale login is needed
 	// during NetModeTSNet bring-up and an auth/login URL is available (for example
@@ -123,17 +139,26 @@ type Config struct {
 	// Not used for host or plain modes. Never receives AuthKey material.
 	OnAuthURL func(url string)
 	// AfterReconcile, if non-nil, is called after each successful reconcile with
-	// whether peer-visible local index content changed. For tests. Must return
-	// quickly and must not call back into the daemon.
+	// whether peer-visible local index content changed.
+	//
+	// Unstable / test-only: not a supported production API; may change or be
+	// removed without notice. Must return quickly and must not call back into
+	// the daemon.
 	AfterReconcile func(changed bool)
 	// AfterSyncPeers, if non-nil, is called after each pullPeers batch completes
-	// (including empty peer lists). For tests. Must return quickly and must not
-	// call back into the daemon.
+	// (including empty peer lists).
+	//
+	// Unstable / test-only: not a supported production API; may change or be
+	// removed without notice. Must return quickly and must not call back into
+	// the daemon.
 	AfterSyncPeers func()
 	// AfterNotify, if non-nil, is called when scheduleNotify actually schedules
 	// at least one notify goroutine (not when deduped or no candidates; not
-	// after each peer dial finishes). For tests. Must return quickly and must
-	// not call back into the daemon.
+	// after each peer dial finishes).
+	//
+	// Unstable / test-only: not a supported production API; may change or be
+	// removed without notice. Must return quickly and must not call back into
+	// the daemon.
 	AfterNotify func()
 }
 
@@ -170,8 +195,8 @@ type Daemon struct {
 	// syncMu serializes reconcile and remote apply commits (see package comment).
 	syncMu sync.Mutex
 
-	// netMu guards injectNetChange so mobile NotifyNetworkChange can race Stop
-	// without observing a half-torn-down callback.
+	// netMu guards injectNetChange so embedder InjectNetworkChange can race
+	// shutdown without observing a half-torn-down callback.
 	netMu           sync.Mutex
 	injectNetChange func() // NetModeTSNet: mon.InjectEvent after Up; nil otherwise
 
@@ -211,8 +236,9 @@ type Daemon struct {
 
 // InjectNetworkChange signals tsnet's netmon that host connectivity changed
 // (Android ConnectivityManager updates). No-op when not in tsnet mode, before
-// Up succeeds, or after closeNetworkBackend. Safe concurrent with Run/Stop:
-// copies the inject func under netMu, then invokes it outside the lock.
+// Up succeeds, or after network backend teardown. Safe concurrent with [Daemon.Run]
+// and Run shutdown (context cancel): copies the inject func under netMu, then
+// invokes it outside the lock.
 func (d *Daemon) InjectNetworkChange() {
 	if d == nil {
 		return
@@ -277,7 +303,7 @@ func New(cfg Config) (*Daemon, error) {
 		cfg.WatchDebounce = DefaultWatchDebounce
 	}
 	if cfg.BlockSize <= 0 {
-		cfg.BlockSize = delta.DefaultBlockSize
+		cfg.BlockSize = DefaultBlockSize
 	}
 	if cfg.MaxFileBytes <= 0 {
 		cfg.MaxFileBytes = DefaultMaxFileBytes
@@ -286,7 +312,7 @@ func New(cfg Config) (*Daemon, error) {
 		cfg.DialTimeout = DefaultDialTimeout
 	}
 	if cfg.TombstoneTTL <= 0 {
-		cfg.TombstoneTTL = index.DefaultTombstoneTTL
+		cfg.TombstoneTTL = DefaultTombstoneTTL
 	}
 	log := cfg.Logger
 	if log == nil {

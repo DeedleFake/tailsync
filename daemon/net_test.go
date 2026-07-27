@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -19,6 +20,9 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
+
+	"deedles.dev/tailsync/internal/delta"
+	"deedles.dev/tailsync/internal/index"
 )
 
 func TestBindAddrsFromTailscaleIPs(t *testing.T) {
@@ -479,6 +483,74 @@ func TestNewAppliesDefaultDialTimeout(t *testing.T) {
 	}
 	if d.cfg.DialTimeout != DefaultDialTimeout {
 		t.Fatalf("DialTimeout=%v want %v", d.cfg.DialTimeout, DefaultDialTimeout)
+	}
+}
+
+func TestNewAppliesDefaultBlockSize(t *testing.T) {
+	dir := t.TempDir()
+	d, err := New(Config{Dir: dir, NetMode: NetModePlain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.cfg.BlockSize != DefaultBlockSize {
+		t.Fatalf("BlockSize=%d want %d", d.cfg.BlockSize, DefaultBlockSize)
+	}
+	if DefaultBlockSize != delta.DefaultBlockSize {
+		t.Fatalf("daemon.DefaultBlockSize=%d != delta.DefaultBlockSize=%d", DefaultBlockSize, delta.DefaultBlockSize)
+	}
+}
+
+func TestInjectNetworkChangeNilSafeAndConcurrent(t *testing.T) {
+	// Nil receiver and unset inject are no-ops.
+	var nilD *Daemon
+	nilD.InjectNetworkChange()
+
+	dir := t.TempDir()
+	d, err := New(Config{Dir: dir, NetMode: NetModePlain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.InjectNetworkChange() // no inject registered yet
+
+	var calls atomic.Int64
+	d.setInjectNetChange(func() { calls.Add(1) })
+
+	const workers = 8
+	const perWorker = 50
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for range perWorker {
+				d.InjectNetworkChange()
+			}
+		}()
+	}
+	// Concurrent clear while injects are in flight (mirrors Run shutdown
+	// clearing inject while host Notify/Inject races in).
+	go func() {
+		time.Sleep(time.Millisecond)
+		d.setInjectNetChange(nil)
+	}()
+	wg.Wait()
+	d.InjectNetworkChange() // after clear: still no-op
+	if calls.Load() == 0 {
+		t.Fatal("expected at least one inject callback before clear")
+	}
+}
+
+func TestNewAppliesDefaultTombstoneTTL(t *testing.T) {
+	dir := t.TempDir()
+	d, err := New(Config{Dir: dir, NetMode: NetModePlain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.cfg.TombstoneTTL != DefaultTombstoneTTL {
+		t.Fatalf("TombstoneTTL=%v want %v", d.cfg.TombstoneTTL, DefaultTombstoneTTL)
+	}
+	if DefaultTombstoneTTL != index.DefaultTombstoneTTL {
+		t.Fatalf("daemon.DefaultTombstoneTTL=%v != index.DefaultTombstoneTTL=%v", DefaultTombstoneTTL, index.DefaultTombstoneTTL)
 	}
 }
 
