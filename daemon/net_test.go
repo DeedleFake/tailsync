@@ -26,6 +26,12 @@ import (
 	"deedles.dev/tailsync/internal/peer"
 )
 
+// test user IDs for PeerStatus / WhoIs ownership fixtures
+const (
+	testUserSelf  tailcfg.UserID = 1001
+	testUserOther tailcfg.UserID = 2002
+)
+
 func TestBindAddrsFromTailscaleIPs(t *testing.T) {
 	v4 := netip.MustParseAddr("100.64.0.1")
 	v6 := netip.MustParseAddr("fd7a:115c:a1e0::1")
@@ -65,6 +71,7 @@ func TestPeersFromStatus(t *testing.T) {
 			ID:       "self",
 			HostName: "me",
 			DNSName:  "me.tailnet.ts.net.",
+			UserID:   testUserSelf,
 		},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			key.NewNode().Public(): {
@@ -72,6 +79,7 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName:     "tailsync-a",
 				DNSName:      "tailsync-a.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 			},
 			key.NewNode().Public(): {
@@ -79,18 +87,21 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName: "other",
 				DNSName:  "other.tailnet.ts.net.",
 				Online:   false, // offline — skip
+				UserID:   testUserSelf,
 			},
 			key.NewNode().Public(): {
 				ID:       "peer3",
 				HostName: "laptop",
 				DNSName:  "laptop.tailnet.ts.net.",
 				Online:   true, // no IP → MagicDNS fallback
+				UserID:   testUserSelf,
 			},
 			key.NewNode().Public(): {
 				ID:       "self", // same StableID as Self — skip
 				HostName: "me",
 				DNSName:  "me.tailnet.ts.net.",
 				Online:   true,
+				UserID:   testUserSelf,
 			},
 			// Distinct node sharing Self HostName must still be discovered.
 			key.NewNode().Public(): {
@@ -98,6 +109,7 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName:     "me",
 				DNSName:      "clone.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.9")},
 			},
 		},
@@ -119,47 +131,88 @@ func TestPeersFromStatus(t *testing.T) {
 	}
 }
 
-func TestPeersFromStatusSkipsMullvad(t *testing.T) {
-	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
+func TestPeersFromStatusSameUserOnly(t *testing.T) {
 	st := &ipnstate.Status{
 		Self: &ipnstate.PeerStatus{
 			ID:      "self",
 			DNSName: "me.tailnet.ts.net.",
+			UserID:  testUserSelf,
 		},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			key.NewNode().Public(): {
-				ID:           "real",
+				ID:           "mine",
 				HostName:     "laptop",
 				DNSName:      "laptop.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 			},
-			// Tailscale Mullvad exit nodes carry tag:mullvad-exit-node.
+			// Other user's machine on the same multi-user tailnet.
 			key.NewNode().Public(): {
-				ID:             "mullvad-se",
-				HostName:       "se-mma-wg-001",
-				DNSName:        "se-mma-wg-001.mullvad.ts.net.",
-				Online:         true,
-				ExitNodeOption: true,
-				Tags:           &mullvadTags,
-				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
+				ID:           "coworker",
+				HostName:     "coworker-pc",
+				DNSName:      "coworker-pc.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
 			},
-			// User-run exit node is still a candidate (may run tailsync).
+			// Shared-in device (foreign owner).
+			key.NewNode().Public(): {
+				ID:           "shared-in",
+				HostName:     "friend-phone",
+				DNSName:      "friend-phone.other.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.4")},
+			},
+			// Sharee-only netmap entry (recipient of a share we made).
+			key.NewNode().Public(): {
+				ID:           "sharee",
+				HostName:     "sharee-laptop",
+				DNSName:      "sharee-laptop.other.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				ShareeNode:   true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.5")},
+			},
+			// Same user id but ShareeNode must still be excluded.
+			key.NewNode().Public(): {
+				ID:           "weird-sharee",
+				HostName:     "weird",
+				DNSName:      "weird.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserSelf,
+				ShareeNode:   true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.6")},
+			},
+			// Zero UserID on peer — fail closed.
+			key.NewNode().Public(): {
+				ID:           "unknown-owner",
+				HostName:     "unknown",
+				DNSName:      "unknown.tailnet.ts.net.",
+				Online:       true,
+				UserID:       0,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.7")},
+			},
+			// User-run exit node owned by self remains a candidate.
 			key.NewNode().Public(): {
 				ID:             "home-exit",
 				HostName:       "home-exit",
 				DNSName:        "home-exit.tailnet.ts.net.",
 				Online:         true,
+				UserID:         testUserSelf,
 				ExitNodeOption: true,
 				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.60")},
 			},
-			// mullvad.ts.net-looking DNS alone is not enough without the tag.
+			// Foreign product node (e.g. Mullvad) has different owner.
 			key.NewNode().Public(): {
-				ID:           "not-mullvad",
-				HostName:     "named-like-mullvad",
-				DNSName:      "fake.mullvad.ts.net.",
-				Online:       true,
-				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.70")},
+				ID:             "mullvad-se",
+				HostName:       "se-mma-wg-001",
+				DNSName:        "se-mma-wg-001.mullvad.ts.net.",
+				Online:         true,
+				UserID:         testUserOther,
+				ExitNodeOption: true,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
 			},
 		},
 	}
@@ -168,15 +221,84 @@ func TestPeersFromStatusSkipsMullvad(t *testing.T) {
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
 		"100.64.0.60:5960": true,
-		"100.64.0.70:5960": true,
 	}
 	if len(got) != len(wantSet) {
 		t.Fatalf("got %v", got)
 	}
 	for _, a := range got {
 		if !wantSet[a] {
-			t.Errorf("unexpected addr %q (Mullvad should be filtered)", a)
+			t.Errorf("unexpected addr %q", a)
 		}
+	}
+}
+
+func TestPeersFromStatusFailClosedNoSelfUser(t *testing.T) {
+	peer := map[key.NodePublic]*ipnstate.PeerStatus{
+		key.NewNode().Public(): {
+			ID:           "peer1",
+			Online:       true,
+			UserID:       testUserSelf,
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+		},
+	}
+	if got := peersFromStatus(nil, 5960); len(got) != 0 {
+		t.Fatalf("nil status: %v", got)
+	}
+	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960); len(got) != 0 {
+		t.Fatalf("nil self: %v", got)
+	}
+	if got := peersFromStatus(&ipnstate.Status{
+		Self: &ipnstate.PeerStatus{ID: "self", UserID: 0},
+		Peer: peer,
+	}, 5960); len(got) != 0 {
+		t.Fatalf("zero self UserID: %v", got)
+	}
+	tagServer := views.SliceOf([]string{"tag:server"})
+	if got := peersFromStatus(&ipnstate.Status{
+		Self: &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer},
+		Peer: peer,
+	}, 5960); len(got) != 0 {
+		t.Fatalf("tagged self: %v", got)
+	}
+}
+
+func TestIsSameUserPeer(t *testing.T) {
+	self := &ipnstate.PeerStatus{UserID: testUserSelf}
+	if isSameUserPeer(nil, &ipnstate.PeerStatus{UserID: testUserSelf}) {
+		t.Fatal("nil self")
+	}
+	if isSameUserPeer(self, nil) {
+		t.Fatal("nil peer")
+	}
+	if isSameUserPeer(&ipnstate.PeerStatus{UserID: 0}, &ipnstate.PeerStatus{UserID: testUserSelf}) {
+		t.Fatal("zero self UserID")
+	}
+	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: 0}) {
+		t.Fatal("zero peer UserID")
+	}
+	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserOther}) {
+		t.Fatal("other user")
+	}
+	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserSelf, ShareeNode: true}) {
+		t.Fatal("sharee")
+	}
+	if !isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserSelf}) {
+		t.Fatal("same user should match")
+	}
+
+	// IsSelfUntagged: any tags drop user ownership (synthetic shared owners).
+	tagServer := views.SliceOf([]string{"tag:server"})
+	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
+	taggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
+	untaggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf}
+	if isSameUserPeer(taggedSelf, untaggedPeer) {
+		t.Fatal("tagged self")
+	}
+	if isSameUserPeer(self, taggedPeer) {
+		t.Fatal("tagged peer")
+	}
+	if isSameUserPeer(taggedSelf, taggedPeer) {
+		t.Fatal("both tagged same UserID")
 	}
 }
 
@@ -222,6 +344,81 @@ func TestClaimedMatchesWhoIs(t *testing.T) {
 	}
 	if claimedMatchesWhoIs("peer.extra", who) {
 		t.Fatal("claim longer than first label must not match")
+	}
+}
+
+func TestWhoIsSameUser(t *testing.T) {
+	self := &ipnstate.PeerStatus{UserID: testUserSelf}
+	same := &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{
+			Name: "peer.tailnet.ts.net.",
+			User: testUserSelf,
+		},
+		UserProfile: &tailcfg.UserProfile{ID: testUserSelf},
+	}
+	if !whoIsSameUser(self, same) {
+		t.Fatal("same user")
+	}
+
+	other := &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{
+			Name: "other.tailnet.ts.net.",
+			User: testUserOther,
+		},
+		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
+	}
+	if whoIsSameUser(self, other) {
+		t.Fatal("other user")
+	}
+
+	// Name match alone is not ownership — Node.User must equal Self.
+	if whoIsSameUser(self, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{Name: "peer.tailnet.ts.net.", User: 0},
+	}) {
+		t.Fatal("zero peer User must fail closed")
+	}
+	if whoIsSameUser(&ipnstate.PeerStatus{UserID: 0}, same) {
+		t.Fatal("zero self UserID must fail closed")
+	}
+	if whoIsSameUser(nil, same) {
+		t.Fatal("nil self")
+	}
+	if whoIsSameUser(self, nil) {
+		t.Fatal("nil who")
+	}
+
+	// UserProfile disagrees with accepted Node.User — fail closed.
+	if whoIsSameUser(self, &apitype.WhoIsResponse{
+		Node:        &tailcfg.Node{User: testUserSelf},
+		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
+	}) {
+		t.Fatal("profile mismatch")
+	}
+
+	// ShareeNode must not authenticate as a same-user peer.
+	hi := (&tailcfg.Hostinfo{ShareeNode: true}).View()
+	// Hostinfo on Node is a HostinfoView; construct via pointer assignment.
+	shareeNode := &tailcfg.Node{User: testUserSelf}
+	shareeNode.Hostinfo = hi
+	if whoIsSameUser(self, &apitype.WhoIsResponse{Node: shareeNode}) {
+		t.Fatal("sharee node")
+	}
+
+	// IsSelfUntagged: tags drop user ownership even with matching UserID.
+	tagServer := views.SliceOf([]string{"tag:server"})
+	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
+	if whoIsSameUser(taggedSelf, same) {
+		t.Fatal("tagged self")
+	}
+	if whoIsSameUser(self, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
+	}) {
+		t.Fatal("tagged peer")
+	}
+	if whoIsSameUser(taggedSelf, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
+	}) {
+		t.Fatal("both tagged same UserID")
 	}
 }
 

@@ -76,15 +76,15 @@ Discovery is a **background service** that builds a roster of persistent peer se
 
 | Source | Role |
 |--------|------|
-| **Status Online** | Candidates from Tailscale status (IPs preferred; MagicDNS fallback) |
+| **Status Online (same user)** | Candidates from Tailscale status owned by the current user (IPs preferred; MagicDNS fallback) |
 | **`-peers`** | Test/override pin only; when set, status discovery is skipped |
-| **Inbound** | Accept connections from peers that dial us (Hello handshake) |
+| **Inbound** | Accept connections from the current user's machines only (WhoIs + Hello; plain mode is local tests) |
 
 Once connected, each peer has **at most one** QUIC connection. Hello is **connection-scoped** (not per stream). Application ops (notify, manifest, file, delta, ping) open short-lived streams on that connection. Redundant connections are rejected with `already_connected`; simultaneous dial races pick a deterministic winner by node ID. Unhealthy sessions (failed heartbeats) are replaced and re-discovered with exponential backoff (**never permanently banned**). Discovery dials use an in-flight concurrency semaphore (default 32) that is released **before** backoff sleep so other peers can still dial.
 
 Notify and pull use the **connected roster** only (no one-shot dial-per-op). Pull content streams are capped globally (default 8). Offline (status) peers are not dialed.
 
-With empty `-peers`, discovery may attempt **every** online tailnet node—phones, TVs, unrelated servers—not only machines running tailsync. Soft dial failures and exponential backoff are expected; they do not block writers. **Mullvad VPN exit nodes** (`tag:mullvad-exit-node`) are always excluded; they appear Online but never run tailsync. Use **`-peers host:port,...`** only for local tests / explicit overrides.
+With empty `-peers`, discovery dials **online untagged nodes owned by the current Tailscale user** (same `UserID` as Self; Tailscale IsSelfUntagged semantics)—not every node on the tailnet. Shared-in devices, other users' machines, sharee-only netmap entries, and tagged nodes are skipped. Soft dial failures and exponential backoff are expected for nodes that do not run tailsync; they do not block writers. Inbound Hello is bound to Tailscale WhoIs and the same ownership check (plain/local test mode skips WhoIs). Use **`-peers host:port,...`** only for local tests / explicit overrides.
 
 ```bash
 # two machines (each uses its host Tailscale identity; zero-config mesh)

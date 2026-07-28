@@ -27,7 +27,7 @@ func main() {
 		noWatch       = flag.Bool("no-watch", false, "disable filesystem watching; rely on -scan-interval only")
 		blockSize     = flag.Int("block-size", 0, "rsync-style block size for delta transfers (0 = daemon default)")
 		dialTimeout   = flag.Duration("dial-timeout", 0, fmt.Sprintf("timeout for outbound peer dials (0 = default %s); caps waits on nodes not running tailsync", daemon.DefaultDialTimeout))
-		peers         = flag.String("peers", "", "comma-separated peer addresses host:port (test/override only); when empty, discovery uses status Online + pins")
+		peers         = flag.String("peers", "", "comma-separated peer addresses host:port (test/override only); when empty, discover Online peers owned by the current Tailscale user")
 		useTSNet      = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
 		plain         = flag.Bool("plain", false, "use plain QUIC on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
 		verbose       = flag.Bool("v", false, "verbose debug logging")

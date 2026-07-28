@@ -75,42 +75,50 @@ func nodeIDFromSelf(self *ipnstate.PeerStatus) string {
 	return string(self.ID)
 }
 
-// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
-// peers. Those peers are Online on the tailnet but never run tailsync; dialing
-// them only burns DialTimeout. Do not use ExitNodeOption alone — user-run exit
-// nodes may still run tailsync.
-const mullvadExitNodeTag = "tag:mullvad-exit-node"
-
-// isMullvadPeer reports whether p is a Tailscale Mullvad exit-node peer
-// (has tag:mullvad-exit-node).
-func isMullvadPeer(p *ipnstate.PeerStatus) bool {
-	if p == nil || p.Tags == nil {
+// isSameUserPeer reports whether p is a trusted peer for tailsync: both nodes
+// untagged and owned by the same Tailscale user (Tailscale IsSelfUntagged
+// semantics). Tagged nodes are identity-by-tags, not user ownership—many
+// control planes assign them a synthetic shared owner—so they are never
+// treated as "the current user's machines."
+//
+// Fail closed when either UserID is unknown. ShareeNode peers exist only so a
+// share recipient can dial a node we shared; they are never candidates.
+func isSameUserPeer(self, p *ipnstate.PeerStatus) bool {
+	if self == nil || p == nil {
 		return false
 	}
-	return p.Tags.ContainsFunc(func(tag string) bool {
-		return tag == mullvadExitNodeTag
-	})
+	if self.IsTagged() || p.IsTagged() {
+		return false
+	}
+	if self.UserID == 0 || p.UserID == 0 {
+		return false
+	}
+	if p.ShareeNode {
+		return false
+	}
+	return p.UserID == self.UserID
 }
 
-// peersFromStatus returns dial addresses (host:port) for online peers excluding self.
-// Prefers the first Tailscale IP for reliable dialing with the host net stack
-// (does not depend on MagicDNS); falls back to MagicDNS when no IP is known.
-// Mullvad VPN exit nodes (tag:mullvad-exit-node) are always skipped.
+// peersFromStatus returns dial addresses (host:port) for online peers that
+// belong to the current Tailscale user, excluding self. Prefers the first
+// Tailscale IP for reliable dialing with the host net stack (does not depend
+// on MagicDNS); falls back to MagicDNS when no IP is known.
+//
+// Only untagged peers with the same PeerStatus.UserID as Self are candidates
+// (IsSelfUntagged). Shared-in nodes, sharee-only netmap entries, tagged nodes,
+// and other users' machines on multi-user tailnets are skipped. When Self,
+// Self.UserID is unavailable, or Self is tagged, returns nil (fail closed —
+// never discover the whole mesh).
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
 func peersFromStatus(st *ipnstate.Status, port int) []string {
-	if st == nil {
+	if st == nil || st.Self == nil || st.Self.UserID == 0 || st.Self.IsTagged() {
 		return nil
 	}
-	var (
-		selfID  string
-		selfDNS string
-	)
-	if st.Self != nil {
-		selfID = string(st.Self.ID)
-		selfDNS = strings.TrimSuffix(st.Self.DNSName, ".")
-	}
+	self := st.Self
+	selfID := string(self.ID)
+	selfDNS := strings.TrimSuffix(self.DNSName, ".")
 	portStr := strconv.Itoa(port)
 	var addrs []string
 	for _, p := range st.Peer {
@@ -120,7 +128,7 @@ func peersFromStatus(st *ipnstate.Status, port int) []string {
 		if selfID != "" && string(p.ID) == selfID {
 			continue
 		}
-		if isMullvadPeer(p) {
+		if !isSameUserPeer(self, p) {
 			continue
 		}
 		dns := strings.TrimSuffix(p.DNSName, ".")
@@ -205,7 +213,9 @@ func (d *Daemon) newMesh() (*peer.Manager, error) {
 }
 
 // verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
-// remoteAddr. Prevents roster hijack under skip-verify TLS on the tailnet.
+// remoteAddr and that the peer is owned by the current Tailscale user.
+// Prevents roster hijack under skip-verify TLS and blocks shared-in / other
+// users' nodes even when their Hello names match wire identity.
 func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
 	lc, err := d.localClient()
 	if err != nil {
@@ -221,7 +231,51 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	if !claimedMatchesWhoIs(claimed, who) {
 		return fmt.Errorf("hello node id %q does not match tailscale peer at %s", claimed, remoteAddr)
 	}
+	// Ownership from LocalAPI (Self.UserID + WhoIs Node.User), not Hello alone.
+	st, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return fmt.Errorf("status: %w", err)
+	}
+	if st == nil || st.Self == nil || st.Self.UserID == 0 {
+		return fmt.Errorf("cannot determine local tailscale user")
+	}
+	if st.Self.IsTagged() {
+		return fmt.Errorf("local node is tagged; tailsync requires untagged user-owned nodes")
+	}
+	if !whoIsSameUser(st.Self, who) {
+		return fmt.Errorf("peer at %s is not an untagged machine of the current tailscale user", remoteAddr)
+	}
 	return nil
+}
+
+// whoIsSameUser reports whether WhoIs identity is a trusted peer for tailsync:
+// both Self and the remote node untagged and owned by the same Tailscale user
+// (IsSelfUntagged). Uses control-plane Node.User (and UserProfile when present),
+// not the claimed Hello string. Sharee-only netmap nodes and tagged nodes are
+// rejected. Fail closed when ownership cannot be determined.
+func whoIsSameUser(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse) bool {
+	if self == nil || self.UserID == 0 || who == nil || who.Node == nil {
+		return false
+	}
+	if self.IsTagged() || who.Node.IsTagged() {
+		return false
+	}
+	if who.Node.Hostinfo.Valid() && who.Node.Hostinfo.ShareeNode() {
+		return false
+	}
+	peerUID := who.Node.User
+	if peerUID == 0 {
+		return false
+	}
+	if peerUID != self.UserID {
+		return false
+	}
+	// Cross-check profile when control plane provided one (successful WhoIs
+	// always includes UserProfile; still tolerate nil for partial test fixtures).
+	if who.UserProfile != nil && who.UserProfile.ID != 0 && who.UserProfile.ID != self.UserID {
+		return false
+	}
+	return true
 }
 
 // localClient returns the LocalAPI client for host or tsnet mode.
@@ -583,7 +637,8 @@ func (d *Daemon) closeNetworkBackend() {
 	d.local = nil
 }
 
-// listPeers returns online discovery peers from Tailscale status only.
+// listPeers returns online discovery peers from Tailscale status that belong
+// to the current user (see peersFromStatus).
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 	switch d.cfg.NetMode {
 	case NetModePlain:
