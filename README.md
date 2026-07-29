@@ -59,7 +59,7 @@ For regular files, permission bits and modification time are synchronized. Conte
 | `-hostname` | `tailsync-<os-hostname>` (tsnet only) | tsnet hostname; in host mode, identity comes from Tailscale |
 | `-port` | `5960` | UDP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
-| `-peers` | (discover) | Comma-separated `host:port` list; skips automatic discovery (**tests / overrides**) |
+| `-peers` | (discover) | Comma-separated `host:port` dial list; skips status discovery only. On host/tsnet, mesh trust still applies at Hello. |
 | `-tag-match` | `intersect` | When **this** machine is tagged: how peer tags must relate (`intersect`, `equal`, or `contains`). Ignored when this machine is untagged. |
 | `-scan-interval` | `30s` | Full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer pull period if a notify was missed |
@@ -73,19 +73,19 @@ For regular files, permission bits and modification time are synchronized. Conte
 
 ### Who connects to whom
 
-With default discovery (empty `-peers`), tailsync only tries peers that match **mesh trust** for *this* machine:
+On **host** and **tsnet**, mesh membership requires **mesh trust** for *this* machine. Trust applies both when selecting discovery dial targets and when accepting a Hello (WhoIs). A pin list does not relax that check.
 
-- **Untagged machine** (typical laptop or desktop): other online machines owned by the **same Tailscale user**. Tagged devices usually do **not** match (they are not user-owned in Tailscale’s model).
+- **Untagged machine** (typical laptop or desktop): other machines owned by the **same Tailscale user**. Tagged devices usually do **not** match (they are not user-owned in Tailscale’s model).
 - **Tagged machine** (typical server): other **tagged** machines whose tags match `-tag-match`:
   - `intersect` (default) — share at least one tag
   - `equal` — same set of tags
   - `contains` — peer has every tag this machine has
 
-Always skipped: devices shared into the tailnet as share-only entries, and [Mullvad](https://tailscale.com/kb/1258/mullvad-exit-nodes) exit nodes.
+Always denied: devices shared into the tailnet as share-only entries, and [Mullvad](https://tailscale.com/kb/1258/mullvad-exit-nodes) exit nodes.
 
-**Laptop ↔ tagged server** is not automatic under this policy. Run tailsync on a consistent class of machines (all your untagged devices, or a set of servers sharing a tag such as `tag:tailsync`), or pin peers with `-peers` for tests and special cases.
+**`-peers`** only sets which `host:port` addresses to dial and skips status-based discovery (useful for tests and fixed dial lists). On host/tsnet it does **not** bypass mesh trust: untrusted pins still fail Hello and will not join the mesh. To run without Tailscale identity checks, use **`-plain`** (localhost testing only; requires `TAILSYNC_TESTING=1`).
 
-Inbound connections are checked the same way (via Tailscale identity), so a peer you would not dial is also not accepted as a mesh member.
+**Laptop ↔ tagged server** is not supported under this policy. Run tailsync on a consistent class of machines (all your untagged devices under one user, or a set of tagged servers that match `-tag-match`, for example a dedicated `tag:tailsync`).
 
 ```bash
 # two untagged machines (same Tailscale user)
@@ -110,6 +110,8 @@ tailsync -tsnet -dir ~/shared -hostname tailsync-a
 This registers a separate node named with `-hostname` (default `tailsync-<os-hostname>`). Keep a stable `-state` directory so the node does not need to re-authenticate every launch.
 
 ### Local testing without Tailscale
+
+Use `-plain` so Hello does not require Tailscale identity. Pin the other process with `-peers` (status discovery does not apply in this mode):
 
 ```bash
 # terminal 1

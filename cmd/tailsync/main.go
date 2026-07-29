@@ -27,7 +27,7 @@ func main() {
 		noWatch       = flag.Bool("no-watch", false, "disable filesystem watching; rely on -scan-interval only")
 		blockSize     = flag.Int("block-size", 0, "rsync-style block size for delta transfers (0 = daemon default)")
 		dialTimeout   = flag.Duration("dial-timeout", 0, fmt.Sprintf("timeout for outbound peer dials (0 = default %s); caps waits on nodes not running tailsync", daemon.DefaultDialTimeout))
-		peers         = flag.String("peers", "", "comma-separated peer addresses host:port (test/override only); when empty, discover via mesh trust (untagged Self: same UserID; tagged Self: -tag-match; excludes sharees, Mullvad)")
+		peers         = flag.String("peers", "", "comma-separated host:port dial list; skips status discovery only (tests/overrides). On host/tsnet, Hello still requires mesh trust; use -plain to skip identity checks")
 		tagMatch      = flag.String("tag-match", "intersect", "when Self is tagged, how peer tags must relate: intersect (default), equal, or contains (peer has all of Self's tags); ignored when Self is untagged")
 		useTSNet      = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
 		plain         = flag.Bool("plain", false, "use plain QUIC on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
