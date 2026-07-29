@@ -51,11 +51,16 @@ func validateMeshTagFormat(s string) error {
 	return nil
 }
 
-// checkSelfMeshTagConfig fails closed when Self is tagged but MeshTag is
-// missing or not present on Self. Call after LocalAPI status is available
-// (host/tsnet listen). Untagged Self always passes.
+// checkSelfMeshTagConfig fails closed when MeshTag does not match Self:
+//   - untagged Self: MeshTag must be empty
+//   - tagged Self: MeshTag required and present on Self
+//
+// Call after LocalAPI status is available (host/tsnet listen).
 func checkSelfMeshTagConfig(self meshIdentity, meshTag string) error {
 	if !self.tagged() {
+		if meshTag != "" {
+			return fmt.Errorf("this machine is untagged; omit -mesh-tag (or Config.MeshTag)")
+		}
 		return nil
 	}
 	if meshTag == "" {

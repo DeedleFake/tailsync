@@ -436,6 +436,9 @@ func TestCheckSelfMeshTagConfig(t *testing.T) {
 	if err := checkSelfMeshTagConfig(meshIdentity{user: testUserSelf}, ""); err != nil {
 		t.Fatalf("untagged: %v", err)
 	}
+	if err := checkSelfMeshTagConfig(meshIdentity{user: testUserSelf}, "tag:tailsync"); err == nil {
+		t.Fatal("untagged with mesh tag want error")
+	}
 	if err := checkSelfMeshTagConfig(meshIdentity{tags: []string{"tag:tailsync"}}, ""); err == nil {
 		t.Fatal("tagged without mesh tag want error")
 	}

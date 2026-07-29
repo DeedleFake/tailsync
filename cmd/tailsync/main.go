@@ -28,7 +28,7 @@ func main() {
 		blockSize     = flag.Int("block-size", 0, "rsync-style block size for delta transfers (0 = daemon default)")
 		dialTimeout   = flag.Duration("dial-timeout", 0, fmt.Sprintf("timeout for outbound peer dials (0 = default %s); caps waits on nodes not running tailsync", daemon.DefaultDialTimeout))
 		peers         = flag.String("peers", "", "comma-separated host:port dial list; skips status discovery only (tests/overrides). On host/tsnet, Hello still requires mesh trust; use -plain to skip identity checks")
-		meshTag       = flag.String("mesh-tag", "", "when this machine is tagged, required ACL tag peers must share (e.g. tag:tailsync); ignored when untagged; listen fails if tagged without this")
+		meshTag       = flag.String("mesh-tag", "", "when this machine is tagged, required ACL tag peers must share (e.g. tag:tailsync); must be unset when untagged; listen fails if tagged without this or if untagged with this set")
 		useTSNet      = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
 		plain         = flag.Bool("plain", false, "use plain QUIC on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
 		verbose       = flag.Bool("v", false, "verbose debug logging")

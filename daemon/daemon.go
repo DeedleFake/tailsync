@@ -130,8 +130,9 @@ type Config struct {
 	// backoff handle nodes that are Online but not running tailsync.
 	Peers []string
 	// MeshTag is the ACL tag peers must share when this machine is tagged
-	// (for example "tag:tailsync"). Required at listen when Self is tagged;
-	// ignored when Self is untagged. Must look like tag:name when non-empty.
+	// (for example "tag:tailsync"). Required at listen when Self is tagged
+	// and must appear on Self. Must be empty when Self is untagged. Must look
+	// like tag:name when non-empty.
 	MeshTag string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait

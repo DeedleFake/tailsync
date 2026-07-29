@@ -60,7 +60,7 @@ For regular files, permission bits and modification time are synchronized. Conte
 | `-port` | `5960` | UDP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
 | `-peers` | (discover) | Comma-separated `host:port` dial list; skips status discovery only. On host/tsnet, mesh trust still applies at Hello. |
-| `-mesh-tag` | (none) | When **this** machine is tagged: required ACL tag peers must share (for example `tag:tailsync`). Listen fails if this machine is tagged and the flag is missing or not on Self. Ignored when untagged. |
+| `-mesh-tag` | (none) | When **this** machine is tagged: required ACL tag peers must share (for example `tag:tailsync`). Listen fails if this machine is tagged and the flag is missing or not on Self, or if this machine is untagged and the flag is set. |
 | `-scan-interval` | `30s` | Full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer pull period if a notify was missed |
 | `-watch-debounce` | `1s` | Wait after filesystem events before reconciling |
@@ -75,7 +75,7 @@ For regular files, permission bits and modification time are synchronized. Conte
 
 On **host** and **tsnet**, mesh membership requires **mesh trust** for *this* machine. Trust applies both when selecting discovery dial targets and when accepting a Hello (WhoIs). A pin list does not relax that check.
 
-- **Untagged machine** (typical laptop or desktop): other machines owned by the **same Tailscale user**. Tagged devices usually do **not** match (they are not user-owned in Tailscale’s model).
+- **Untagged machine** (typical laptop or desktop): other machines owned by the **same Tailscale user**. Tagged devices usually do **not** match (they are not user-owned in Tailscale’s model). Do **not** set `-mesh-tag` (listen fails if it is set).
 - **Tagged machine** (typical server): other machines that carry the same **`-mesh-tag`** (for example `tag:tailsync`). Extra ACL tags on either side do not affect membership. If this machine is tagged, `-mesh-tag` is **required** and must appear on Self, or the daemon refuses to start.
 
 Always denied: devices shared into the tailnet as share-only entries, and [Mullvad](https://tailscale.com/kb/1258/mullvad-exit-nodes) exit nodes.
