@@ -8,10 +8,9 @@ import (
 
 // discoveryCandidates builds dial targets for the peer discovery service.
 // Explicit Config.Peers pins skip status discovery (test determinism).
-// Otherwise status Online peers owned by the current Tailscale user (same
-// UserID; excluding self, shared-in, sharee, other users' machines, and
-// Mullvad) are returned. Tags do not exclude same-owner peers. Connected
-// sessions are filtered out by discovery itself.
+// Otherwise status Online peers that pass mesh trust are returned (untagged
+// Self → same UserID; tagged Self → TagMatch; excludes self, sharees, Mullvad).
+// Connected sessions are filtered out by discovery itself.
 func (d *Daemon) discoveryCandidates(ctx context.Context) []peer.Candidate {
 	if len(d.cfg.Peers) > 0 {
 		out := make([]peer.Candidate, 0, len(d.cfg.Peers))

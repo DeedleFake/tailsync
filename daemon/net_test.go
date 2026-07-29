@@ -115,7 +115,7 @@ func TestPeersFromStatus(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960)
+	got := peersFromStatus(st, 5960, TagMatchIntersection)
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":            true, // prefers IP over MagicDNS
 		"laptop.tailnet.ts.net:5960": true, // DNS fallback when no IP
@@ -131,7 +131,9 @@ func TestPeersFromStatus(t *testing.T) {
 	}
 }
 
-func TestPeersFromStatusSameUserOnly(t *testing.T) {
+func TestPeersFromStatusUntaggedSelf(t *testing.T) {
+	// Realistic tagged node uses synthetic tagged-devices UserID, not Self.
+	const taggedDevicesUser tailcfg.UserID = 9999
 	tagServer := views.SliceOf([]string{"tag:server"})
 	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
 	st := &ipnstate.Status{
@@ -149,15 +151,25 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 			},
-			// Same-owner tagged machine must still mesh.
+			// Same UserID + tags still allowed for untagged Self (policy is UserID).
 			key.NewNode().Public(): {
-				ID:           "tagged-server",
+				ID:           "tagged-same-uid",
 				HostName:     "server",
 				DNSName:      "server.tailnet.ts.net.",
 				Online:       true,
 				UserID:       testUserSelf,
 				Tags:         &tagServer,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.8")},
+			},
+			// Typical tagged node: tagged-devices user — not same UserID.
+			key.NewNode().Public(): {
+				ID:           "tagged-devices",
+				HostName:     "nas",
+				DNSName:      "nas.tailnet.ts.net.",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagServer,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.80")},
 			},
 			// Other user's machine on the same multi-user tailnet.
 			key.NewNode().Public(): {
@@ -240,10 +252,10 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960)
+	got := peersFromStatus(st, 5960, TagMatchIntersection)
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
-		"100.64.0.8:5960":  true, // same-user tagged
+		"100.64.0.8:5960":  true, // same UserID even if tagged
 		"100.64.0.60:5960": true, // user-run exit node
 	}
 	if len(got) != len(wantSet) {
@@ -252,6 +264,101 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 	for _, a := range got {
 		if !wantSet[a] {
 			t.Errorf("unexpected addr %q", a)
+		}
+	}
+}
+
+func TestPeersFromStatusTaggedSelf(t *testing.T) {
+	const taggedDevicesUser tailcfg.UserID = 9999
+	tagServer := views.SliceOf([]string{"tag:server"})
+	tagWeb := views.SliceOf([]string{"tag:web"})
+	tagServerWeb := views.SliceOf([]string{"tag:server", "tag:web"})
+	tagExact := views.SliceOf([]string{"tag:server"})
+	st := &ipnstate.Status{
+		Self: &ipnstate.PeerStatus{
+			ID:      "self",
+			DNSName: "self.tailnet.ts.net.",
+			UserID:  taggedDevicesUser,
+			Tags:    &tagServer,
+		},
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			// Intersecting tag — allow under default intersect.
+			key.NewNode().Public(): {
+				ID:           "peer-server",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagExact,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.10")},
+			},
+			// Superset of Self tags — allow under intersect and contains.
+			key.NewNode().Public(): {
+				ID:           "peer-both",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagServerWeb,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.11")},
+			},
+			// Disjoint tags — never.
+			key.NewNode().Public(): {
+				ID:           "peer-web",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagWeb,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.12")},
+			},
+			// Untagged same synthetic user — tagged Self ignores UserID.
+			key.NewNode().Public(): {
+				ID:           "untagged",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.13")},
+			},
+			// Human user machine — not tagged.
+			key.NewNode().Public(): {
+				ID:           "laptop",
+				Online:       true,
+				UserID:       testUserSelf,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.14")},
+			},
+		},
+	}
+
+	got := peersFromStatus(st, 5960, TagMatchIntersection)
+	wantIntersect := map[string]bool{
+		"100.64.0.10:5960": true,
+		"100.64.0.11:5960": true,
+	}
+	if len(got) != len(wantIntersect) {
+		t.Fatalf("intersect: got %v", got)
+	}
+	for _, a := range got {
+		if !wantIntersect[a] {
+			t.Errorf("intersect unexpected %q", a)
+		}
+	}
+
+	got = peersFromStatus(st, 5960, TagMatchEqual)
+	wantEqual := map[string]bool{"100.64.0.10:5960": true}
+	if len(got) != len(wantEqual) {
+		t.Fatalf("equal: got %v", got)
+	}
+	for _, a := range got {
+		if !wantEqual[a] {
+			t.Errorf("equal unexpected %q", a)
+		}
+	}
+
+	got = peersFromStatus(st, 5960, TagMatchContains)
+	wantContains := map[string]bool{
+		"100.64.0.10:5960": true, // exact set contains all of self
+		"100.64.0.11:5960": true, // superset
+	}
+	if len(got) != len(wantContains) {
+		t.Fatalf("contains: got %v", got)
+	}
+	for _, a := range got {
+		if !wantContains[a] {
+			t.Errorf("contains unexpected %q", a)
 		}
 	}
 }
@@ -265,90 +372,85 @@ func TestPeersFromStatusFailClosedNoSelfUser(t *testing.T) {
 			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 		},
 	}
-	if got := peersFromStatus(nil, 5960); len(got) != 0 {
+	if got := peersFromStatus(nil, 5960, TagMatchIntersection); len(got) != 0 {
 		t.Fatalf("nil status: %v", got)
 	}
-	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960); len(got) != 0 {
+	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960, TagMatchIntersection); len(got) != 0 {
 		t.Fatalf("nil self: %v", got)
 	}
 	if got := peersFromStatus(&ipnstate.Status{
 		Self: &ipnstate.PeerStatus{ID: "self", UserID: 0},
 		Peer: peer,
-	}, 5960); len(got) != 0 {
+	}, 5960, TagMatchIntersection); len(got) != 0 {
 		t.Fatalf("zero self UserID: %v", got)
 	}
-	// Tagged Self still discovers same-user peers (tags do not fail closed).
+	// Tagged Self does not use UserID; untagged peer is not a candidate.
 	tagServer := views.SliceOf([]string{"tag:server"})
 	got := peersFromStatus(&ipnstate.Status{
 		Self: &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer},
 		Peer: peer,
-	}, 5960)
-	if len(got) != 1 || got[0] != "100.64.0.2:5960" {
-		t.Fatalf("tagged self should still discover same-user peers: %v", got)
+	}, 5960, TagMatchIntersection)
+	if len(got) != 0 {
+		t.Fatalf("tagged self must not discover untagged peers via UserID: %v", got)
 	}
 }
 
-func TestIsSameUserPeer(t *testing.T) {
-	self := &ipnstate.PeerStatus{UserID: testUserSelf}
-	if isSameUserPeer(nil, &ipnstate.PeerStatus{UserID: testUserSelf}) {
-		t.Fatal("nil self")
+func TestTrustedMeshPeer(t *testing.T) {
+	self := meshIdentity{user: testUserSelf}
+	if trustedMeshPeer(self, meshIdentity{}, TagMatchIntersection) {
+		t.Fatal("zero peer user")
 	}
-	if isSameUserPeer(self, nil) {
-		t.Fatal("nil peer")
+	if trustedMeshPeer(meshIdentity{}, meshIdentity{user: testUserSelf}, TagMatchIntersection) {
+		t.Fatal("zero self user")
 	}
-	if isSameUserPeer(&ipnstate.PeerStatus{UserID: 0}, &ipnstate.PeerStatus{UserID: testUserSelf}) {
-		t.Fatal("zero self UserID")
-	}
-	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: 0}) {
-		t.Fatal("zero peer UserID")
-	}
-	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserOther}) {
+	if trustedMeshPeer(self, meshIdentity{user: testUserOther}, TagMatchIntersection) {
 		t.Fatal("other user")
 	}
-	if isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserSelf, ShareeNode: true}) {
+	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, sharee: true}, TagMatchIntersection) {
 		t.Fatal("sharee")
 	}
-	if !isSameUserPeer(self, &ipnstate.PeerStatus{UserID: testUserSelf}) {
-		t.Fatal("same user should match")
+	if !trustedMeshPeer(self, meshIdentity{user: testUserSelf}, TagMatchIntersection) {
+		t.Fatal("same user")
 	}
 
-	// Tags do not gate same-owner allow/deny.
-	tagServer := views.SliceOf([]string{"tag:server"})
-	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
-	taggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
-	untaggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf}
-	if !isSameUserPeer(taggedSelf, untaggedPeer) {
-		t.Fatal("tagged self + untagged peer same user")
-	}
-	if !isSameUserPeer(self, taggedPeer) {
-		t.Fatal("tagged peer same user")
-	}
-	if !isSameUserPeer(taggedSelf, taggedPeer) {
-		t.Fatal("both tagged same UserID")
+	// Untagged self: UserID match even if peer is tagged.
+	if !trustedMeshPeer(self, meshIdentity{user: testUserSelf, tags: []string{"tag:server"}}, TagMatchIntersection) {
+		t.Fatal("untagged self + tagged peer same user")
 	}
 
-	// Explicit Mullvad markers deny even with matching UserID.
-	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
-	if isSameUserPeer(self, &ipnstate.PeerStatus{
-		UserID:  testUserSelf,
-		Tags:    &mullvadTags,
-		DNSName: "exit.tailnet.ts.net.",
-	}) {
+	// Tagged self: tags only; UserID ignored.
+	taggedSelf := meshIdentity{user: 9999, tags: []string{"tag:server"}}
+	if trustedMeshPeer(taggedSelf, meshIdentity{user: 9999}, TagMatchIntersection) {
+		t.Fatal("tagged self must not trust untagged peer")
+	}
+	if !trustedMeshPeer(taggedSelf, meshIdentity{user: 1, tags: []string{"tag:server", "tag:web"}}, TagMatchIntersection) {
+		t.Fatal("intersect")
+	}
+	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{"tag:web"}}, TagMatchIntersection) {
+		t.Fatal("disjoint tags")
+	}
+	if !trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{"tag:server"}}, TagMatchEqual) {
+		t.Fatal("equal")
+	}
+	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{"tag:server", "tag:web"}}, TagMatchEqual) {
+		t.Fatal("equal rejects superset")
+	}
+	if !trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{"tag:server", "tag:web"}}, TagMatchContains) {
+		t.Fatal("contains superset")
+	}
+	if trustedMeshPeer(meshIdentity{tags: []string{"tag:server", "tag:web"}}, meshIdentity{tags: []string{"tag:server"}}, TagMatchContains) {
+		t.Fatal("contains rejects missing tag")
+	}
+
+	// Mullvad always denied.
+	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, tags: []string{mullvadExitNodeTag}}, TagMatchIntersection) {
 		t.Fatal("mullvad tag")
 	}
-	if isSameUserPeer(self, &ipnstate.PeerStatus{
-		UserID:  testUserSelf,
-		DNSName: "se-mma-wg-001.mullvad.ts.net.",
-	}) {
+	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, dns: "se.mullvad.ts.net."}, TagMatchIntersection) {
 		t.Fatal("mullvad dns")
 	}
-	// ExitNodeOption alone is not Mullvad.
-	if !isSameUserPeer(self, &ipnstate.PeerStatus{
-		UserID:         testUserSelf,
-		ExitNodeOption: true,
-		DNSName:        "home-exit.tailnet.ts.net.",
-	}) {
-		t.Fatal("user-run exit node same user")
+	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{mullvadExitNodeTag, "tag:server"}}, TagMatchIntersection) {
+		t.Fatal("mullvad among tags")
 	}
 }
 
@@ -425,7 +527,7 @@ func TestClaimedMatchesWhoIs(t *testing.T) {
 	}
 }
 
-func TestWhoIsSameUser(t *testing.T) {
+func TestMeshPeerAllowed(t *testing.T) {
 	self := &ipnstate.PeerStatus{UserID: testUserSelf}
 	same := &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
@@ -434,7 +536,7 @@ func TestWhoIsSameUser(t *testing.T) {
 		},
 		UserProfile: &tailcfg.UserProfile{ID: testUserSelf},
 	}
-	if !whoIsSameUser(self, same) {
+	if !meshPeerAllowed(self, same, TagMatchIntersection) {
 		t.Fatal("same user")
 	}
 
@@ -445,77 +547,112 @@ func TestWhoIsSameUser(t *testing.T) {
 		},
 		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
 	}
-	if whoIsSameUser(self, other) {
+	if meshPeerAllowed(self, other, TagMatchIntersection) {
 		t.Fatal("other user")
 	}
 
-	// Name match alone is not ownership — Node.User must equal Self.
-	if whoIsSameUser(self, &apitype.WhoIsResponse{
+	if meshPeerAllowed(self, &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{Name: "peer.tailnet.ts.net.", User: 0},
-	}) {
+	}, TagMatchIntersection) {
 		t.Fatal("zero peer User must fail closed")
 	}
-	if whoIsSameUser(&ipnstate.PeerStatus{UserID: 0}, same) {
+	if meshPeerAllowed(&ipnstate.PeerStatus{UserID: 0}, same, TagMatchIntersection) {
 		t.Fatal("zero self UserID must fail closed")
 	}
-	if whoIsSameUser(nil, same) {
+	if meshPeerAllowed(nil, same, TagMatchIntersection) {
 		t.Fatal("nil self")
 	}
-	if whoIsSameUser(self, nil) {
+	if meshPeerAllowed(self, nil, TagMatchIntersection) {
 		t.Fatal("nil who")
 	}
 
-	// UserProfile disagrees with accepted Node.User — fail closed.
-	if whoIsSameUser(self, &apitype.WhoIsResponse{
+	// UserProfile disagrees with Self — fail closed on untagged path.
+	if meshPeerAllowed(self, &apitype.WhoIsResponse{
 		Node:        &tailcfg.Node{User: testUserSelf},
 		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
-	}) {
+	}, TagMatchIntersection) {
 		t.Fatal("profile mismatch")
 	}
 
-	// ShareeNode must not authenticate as a same-user peer.
+	// ShareeNode must not authenticate.
 	hi := (&tailcfg.Hostinfo{ShareeNode: true}).View()
-	// Hostinfo on Node is a HostinfoView; construct via pointer assignment.
 	shareeNode := &tailcfg.Node{User: testUserSelf}
 	shareeNode.Hostinfo = hi
-	if whoIsSameUser(self, &apitype.WhoIsResponse{Node: shareeNode}) {
+	if meshPeerAllowed(self, &apitype.WhoIsResponse{Node: shareeNode}, TagMatchIntersection) {
 		t.Fatal("sharee node")
 	}
 
-	// Tags do not reject same-owner WhoIs identity.
+	// Untagged self allows same-user tagged peer.
+	if !meshPeerAllowed(self, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
+	}, TagMatchIntersection) {
+		t.Fatal("untagged self + tagged peer same user")
+	}
+
+	// Tagged self: tag match, not UserID.
 	tagServer := views.SliceOf([]string{"tag:server"})
-	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
-	if !whoIsSameUser(taggedSelf, same) {
-		t.Fatal("tagged self should allow same-user peer")
+	taggedSelf := &ipnstate.PeerStatus{UserID: 9999, Tags: &tagServer}
+	if meshPeerAllowed(taggedSelf, same, TagMatchIntersection) {
+		t.Fatal("tagged self must not accept untagged peer via UserID")
 	}
-	if !whoIsSameUser(self, &apitype.WhoIsResponse{
-		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
-	}) {
-		t.Fatal("tagged peer same user")
+	if !meshPeerAllowed(taggedSelf, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: 1, Tags: []string{"tag:server"}},
+	}, TagMatchIntersection) {
+		t.Fatal("tagged self + intersecting peer tags")
 	}
-	if !whoIsSameUser(taggedSelf, &apitype.WhoIsResponse{
-		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
-	}) {
-		t.Fatal("both tagged same UserID")
+	if !meshPeerAllowed(taggedSelf, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{Tags: []string{"tag:server", "tag:web"}},
+	}, TagMatchContains) {
+		t.Fatal("contains")
+	}
+	if meshPeerAllowed(taggedSelf, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{Tags: []string{"tag:server", "tag:web"}},
+	}, TagMatchEqual) {
+		t.Fatal("equal rejects superset")
 	}
 
 	// Explicit Mullvad markers on WhoIs path (tag and/or DNS).
-	if whoIsSameUser(self, &apitype.WhoIsResponse{
+	if meshPeerAllowed(self, &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
 			Name: "se.tailnet.ts.net.",
 			User: testUserSelf,
 			Tags: []string{mullvadExitNodeTag},
 		},
-	}) {
+	}, TagMatchIntersection) {
 		t.Fatal("mullvad tag")
 	}
-	if whoIsSameUser(self, &apitype.WhoIsResponse{
+	if meshPeerAllowed(self, &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
 			Name: "se-mma-wg-001.mullvad.ts.net.",
 			User: testUserSelf,
 		},
-	}) {
+	}, TagMatchIntersection) {
 		t.Fatal("mullvad dns")
+	}
+}
+
+func TestParseTagMatchMode(t *testing.T) {
+	m, err := ParseTagMatchMode("")
+	if err != nil || m != TagMatchIntersection {
+		t.Fatalf("empty: %v %v", m, err)
+	}
+	m, err = ParseTagMatchMode("intersect")
+	if err != nil || m != TagMatchIntersection {
+		t.Fatalf("intersect: %v %v", m, err)
+	}
+	m, err = ParseTagMatchMode("equal")
+	if err != nil || m != TagMatchEqual {
+		t.Fatalf("equal: %v %v", m, err)
+	}
+	m, err = ParseTagMatchMode("contains")
+	if err != nil || m != TagMatchContains {
+		t.Fatalf("contains: %v %v", m, err)
+	}
+	if _, err := ParseTagMatchMode("nope"); err == nil {
+		t.Fatal("want error")
+	}
+	if TagMatchIntersection.String() != "intersect" || TagMatchEqual.String() != "equal" || TagMatchContains.String() != "contains" {
+		t.Fatal("String()")
 	}
 }
 

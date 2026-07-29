@@ -76,15 +76,20 @@ Discovery is a **background service** that builds a roster of persistent peer se
 
 | Source | Role |
 |--------|------|
-| **Status Online (same user)** | Candidates from Tailscale status owned by the current user (IPs preferred; MagicDNS fallback) |
+| **Status Online (mesh trust)** | Candidates from Tailscale status: untagged Self → same user; tagged Self → `-tag-match` on peer tags (IPs preferred; MagicDNS fallback) |
 | **`-peers`** | Test/override pin only; when set, status discovery is skipped |
-| **Inbound** | Accept connections from the current user's machines only (WhoIs + Hello; plain mode is local tests) |
+| **Inbound** | Accept connections from trusted mesh peers only (WhoIs + Hello; plain mode is local tests) |
 
 Once connected, each peer has **at most one** QUIC connection. Hello is **connection-scoped** (not per stream). Application ops (notify, manifest, file, delta, ping) open short-lived streams on that connection. Redundant connections are rejected with `already_connected`; simultaneous dial races pick a deterministic winner by node ID. Unhealthy sessions (failed heartbeats) are replaced and re-discovered with exponential backoff (**never permanently banned**). Discovery dials use an in-flight concurrency semaphore (default 32) that is released **before** backoff sleep so other peers can still dial.
 
 Notify and pull use the **connected roster** only (no one-shot dial-per-op). Pull content streams are capped globally (default 8). Offline (status) peers are not dialed.
 
-With empty `-peers`, discovery dials **online nodes owned by the current Tailscale user** (same `UserID` as Self)—not every node on the tailnet. Tagged machines of that user are included. Shared-in devices, other users' machines, sharee-only netmap entries, and Mullvad exit nodes (`tag:mullvad-exit-node` and/or `*.mullvad.ts.net`) are skipped. Soft dial failures and exponential backoff are expected for nodes that do not run tailsync; they do not block writers. Inbound Hello is bound to Tailscale WhoIs and the same ownership check (plain/local test mode skips WhoIs). Use **`-peers host:port,...`** only for local tests / explicit overrides.
+With empty `-peers`, discovery uses **mesh trust** on online status peers—not every node on the tailnet:
+
+- **Untagged Self** (typical laptop/desktop): dial peers with the same Tailscale `UserID`. Real tagged nodes usually sit under the synthetic `tagged-devices` user, so they do not match.
+- **Tagged Self** (typical server): dial other **tagged** peers whose tags relate per **`-tag-match`**: `intersect` (default, share at least one tag), `equal` (same tag set), or `contains` (peer has every tag on Self).
+
+Sharee-only netmap entries and Mullvad exit nodes (`tag:mullvad-exit-node` and/or `*.mullvad.ts.net`) are always skipped. Soft dial failures and exponential backoff are expected for nodes that do not run tailsync; they do not block writers. Inbound Hello is bound to Tailscale WhoIs and the **same** trust policy (plain/local test mode skips WhoIs). Cross-class meshes (untagged laptop ↔ tagged server) are out of scope for automatic discovery; use **`-peers host:port,...`** only for local tests / explicit overrides.
 
 ```bash
 # two machines (each uses its host Tailscale identity; zero-config mesh)

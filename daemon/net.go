@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -97,69 +96,32 @@ func isMullvadPeer(p *ipnstate.PeerStatus) bool {
 	if p == nil {
 		return false
 	}
-	if p.Tags != nil && p.Tags.ContainsFunc(func(tag string) bool {
-		return tag == mullvadExitNodeTag
-	}) {
-		return true
-	}
-	return isMullvadDNSName(p.DNSName)
+	id := meshIdentityFromPeerStatus(p)
+	return isMullvadIdentity(id.tags, id.dns)
 }
 
-// isMullvadWhoIs reports whether WhoIs identity is a Mullvad exit-node peer
-// (tag and/or DNS), matching isMullvadPeer for the wire path.
-func isMullvadWhoIs(who *apitype.WhoIsResponse) bool {
-	if who == nil || who.Node == nil {
-		return false
-	}
-	n := who.Node
-	if slices.Contains(n.Tags, mullvadExitNodeTag) {
-		return true
-	}
-	return isMullvadDNSName(n.Name)
-}
-
-// isSameUserPeer reports whether p is a trusted mesh peer for tailsync: owned
-// by the same Tailscale user as Self (matching PeerStatus.UserID), not a
-// sharee-only netmap entry, and not an explicit product peer we skip (Mullvad).
-// Tags do not gate allow/deny — tagged machines of the same user are allowed.
+// peersFromStatus returns dial addresses (host:port) for online mesh peers
+// excluding self. Prefers the first Tailscale IP for reliable dialing with the
+// host net stack (does not depend on MagicDNS); falls back to MagicDNS when no
+// IP is known.
 //
-// Fail closed when either UserID is unknown. ShareeNode peers exist only so a
-// share recipient can dial a node we shared; they are never candidates.
-func isSameUserPeer(self, p *ipnstate.PeerStatus) bool {
-	if self == nil || p == nil {
-		return false
-	}
-	if self.UserID == 0 || p.UserID == 0 {
-		return false
-	}
-	if p.ShareeNode {
-		return false
-	}
-	if isMullvadPeer(p) {
-		return false
-	}
-	return p.UserID == self.UserID
-}
-
-// peersFromStatus returns dial addresses (host:port) for online peers that
-// belong to the current Tailscale user, excluding self. Prefers the first
-// Tailscale IP for reliable dialing with the host net stack (does not depend
-// on MagicDNS); falls back to MagicDNS when no IP is known.
-//
-// Only peers with the same PeerStatus.UserID as Self are candidates. Shared-in
-// nodes, sharee-only netmap entries, other users' machines on multi-user
-// tailnets, and Mullvad exit nodes are skipped. Tags on Self or peer do not
-// exclude a candidate. When Self or Self.UserID is unavailable, returns nil
-// (fail closed — never discover the whole mesh).
+// Trust policy (see trustedMeshPeer): untagged Self → same UserID; tagged Self
+// → TagMatchMode against peer tags. Sharees, Mullvad, and other users /
+// untagged-vs-tagged mismatches are skipped. Fail closed when Self identity is
+// unusable (untagged with unknown UserID, or missing Self).
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
-func peersFromStatus(st *ipnstate.Status, port int) []string {
-	if st == nil || st.Self == nil || st.Self.UserID == 0 {
+func peersFromStatus(st *ipnstate.Status, port int, mode TagMatchMode) []string {
+	if st == nil || st.Self == nil {
+		return nil
+	}
+	selfID := meshIdentityFromPeerStatus(st.Self)
+	if !selfID.tagged() && selfID.user == 0 {
 		return nil
 	}
 	self := st.Self
-	selfID := string(self.ID)
+	selfStable := string(self.ID)
 	selfDNS := strings.TrimSuffix(self.DNSName, ".")
 	portStr := strconv.Itoa(port)
 	var addrs []string
@@ -167,10 +129,10 @@ func peersFromStatus(st *ipnstate.Status, port int) []string {
 		if p == nil || !p.Online {
 			continue
 		}
-		if selfID != "" && string(p.ID) == selfID {
+		if selfStable != "" && string(p.ID) == selfStable {
 			continue
 		}
-		if !isSameUserPeer(self, p) {
+		if !trustedMeshPeer(selfID, meshIdentityFromPeerStatus(p), mode) {
 			continue
 		}
 		dns := strings.TrimSuffix(p.DNSName, ".")
@@ -255,10 +217,10 @@ func (d *Daemon) newMesh() (*peer.Manager, error) {
 }
 
 // verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
-// remoteAddr and that the peer is owned by the current Tailscale user (same
-// UserID; tags OK; rejects sharees and Mullvad). Prevents roster hijack under
-// skip-verify TLS and blocks shared-in / other users' nodes even when their
-// Hello names match wire identity.
+// remoteAddr and that the peer is a trusted mesh peer (same UserID when Self is
+// untagged; TagMatchMode when Self is tagged; rejects sharees and Mullvad).
+// Prevents roster hijack under skip-verify TLS and blocks wrong-identity nodes
+// even when their Hello names match wire identity.
 func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
 	lc, err := d.localClient()
 	if err != nil {
@@ -274,48 +236,22 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	if !claimedMatchesWhoIs(claimed, who) {
 		return fmt.Errorf("hello node id %q does not match tailscale peer at %s", claimed, remoteAddr)
 	}
-	// Ownership from LocalAPI (Self.UserID + WhoIs Node.User), not Hello alone.
+	// Trust from LocalAPI Self + WhoIs, not Hello alone.
 	st, err := lc.StatusWithoutPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("status: %w", err)
 	}
-	if st == nil || st.Self == nil || st.Self.UserID == 0 {
+	if st == nil || st.Self == nil {
+		return fmt.Errorf("cannot determine local tailscale identity")
+	}
+	selfID := meshIdentityFromPeerStatus(st.Self)
+	if !selfID.tagged() && selfID.user == 0 {
 		return fmt.Errorf("cannot determine local tailscale user")
 	}
-	if !whoIsSameUser(st.Self, who) {
-		return fmt.Errorf("peer at %s is not a machine of the current tailscale user", remoteAddr)
+	if !meshPeerAllowed(st.Self, who, d.cfg.TagMatch) {
+		return fmt.Errorf("peer at %s is not a trusted mesh peer", remoteAddr)
 	}
 	return nil
-}
-
-// whoIsSameUser reports whether WhoIs identity is a trusted mesh peer for
-// tailsync: owned by the same Tailscale user as Self (Node.User, and
-// UserProfile when present), not a sharee-only netmap node, and not Mullvad.
-// Tags on Self or the remote node do not reject. Fail closed when ownership
-// cannot be determined. Uses control-plane fields, not the claimed Hello string.
-func whoIsSameUser(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse) bool {
-	if self == nil || self.UserID == 0 || who == nil || who.Node == nil {
-		return false
-	}
-	if who.Node.Hostinfo.Valid() && who.Node.Hostinfo.ShareeNode() {
-		return false
-	}
-	if isMullvadWhoIs(who) {
-		return false
-	}
-	peerUID := who.Node.User
-	if peerUID == 0 {
-		return false
-	}
-	if peerUID != self.UserID {
-		return false
-	}
-	// Cross-check profile when control plane provided one (successful WhoIs
-	// always includes UserProfile; still tolerate nil for partial test fixtures).
-	if who.UserProfile != nil && who.UserProfile.ID != 0 && who.UserProfile.ID != self.UserID {
-		return false
-	}
-	return true
 }
 
 // localClient returns the LocalAPI client for host or tsnet mode.
@@ -677,8 +613,8 @@ func (d *Daemon) closeNetworkBackend() {
 	d.local = nil
 }
 
-// listPeers returns online discovery peers from Tailscale status that belong
-// to the current user (see peersFromStatus).
+// listPeers returns online discovery peers from Tailscale status that pass
+// mesh trust (see peersFromStatus / trustedMeshPeer).
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 	switch d.cfg.NetMode {
 	case NetModePlain:
@@ -696,7 +632,7 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		// Also skip by configured tsnet hostname (Self may use a different DNS form).
-		addrs := peersFromStatus(st, d.cfg.Port)
+		addrs := peersFromStatus(st, d.cfg.Port, d.cfg.TagMatch)
 		return filterSelfHostname(addrs, d.cfg.Hostname), nil
 	default: // host
 		lc := d.local
@@ -707,6 +643,6 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return peersFromStatus(st, d.cfg.Port), nil
+		return peersFromStatus(st, d.cfg.Port, d.cfg.TagMatch), nil
 	}
 }
