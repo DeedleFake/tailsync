@@ -96,8 +96,9 @@ func meshIdentityFromPeerStatus(p *ipnstate.PeerStatus) meshIdentity {
 	return id
 }
 
-// meshIdentityFromWhoIs maps WhoIs identity. ok is false when Node is missing.
-// UserProfile vs Node.User consistency is checked in meshPeerAllowed.
+// meshIdentityFromWhoIs maps WhoIs Node fields into meshIdentity.
+// ok is false when Node is missing. UserProfile is ignored: LocalAPI WhoIs is
+// trusted, and peer ownership/tags come from Node (same facts as status peers).
 func meshIdentityFromWhoIs(who *apitype.WhoIsResponse) (id meshIdentity, ok bool) {
 	if who == nil || who.Node == nil {
 		return meshIdentity{}, false
@@ -141,21 +142,15 @@ func trustedMeshPeer(self, peer meshIdentity, meshTag string) bool {
 	return peer.user == self.user
 }
 
-// meshPeerAllowed is the WhoIs-path trust check: same policy as trustedMeshPeer,
-// plus UserProfile must not disagree with Self when Self is untagged.
+// meshPeerAllowed is the WhoIs-path adapter: map Self + WhoIs to meshIdentity
+// and apply the same policy as discovery (trustedMeshPeer).
 func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, meshTag string) bool {
 	if self == nil {
 		return false
 	}
-	sid := meshIdentityFromPeerStatus(self)
 	pid, ok := meshIdentityFromWhoIs(who)
 	if !ok {
 		return false
 	}
-	// Cross-check profile when Self is user-owned (successful WhoIs usually
-	// includes UserProfile; nil is tolerated for partial fixtures).
-	if !sid.tagged() && who.UserProfile != nil && who.UserProfile.ID != 0 && who.UserProfile.ID != sid.user {
-		return false
-	}
-	return trustedMeshPeer(sid, pid, meshTag)
+	return trustedMeshPeer(meshIdentityFromPeerStatus(self), pid, meshTag)
 }

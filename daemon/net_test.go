@@ -545,7 +545,6 @@ func TestMeshPeerAllowed(t *testing.T) {
 			Name: "peer.tailnet.ts.net.",
 			User: testUserSelf,
 		},
-		UserProfile: &tailcfg.UserProfile{ID: testUserSelf},
 	}
 	if !meshPeerAllowed(self, same, "") {
 		t.Fatal("same user")
@@ -556,7 +555,6 @@ func TestMeshPeerAllowed(t *testing.T) {
 			Name: "other.tailnet.ts.net.",
 			User: testUserOther,
 		},
-		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
 	}
 	if meshPeerAllowed(self, other, "") {
 		t.Fatal("other user")
@@ -575,14 +573,6 @@ func TestMeshPeerAllowed(t *testing.T) {
 	}
 	if meshPeerAllowed(self, nil, "") {
 		t.Fatal("nil who")
-	}
-
-	// UserProfile disagrees with Self — fail closed on untagged path.
-	if meshPeerAllowed(self, &apitype.WhoIsResponse{
-		Node:        &tailcfg.Node{User: testUserSelf},
-		UserProfile: &tailcfg.UserProfile{ID: testUserOther},
-	}, "") {
-		t.Fatal("profile mismatch")
 	}
 
 	// ShareeNode must not authenticate.
