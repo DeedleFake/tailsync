@@ -205,6 +205,13 @@ type Daemon struct {
 	netMu           sync.Mutex
 	injectNetChange func() // NetModeTSNet: mon.InjectEvent after Up; nil otherwise
 
+	// meshGateMu guards the compiled mesh-trust policy (last Self snapshot).
+	// Set at listen and refreshed on status discovery; Hello reads it without
+	// re-fetching Self on every handshake.
+	meshGateMu  sync.RWMutex
+	meshGate    meshGate
+	hasMeshGate bool
+
 	// streamWG tracks in-flight handleStream goroutines so Run can drain them
 	// before closing root (avoids nil/use-after-close races on d.root).
 	streamWG sync.WaitGroup

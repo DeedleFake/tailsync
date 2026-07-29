@@ -55,7 +55,8 @@ func validateMeshTagFormat(s string) error {
 //   - untagged Self: MeshTag must be empty
 //   - tagged Self: MeshTag required and present on Self
 //
-// Call after LocalAPI status is available (host/tsnet listen).
+// Prefer newMeshGate, which runs this check and compiles the hot-path policy.
+// Call after LocalAPI status is available (host/tsnet listen or status refresh).
 func checkSelfMeshTagConfig(self meshIdentity, meshTag string) error {
 	if !self.tagged() {
 		if meshTag != "" {
@@ -120,42 +121,52 @@ func meshIdentityFromWhoIs(who *apitype.WhoIsResponse) (id meshIdentity, ok bool
 	return id, true
 }
 
-// trustedMeshPeer reports whether peer may join the mesh with self under meshTag.
+// meshGate is a compiled mesh-trust policy for one Self snapshot.
 //
-// Policy:
-//   - Product skips: sharee-only netmap entries and Mullvad are never trusted.
-//   - Untagged self: same Tailscale UserID (fail closed on unknown IDs). Peer
-//     tags do not matter; real tagged nodes usually use the synthetic
-//     tagged-devices user and therefore do not match.
-//   - Tagged self: peer must carry meshTag (Config.MeshTag / -mesh-tag).
-//     UserID is ignored (tagged-devices is shared across all tagged nodes).
-//     Fail closed if meshTag is empty or not on Self (listen should reject
-//     that config before serving).
-func trustedMeshPeer(self, peer meshIdentity, meshTag string) bool {
+// Build with newMeshGate after LocalAPI Self is known (listen and each status
+// refresh). Reuse for every peer in that evaluation; do not re-decide
+// user-vs-tag mode per peer. Refresh when Self may have changed (discovery
+// status); Hello uses the last good gate so it does not re-fetch Self on every
+// handshake.
+//
+// Policy (after construction succeeds):
+//   - requireTag non-empty: peer must carry that ACL tag (tagged Self mode).
+//   - requireTag empty: peer must share user (untagged Self mode). User 0 fails
+//     closed for all peers.
+//   - Sharee-only and Mullvad peers are never allowed.
+type meshGate struct {
+	// requireTag is set in tagged-Self mode (Config.MeshTag). Empty means
+	// same-user mode.
+	requireTag string
+	// user is Self's Tailscale UserID in same-user mode. Ignored when
+	// requireTag is set.
+	user tailcfg.UserID
+}
+
+// newMeshGate validates MeshTag against Self and compiles the hot-path policy.
+// On error the gate must not be used (fail closed).
+func newMeshGate(self meshIdentity, meshTag string) (meshGate, error) {
+	if err := checkSelfMeshTagConfig(self, meshTag); err != nil {
+		return meshGate{}, err
+	}
+	if self.tagged() {
+		// checkSelfMeshTagConfig ensures meshTag is non-empty and on Self.
+		return meshGate{requireTag: meshTag}, nil
+	}
+	// Untagged: same-user mode. user may be 0 (allows nothing until refresh).
+	return meshGate{user: self.user}, nil
+}
+
+// allows reports whether peer may join the mesh under this gate.
+func (g meshGate) allows(peer meshIdentity) bool {
 	if peer.sharee || isMullvadIdentity(peer.tags, peer.dns) {
 		return false
 	}
-	if self.tagged() {
-		if meshTag == "" || !slices.Contains(self.tags, meshTag) {
-			return false
-		}
-		return slices.Contains(peer.tags, meshTag)
+	if g.requireTag != "" {
+		return slices.Contains(peer.tags, g.requireTag)
 	}
-	if self.user == 0 || peer.user == 0 {
+	if g.user == 0 || peer.user == 0 {
 		return false
 	}
-	return peer.user == self.user
-}
-
-// meshPeerAllowed is the WhoIs-path adapter: map Self + WhoIs to meshIdentity
-// and apply the same policy as discovery (trustedMeshPeer).
-func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, meshTag string) bool {
-	if self == nil {
-		return false
-	}
-	pid, ok := meshIdentityFromWhoIs(who)
-	if !ok {
-		return false
-	}
-	return trustedMeshPeer(meshIdentityFromPeerStatus(self), pid, meshTag)
+	return peer.user == g.user
 }

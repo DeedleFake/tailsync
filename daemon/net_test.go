@@ -115,7 +115,7 @@ func TestPeersFromStatus(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960, "")
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, ""))
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":            true, // prefers IP over MagicDNS
 		"laptop.tailnet.ts.net:5960": true, // DNS fallback when no IP
@@ -252,7 +252,7 @@ func TestPeersFromStatusUntaggedSelf(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960, "")
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, ""))
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
 		"100.64.0.8:5960":  true, // same UserID even if tagged
@@ -325,7 +325,7 @@ func TestPeersFromStatusTaggedSelf(t *testing.T) {
 		},
 	}
 
-	got := peersFromStatus(st, 5960, mesh)
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, mesh))
 	want := map[string]bool{
 		"100.64.0.10:5960": true,
 		"100.64.0.11:5960": true,
@@ -339,9 +339,9 @@ func TestPeersFromStatusTaggedSelf(t *testing.T) {
 		}
 	}
 
-	// Missing mesh tag on config → no candidates (fail closed).
-	if got := peersFromStatus(st, 5960, ""); len(got) != 0 {
-		t.Fatalf("empty mesh tag: %v", got)
+	// Missing mesh tag on config → gate construction fails (fail closed).
+	if _, err := newMeshGate(meshIdentityFromPeerStatus(st.Self), ""); err == nil {
+		t.Fatal("empty mesh tag want error")
 	}
 }
 
@@ -354,80 +354,107 @@ func TestPeersFromStatusFailClosedNoSelfUser(t *testing.T) {
 			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 		},
 	}
-	if got := peersFromStatus(nil, 5960, ""); len(got) != 0 {
+	if got := peersFromStatus(nil, 5960, meshGate{}); len(got) != 0 {
 		t.Fatalf("nil status: %v", got)
 	}
-	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960, ""); len(got) != 0 {
+	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960, meshGate{}); len(got) != 0 {
 		t.Fatalf("nil self: %v", got)
 	}
+	zeroSelf := &ipnstate.PeerStatus{ID: "self", UserID: 0}
+	gZero, err := newMeshGate(meshIdentityFromPeerStatus(zeroSelf), "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := peersFromStatus(&ipnstate.Status{
-		Self: &ipnstate.PeerStatus{ID: "self", UserID: 0},
+		Self: zeroSelf,
 		Peer: peer,
-	}, 5960, ""); len(got) != 0 {
+	}, 5960, gZero); len(got) != 0 {
 		t.Fatalf("zero self UserID: %v", got)
 	}
 	// Tagged Self does not use UserID; untagged peer is not a candidate.
 	tagServer := views.SliceOf([]string{"tag:server"})
+	tagSelf := &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer}
 	got := peersFromStatus(&ipnstate.Status{
-		Self: &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer},
+		Self: tagSelf,
 		Peer: peer,
-	}, 5960, "tag:server")
+	}, 5960, mustMeshGate(t, tagSelf, "tag:server"))
 	if len(got) != 0 {
 		t.Fatalf("tagged self must not discover untagged peers via UserID: %v", got)
 	}
 }
 
-func TestTrustedMeshPeer(t *testing.T) {
+func mustMeshGate(t *testing.T, self *ipnstate.PeerStatus, meshTag string) meshGate {
+	t.Helper()
+	g, err := newMeshGate(meshIdentityFromPeerStatus(self), meshTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func TestMeshGateAllows(t *testing.T) {
 	self := meshIdentity{user: testUserSelf}
-	if trustedMeshPeer(self, meshIdentity{}, "") {
+	g, err := newMeshGate(self, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.allows(meshIdentity{}) {
 		t.Fatal("zero peer user")
 	}
-	if trustedMeshPeer(meshIdentity{}, meshIdentity{user: testUserSelf}, "") {
+	gZero, err := newMeshGate(meshIdentity{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gZero.allows(meshIdentity{user: testUserSelf}) {
 		t.Fatal("zero self user")
 	}
-	if trustedMeshPeer(self, meshIdentity{user: testUserOther}, "") {
+	if g.allows(meshIdentity{user: testUserOther}) {
 		t.Fatal("other user")
 	}
-	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, sharee: true}, "") {
+	if g.allows(meshIdentity{user: testUserSelf, sharee: true}) {
 		t.Fatal("sharee")
 	}
-	if !trustedMeshPeer(self, meshIdentity{user: testUserSelf}, "") {
+	if !g.allows(meshIdentity{user: testUserSelf}) {
 		t.Fatal("same user")
 	}
 
 	// Untagged self: UserID match even if peer is tagged.
-	if !trustedMeshPeer(self, meshIdentity{user: testUserSelf, tags: []string{"tag:server"}}, "") {
+	if !g.allows(meshIdentity{user: testUserSelf, tags: []string{"tag:server"}}) {
 		t.Fatal("untagged self + tagged peer same user")
 	}
 
 	// Tagged self: mesh tag only; UserID ignored.
 	const mesh = "tag:tailsync"
 	taggedSelf := meshIdentity{user: 9999, tags: []string{mesh, "tag:server"}}
-	if trustedMeshPeer(taggedSelf, meshIdentity{user: 9999}, mesh) {
+	tg, err := newMeshGate(taggedSelf, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tg.allows(meshIdentity{user: 9999}) {
 		t.Fatal("tagged self must not trust untagged peer")
 	}
-	if !trustedMeshPeer(taggedSelf, meshIdentity{user: 1, tags: []string{mesh, "tag:web"}}, mesh) {
+	if !tg.allows(meshIdentity{user: 1, tags: []string{mesh, "tag:web"}}) {
 		t.Fatal("peer with mesh tag")
 	}
-	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{"tag:server"}}, mesh) {
+	if tg.allows(meshIdentity{tags: []string{"tag:server"}}) {
 		t.Fatal("shared broad tag only must not match")
 	}
-	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{mesh}}, "") {
+	if _, err := newMeshGate(taggedSelf, ""); err == nil {
 		t.Fatal("empty mesh tag fail closed")
 	}
 	// Self does not carry configured mesh tag.
-	if trustedMeshPeer(meshIdentity{tags: []string{"tag:server"}}, meshIdentity{tags: []string{mesh}}, mesh) {
+	if _, err := newMeshGate(meshIdentity{tags: []string{"tag:server"}}, mesh); err == nil {
 		t.Fatal("self missing mesh tag")
 	}
 
 	// Mullvad always denied.
-	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, tags: []string{mullvadExitNodeTag}}, "") {
+	if g.allows(meshIdentity{user: testUserSelf, tags: []string{mullvadExitNodeTag}}) {
 		t.Fatal("mullvad tag")
 	}
-	if trustedMeshPeer(self, meshIdentity{user: testUserSelf, dns: "se.mullvad.ts.net."}, "") {
+	if g.allows(meshIdentity{user: testUserSelf, dns: "se.mullvad.ts.net."}) {
 		t.Fatal("mullvad dns")
 	}
-	if trustedMeshPeer(taggedSelf, meshIdentity{tags: []string{mullvadExitNodeTag, mesh}}, mesh) {
+	if tg.allows(meshIdentity{tags: []string{mullvadExitNodeTag, mesh}}) {
 		t.Fatal("mullvad among tags")
 	}
 }
@@ -541,15 +568,18 @@ func TestClaimedMatchesWhoIs(t *testing.T) {
 	}
 }
 
-func TestMeshPeerAllowed(t *testing.T) {
+func TestMeshGateFromWhoIs(t *testing.T) {
+	// WhoIs path: compile gate from Self PeerStatus, allow via meshIdentityFromWhoIs.
 	self := &ipnstate.PeerStatus{UserID: testUserSelf}
+	g := mustMeshGate(t, self, "")
 	same := &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
 			Name: "peer.tailnet.ts.net.",
 			User: testUserSelf,
 		},
 	}
-	if !meshPeerAllowed(self, same, "") {
+	pid, ok := meshIdentityFromWhoIs(same)
+	if !ok || !g.allows(pid) {
 		t.Fatal("same user")
 	}
 
@@ -559,22 +589,22 @@ func TestMeshPeerAllowed(t *testing.T) {
 			User: testUserOther,
 		},
 	}
-	if meshPeerAllowed(self, other, "") {
+	pid, ok = meshIdentityFromWhoIs(other)
+	if !ok || g.allows(pid) {
 		t.Fatal("other user")
 	}
 
-	if meshPeerAllowed(self, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{Name: "peer.tailnet.ts.net.", User: 0},
-	}, "") {
+	})
+	if !ok || g.allows(pid) {
 		t.Fatal("zero peer User must fail closed")
 	}
-	if meshPeerAllowed(&ipnstate.PeerStatus{UserID: 0}, same, "") {
+	gZero := mustMeshGate(t, &ipnstate.PeerStatus{UserID: 0}, "")
+	if gZero.allows(meshIdentity{user: testUserSelf}) {
 		t.Fatal("zero self UserID must fail closed")
 	}
-	if meshPeerAllowed(nil, same, "") {
-		t.Fatal("nil self")
-	}
-	if meshPeerAllowed(self, nil, "") {
+	if _, ok := meshIdentityFromWhoIs(nil); ok {
 		t.Fatal("nil who")
 	}
 
@@ -582,14 +612,16 @@ func TestMeshPeerAllowed(t *testing.T) {
 	hi := (&tailcfg.Hostinfo{ShareeNode: true}).View()
 	shareeNode := &tailcfg.Node{User: testUserSelf}
 	shareeNode.Hostinfo = hi
-	if meshPeerAllowed(self, &apitype.WhoIsResponse{Node: shareeNode}, "") {
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{Node: shareeNode})
+	if !ok || g.allows(pid) {
 		t.Fatal("sharee node")
 	}
 
 	// Untagged self allows same-user tagged peer.
-	if !meshPeerAllowed(self, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
-	}, "") {
+	})
+	if !ok || !g.allows(pid) {
 		t.Fatal("untagged self + tagged peer same user")
 	}
 
@@ -597,36 +629,42 @@ func TestMeshPeerAllowed(t *testing.T) {
 	const mesh = "tag:tailsync"
 	tagMesh := views.SliceOf([]string{mesh, "tag:server"})
 	taggedSelf := &ipnstate.PeerStatus{UserID: 9999, Tags: &tagMesh}
-	if meshPeerAllowed(taggedSelf, same, mesh) {
+	tg := mustMeshGate(t, taggedSelf, mesh)
+	pid, ok = meshIdentityFromWhoIs(same)
+	if !ok || tg.allows(pid) {
 		t.Fatal("tagged self must not accept untagged peer via UserID")
 	}
-	if !meshPeerAllowed(taggedSelf, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{User: 1, Tags: []string{mesh}},
-	}, mesh) {
+	})
+	if !ok || !tg.allows(pid) {
 		t.Fatal("tagged self + peer with mesh tag")
 	}
-	if meshPeerAllowed(taggedSelf, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{Tags: []string{"tag:server"}},
-	}, mesh) {
+	})
+	if !ok || tg.allows(pid) {
 		t.Fatal("broad tag only must not match")
 	}
 
 	// Explicit Mullvad markers on WhoIs path (tag and/or DNS).
-	if meshPeerAllowed(self, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
 			Name: "se.tailnet.ts.net.",
 			User: testUserSelf,
 			Tags: []string{mullvadExitNodeTag},
 		},
-	}, "") {
+	})
+	if !ok || g.allows(pid) {
 		t.Fatal("mullvad tag")
 	}
-	if meshPeerAllowed(self, &apitype.WhoIsResponse{
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
 		Node: &tailcfg.Node{
 			Name: "se-mma-wg-001.mullvad.ts.net.",
 			User: testUserSelf,
 		},
-	}, "") {
+	})
+	if !ok || g.allows(pid) {
 		t.Fatal("mullvad dns")
 	}
 }

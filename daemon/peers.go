@@ -9,10 +9,10 @@ import (
 // discoveryCandidates builds dial targets for the peer discovery service.
 // Explicit Config.Peers pins skip status discovery (test determinism / fixed
 // dial lists). Pins do not bypass mesh trust: on host/tsnet, Hello still runs
-// WhoIs + trustedMeshPeer. When Peers is empty, Online status peers that pass
-// mesh trust are returned (untagged Self → same UserID; tagged Self → MeshTag;
-// excludes self, sharees, Mullvad). Connected sessions are filtered out by
-// discovery itself.
+// WhoIs + the compiled mesh gate. When Peers is empty, Online status peers that
+// pass mesh trust are returned (untagged Self → same UserID; tagged Self →
+// MeshTag; excludes self, sharees, Mullvad). Connected sessions are filtered
+// out by discovery itself.
 func (d *Daemon) discoveryCandidates(ctx context.Context) []peer.Candidate {
 	if len(d.cfg.Peers) > 0 {
 		out := make([]peer.Candidate, 0, len(d.cfg.Peers))
