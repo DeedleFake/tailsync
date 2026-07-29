@@ -10,6 +10,30 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
+// peers. Those peers appear Online on the tailnet but never run tailsync.
+const mullvadExitNodeTag = "tag:mullvad-exit-node"
+
+// mullvadDNSSuffix is the MagicDNS suffix of Mullvad exit nodes (with or
+// without a trailing dot on the full name).
+const mullvadDNSSuffix = "mullvad.ts.net"
+
+// isMullvadDNSName reports whether dns is under the Mullvad MagicDNS domain.
+func isMullvadDNSName(dns string) bool {
+	dns = strings.ToLower(strings.TrimSuffix(dns, "."))
+	return dns == mullvadDNSSuffix || strings.HasSuffix(dns, "."+mullvadDNSSuffix)
+}
+
+// isMullvadIdentity reports whether identity facts mark a Mullvad exit node:
+// tag:mullvad-exit-node and/or a mullvad.ts.net DNS name. Do not use
+// ExitNodeOption alone — user-run exit nodes may still run tailsync.
+func isMullvadIdentity(tags []string, dns string) bool {
+	if slices.Contains(tags, mullvadExitNodeTag) {
+		return true
+	}
+	return isMullvadDNSName(dns)
+}
+
 // normalizeMeshTag trims MeshTag / -mesh-tag values.
 func normalizeMeshTag(s string) string {
 	return strings.TrimSpace(s)
@@ -134,11 +158,4 @@ func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, mesh
 		return false
 	}
 	return trustedMeshPeer(sid, pid, meshTag)
-}
-
-func isMullvadIdentity(tags []string, dns string) bool {
-	if slices.Contains(tags, mullvadExitNodeTag) {
-		return true
-	}
-	return isMullvadDNSName(dns)
 }

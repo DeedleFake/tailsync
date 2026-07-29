@@ -75,31 +75,6 @@ func nodeIDFromSelf(self *ipnstate.PeerStatus) string {
 	return string(self.ID)
 }
 
-// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
-// peers. Those peers appear Online on the tailnet but never run tailsync.
-const mullvadExitNodeTag = "tag:mullvad-exit-node"
-
-// mullvadDNSSuffix is the MagicDNS suffix of Mullvad exit nodes (with or
-// without a trailing dot on the full name).
-const mullvadDNSSuffix = "mullvad.ts.net"
-
-// isMullvadDNSName reports whether dns is under the Mullvad MagicDNS domain.
-func isMullvadDNSName(dns string) bool {
-	dns = strings.ToLower(strings.TrimSuffix(dns, "."))
-	return dns == mullvadDNSSuffix || strings.HasSuffix(dns, "."+mullvadDNSSuffix)
-}
-
-// isMullvadPeer reports whether p is a Tailscale Mullvad exit-node peer:
-// tag:mullvad-exit-node and/or a mullvad.ts.net DNS name. Do not use
-// ExitNodeOption alone — user-run exit nodes may still run tailsync.
-func isMullvadPeer(p *ipnstate.PeerStatus) bool {
-	if p == nil {
-		return false
-	}
-	id := meshIdentityFromPeerStatus(p)
-	return isMullvadIdentity(id.tags, id.dns)
-}
-
 // peersFromStatus returns dial addresses (host:port) for online mesh peers
 // excluding self. Prefers the first Tailscale IP for reliable dialing with the
 // host net stack (does not depend on MagicDNS); falls back to MagicDNS when no
@@ -108,7 +83,8 @@ func isMullvadPeer(p *ipnstate.PeerStatus) bool {
 // Trust policy (see trustedMeshPeer): untagged Self → same UserID; tagged Self
 // → peer must carry meshTag. Sharees, Mullvad, and other users /
 // untagged-vs-tagged mismatches are skipped. Fail closed when Self identity is
-// unusable (untagged with unknown UserID, or missing Self).
+// unusable (untagged with unknown UserID, tagged without usable MeshTag, or
+// missing Self).
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
@@ -117,9 +93,6 @@ func peersFromStatus(st *ipnstate.Status, port int, meshTag string) []string {
 		return nil
 	}
 	selfID := meshIdentityFromPeerStatus(st.Self)
-	if !selfID.tagged() && selfID.user == 0 {
-		return nil
-	}
 	self := st.Self
 	selfStable := string(self.ID)
 	selfDNS := strings.TrimSuffix(self.DNSName, ".")
@@ -243,10 +216,6 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	}
 	if st == nil || st.Self == nil {
 		return fmt.Errorf("cannot determine local tailscale identity")
-	}
-	selfID := meshIdentityFromPeerStatus(st.Self)
-	if !selfID.tagged() && selfID.user == 0 {
-		return fmt.Errorf("cannot determine local tailscale user")
 	}
 	if !meshPeerAllowed(st.Self, who, d.cfg.MeshTag) {
 		return fmt.Errorf("peer at %s is not a trusted mesh peer", remoteAddr)

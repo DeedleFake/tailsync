@@ -462,30 +462,33 @@ func TestValidateMeshTagFormat(t *testing.T) {
 	}
 }
 
-func TestIsMullvadPeer(t *testing.T) {
-	if isMullvadPeer(nil) {
-		t.Fatal("nil")
+func TestIsMullvadIdentity(t *testing.T) {
+	if isMullvadIdentity(nil, "") {
+		t.Fatal("empty")
 	}
-	if isMullvadPeer(&ipnstate.PeerStatus{DNSName: "laptop.tailnet.ts.net."}) {
+	id := meshIdentityFromPeerStatus(&ipnstate.PeerStatus{DNSName: "laptop.tailnet.ts.net."})
+	if isMullvadIdentity(id.tags, id.dns) {
 		t.Fatal("normal peer")
 	}
 	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
-	if !isMullvadPeer(&ipnstate.PeerStatus{
+	id = meshIdentityFromPeerStatus(&ipnstate.PeerStatus{
 		DNSName: "se.tailnet.ts.net.",
 		Tags:    &mullvadTags,
-	}) {
+	})
+	if !isMullvadIdentity(id.tags, id.dns) {
 		t.Fatal("tag")
 	}
-	if !isMullvadPeer(&ipnstate.PeerStatus{DNSName: "se-mma-wg-001.mullvad.ts.net."}) {
+	if !isMullvadIdentity(nil, "se-mma-wg-001.mullvad.ts.net.") {
 		t.Fatal("dns with trailing dot")
 	}
-	if !isMullvadPeer(&ipnstate.PeerStatus{DNSName: "se-mma-wg-001.mullvad.ts.net"}) {
+	if !isMullvadIdentity(nil, "se-mma-wg-001.mullvad.ts.net") {
 		t.Fatal("dns without trailing dot")
 	}
-	if isMullvadPeer(&ipnstate.PeerStatus{
+	id = meshIdentityFromPeerStatus(&ipnstate.PeerStatus{
 		DNSName:        "home-exit.tailnet.ts.net.",
 		ExitNodeOption: true,
-	}) {
+	})
+	if isMullvadIdentity(id.tags, id.dns) {
 		t.Fatal("ExitNodeOption alone must not mark Mullvad")
 	}
 }
