@@ -132,6 +132,8 @@ func TestPeersFromStatus(t *testing.T) {
 }
 
 func TestPeersFromStatusSameUserOnly(t *testing.T) {
+	tagServer := views.SliceOf([]string{"tag:server"})
+	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
 	st := &ipnstate.Status{
 		Self: &ipnstate.PeerStatus{
 			ID:      "self",
@@ -146,6 +148,16 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 				Online:       true,
 				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+			},
+			// Same-owner tagged machine must still mesh.
+			key.NewNode().Public(): {
+				ID:           "tagged-server",
+				HostName:     "server",
+				DNSName:      "server.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserSelf,
+				Tags:         &tagServer,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.8")},
 			},
 			// Other user's machine on the same multi-user tailnet.
 			key.NewNode().Public(): {
@@ -204,15 +216,26 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 				ExitNodeOption: true,
 				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.60")},
 			},
-			// Foreign product node (e.g. Mullvad) has different owner.
+			// Mullvad by tag (even if UserID matched — real shape uses tag).
 			key.NewNode().Public(): {
-				ID:             "mullvad-se",
+				ID:             "mullvad-tag",
 				HostName:       "se-mma-wg-001",
-				DNSName:        "se-mma-wg-001.mullvad.ts.net.",
+				DNSName:        "se-mma-wg-001.tailnet.ts.net.",
 				Online:         true,
-				UserID:         testUserOther,
+				UserID:         testUserSelf,
 				ExitNodeOption: true,
+				Tags:           &mullvadTags,
 				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
+			},
+			// Mullvad by DNS suffix alone (without relying on other UserID).
+			key.NewNode().Public(): {
+				ID:             "mullvad-dns",
+				HostName:       "se-mma-wg-002",
+				DNSName:        "se-mma-wg-002.mullvad.ts.net.",
+				Online:         true,
+				UserID:         testUserSelf,
+				ExitNodeOption: true,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.51")},
 			},
 		},
 	}
@@ -220,7 +243,8 @@ func TestPeersFromStatusSameUserOnly(t *testing.T) {
 	got := peersFromStatus(st, 5960)
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
-		"100.64.0.60:5960": true,
+		"100.64.0.8:5960":  true, // same-user tagged
+		"100.64.0.60:5960": true, // user-run exit node
 	}
 	if len(got) != len(wantSet) {
 		t.Fatalf("got %v", got)
@@ -253,12 +277,14 @@ func TestPeersFromStatusFailClosedNoSelfUser(t *testing.T) {
 	}, 5960); len(got) != 0 {
 		t.Fatalf("zero self UserID: %v", got)
 	}
+	// Tagged Self still discovers same-user peers (tags do not fail closed).
 	tagServer := views.SliceOf([]string{"tag:server"})
-	if got := peersFromStatus(&ipnstate.Status{
+	got := peersFromStatus(&ipnstate.Status{
 		Self: &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer},
 		Peer: peer,
-	}, 5960); len(got) != 0 {
-		t.Fatalf("tagged self: %v", got)
+	}, 5960)
+	if len(got) != 1 || got[0] != "100.64.0.2:5960" {
+		t.Fatalf("tagged self should still discover same-user peers: %v", got)
 	}
 }
 
@@ -286,19 +312,71 @@ func TestIsSameUserPeer(t *testing.T) {
 		t.Fatal("same user should match")
 	}
 
-	// IsSelfUntagged: any tags drop user ownership (synthetic shared owners).
+	// Tags do not gate same-owner allow/deny.
 	tagServer := views.SliceOf([]string{"tag:server"})
 	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
 	taggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
 	untaggedPeer := &ipnstate.PeerStatus{UserID: testUserSelf}
-	if isSameUserPeer(taggedSelf, untaggedPeer) {
-		t.Fatal("tagged self")
+	if !isSameUserPeer(taggedSelf, untaggedPeer) {
+		t.Fatal("tagged self + untagged peer same user")
 	}
-	if isSameUserPeer(self, taggedPeer) {
-		t.Fatal("tagged peer")
+	if !isSameUserPeer(self, taggedPeer) {
+		t.Fatal("tagged peer same user")
 	}
-	if isSameUserPeer(taggedSelf, taggedPeer) {
+	if !isSameUserPeer(taggedSelf, taggedPeer) {
 		t.Fatal("both tagged same UserID")
+	}
+
+	// Explicit Mullvad markers deny even with matching UserID.
+	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
+	if isSameUserPeer(self, &ipnstate.PeerStatus{
+		UserID:  testUserSelf,
+		Tags:    &mullvadTags,
+		DNSName: "exit.tailnet.ts.net.",
+	}) {
+		t.Fatal("mullvad tag")
+	}
+	if isSameUserPeer(self, &ipnstate.PeerStatus{
+		UserID:  testUserSelf,
+		DNSName: "se-mma-wg-001.mullvad.ts.net.",
+	}) {
+		t.Fatal("mullvad dns")
+	}
+	// ExitNodeOption alone is not Mullvad.
+	if !isSameUserPeer(self, &ipnstate.PeerStatus{
+		UserID:         testUserSelf,
+		ExitNodeOption: true,
+		DNSName:        "home-exit.tailnet.ts.net.",
+	}) {
+		t.Fatal("user-run exit node same user")
+	}
+}
+
+func TestIsMullvadPeer(t *testing.T) {
+	if isMullvadPeer(nil) {
+		t.Fatal("nil")
+	}
+	if isMullvadPeer(&ipnstate.PeerStatus{DNSName: "laptop.tailnet.ts.net."}) {
+		t.Fatal("normal peer")
+	}
+	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
+	if !isMullvadPeer(&ipnstate.PeerStatus{
+		DNSName: "se.tailnet.ts.net.",
+		Tags:    &mullvadTags,
+	}) {
+		t.Fatal("tag")
+	}
+	if !isMullvadPeer(&ipnstate.PeerStatus{DNSName: "se-mma-wg-001.mullvad.ts.net."}) {
+		t.Fatal("dns with trailing dot")
+	}
+	if !isMullvadPeer(&ipnstate.PeerStatus{DNSName: "se-mma-wg-001.mullvad.ts.net"}) {
+		t.Fatal("dns without trailing dot")
+	}
+	if isMullvadPeer(&ipnstate.PeerStatus{
+		DNSName:        "home-exit.tailnet.ts.net.",
+		ExitNodeOption: true,
+	}) {
+		t.Fatal("ExitNodeOption alone must not mark Mullvad")
 	}
 }
 
@@ -404,21 +482,40 @@ func TestWhoIsSameUser(t *testing.T) {
 		t.Fatal("sharee node")
 	}
 
-	// IsSelfUntagged: tags drop user ownership even with matching UserID.
+	// Tags do not reject same-owner WhoIs identity.
 	tagServer := views.SliceOf([]string{"tag:server"})
 	taggedSelf := &ipnstate.PeerStatus{UserID: testUserSelf, Tags: &tagServer}
-	if whoIsSameUser(taggedSelf, same) {
-		t.Fatal("tagged self")
+	if !whoIsSameUser(taggedSelf, same) {
+		t.Fatal("tagged self should allow same-user peer")
 	}
-	if whoIsSameUser(self, &apitype.WhoIsResponse{
+	if !whoIsSameUser(self, &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
 	}) {
-		t.Fatal("tagged peer")
+		t.Fatal("tagged peer same user")
 	}
-	if whoIsSameUser(taggedSelf, &apitype.WhoIsResponse{
+	if !whoIsSameUser(taggedSelf, &apitype.WhoIsResponse{
 		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
 	}) {
 		t.Fatal("both tagged same UserID")
+	}
+
+	// Explicit Mullvad markers on WhoIs path (tag and/or DNS).
+	if whoIsSameUser(self, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{
+			Name: "se.tailnet.ts.net.",
+			User: testUserSelf,
+			Tags: []string{mullvadExitNodeTag},
+		},
+	}) {
+		t.Fatal("mullvad tag")
+	}
+	if whoIsSameUser(self, &apitype.WhoIsResponse{
+		Node: &tailcfg.Node{
+			Name: "se-mma-wg-001.mullvad.ts.net.",
+			User: testUserSelf,
+		},
+	}) {
+		t.Fatal("mullvad dns")
 	}
 }
 

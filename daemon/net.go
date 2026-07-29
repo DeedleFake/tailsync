@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -75,11 +76,52 @@ func nodeIDFromSelf(self *ipnstate.PeerStatus) string {
 	return string(self.ID)
 }
 
-// isSameUserPeer reports whether p is a trusted peer for tailsync: both nodes
-// untagged and owned by the same Tailscale user (Tailscale IsSelfUntagged
-// semantics). Tagged nodes are identity-by-tags, not user ownership—many
-// control planes assign them a synthetic shared owner—so they are never
-// treated as "the current user's machines."
+// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
+// peers. Those peers appear Online on the tailnet but never run tailsync.
+const mullvadExitNodeTag = "tag:mullvad-exit-node"
+
+// mullvadDNSSuffix is the MagicDNS suffix of Mullvad exit nodes (with or
+// without a trailing dot on the full name).
+const mullvadDNSSuffix = "mullvad.ts.net"
+
+// isMullvadDNSName reports whether dns is under the Mullvad MagicDNS domain.
+func isMullvadDNSName(dns string) bool {
+	dns = strings.ToLower(strings.TrimSuffix(dns, "."))
+	return dns == mullvadDNSSuffix || strings.HasSuffix(dns, "."+mullvadDNSSuffix)
+}
+
+// isMullvadPeer reports whether p is a Tailscale Mullvad exit-node peer:
+// tag:mullvad-exit-node and/or a mullvad.ts.net DNS name. Do not use
+// ExitNodeOption alone — user-run exit nodes may still run tailsync.
+func isMullvadPeer(p *ipnstate.PeerStatus) bool {
+	if p == nil {
+		return false
+	}
+	if p.Tags != nil && p.Tags.ContainsFunc(func(tag string) bool {
+		return tag == mullvadExitNodeTag
+	}) {
+		return true
+	}
+	return isMullvadDNSName(p.DNSName)
+}
+
+// isMullvadWhoIs reports whether WhoIs identity is a Mullvad exit-node peer
+// (tag and/or DNS), matching isMullvadPeer for the wire path.
+func isMullvadWhoIs(who *apitype.WhoIsResponse) bool {
+	if who == nil || who.Node == nil {
+		return false
+	}
+	n := who.Node
+	if slices.Contains(n.Tags, mullvadExitNodeTag) {
+		return true
+	}
+	return isMullvadDNSName(n.Name)
+}
+
+// isSameUserPeer reports whether p is a trusted mesh peer for tailsync: owned
+// by the same Tailscale user as Self (matching PeerStatus.UserID), not a
+// sharee-only netmap entry, and not an explicit product peer we skip (Mullvad).
+// Tags do not gate allow/deny — tagged machines of the same user are allowed.
 //
 // Fail closed when either UserID is unknown. ShareeNode peers exist only so a
 // share recipient can dial a node we shared; they are never candidates.
@@ -87,13 +129,13 @@ func isSameUserPeer(self, p *ipnstate.PeerStatus) bool {
 	if self == nil || p == nil {
 		return false
 	}
-	if self.IsTagged() || p.IsTagged() {
-		return false
-	}
 	if self.UserID == 0 || p.UserID == 0 {
 		return false
 	}
 	if p.ShareeNode {
+		return false
+	}
+	if isMullvadPeer(p) {
 		return false
 	}
 	return p.UserID == self.UserID
@@ -104,16 +146,16 @@ func isSameUserPeer(self, p *ipnstate.PeerStatus) bool {
 // Tailscale IP for reliable dialing with the host net stack (does not depend
 // on MagicDNS); falls back to MagicDNS when no IP is known.
 //
-// Only untagged peers with the same PeerStatus.UserID as Self are candidates
-// (IsSelfUntagged). Shared-in nodes, sharee-only netmap entries, tagged nodes,
-// and other users' machines on multi-user tailnets are skipped. When Self,
-// Self.UserID is unavailable, or Self is tagged, returns nil (fail closed —
-// never discover the whole mesh).
+// Only peers with the same PeerStatus.UserID as Self are candidates. Shared-in
+// nodes, sharee-only netmap entries, other users' machines on multi-user
+// tailnets, and Mullvad exit nodes are skipped. Tags on Self or peer do not
+// exclude a candidate. When Self or Self.UserID is unavailable, returns nil
+// (fail closed — never discover the whole mesh).
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
 func peersFromStatus(st *ipnstate.Status, port int) []string {
-	if st == nil || st.Self == nil || st.Self.UserID == 0 || st.Self.IsTagged() {
+	if st == nil || st.Self == nil || st.Self.UserID == 0 {
 		return nil
 	}
 	self := st.Self
@@ -213,9 +255,10 @@ func (d *Daemon) newMesh() (*peer.Manager, error) {
 }
 
 // verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
-// remoteAddr and that the peer is owned by the current Tailscale user.
-// Prevents roster hijack under skip-verify TLS and blocks shared-in / other
-// users' nodes even when their Hello names match wire identity.
+// remoteAddr and that the peer is owned by the current Tailscale user (same
+// UserID; tags OK; rejects sharees and Mullvad). Prevents roster hijack under
+// skip-verify TLS and blocks shared-in / other users' nodes even when their
+// Hello names match wire identity.
 func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
 	lc, err := d.localClient()
 	if err != nil {
@@ -239,28 +282,25 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	if st == nil || st.Self == nil || st.Self.UserID == 0 {
 		return fmt.Errorf("cannot determine local tailscale user")
 	}
-	if st.Self.IsTagged() {
-		return fmt.Errorf("local node is tagged; tailsync requires untagged user-owned nodes")
-	}
 	if !whoIsSameUser(st.Self, who) {
-		return fmt.Errorf("peer at %s is not an untagged machine of the current tailscale user", remoteAddr)
+		return fmt.Errorf("peer at %s is not a machine of the current tailscale user", remoteAddr)
 	}
 	return nil
 }
 
-// whoIsSameUser reports whether WhoIs identity is a trusted peer for tailsync:
-// both Self and the remote node untagged and owned by the same Tailscale user
-// (IsSelfUntagged). Uses control-plane Node.User (and UserProfile when present),
-// not the claimed Hello string. Sharee-only netmap nodes and tagged nodes are
-// rejected. Fail closed when ownership cannot be determined.
+// whoIsSameUser reports whether WhoIs identity is a trusted mesh peer for
+// tailsync: owned by the same Tailscale user as Self (Node.User, and
+// UserProfile when present), not a sharee-only netmap node, and not Mullvad.
+// Tags on Self or the remote node do not reject. Fail closed when ownership
+// cannot be determined. Uses control-plane fields, not the claimed Hello string.
 func whoIsSameUser(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse) bool {
 	if self == nil || self.UserID == 0 || who == nil || who.Node == nil {
 		return false
 	}
-	if self.IsTagged() || who.Node.IsTagged() {
+	if who.Node.Hostinfo.Valid() && who.Node.Hostinfo.ShareeNode() {
 		return false
 	}
-	if who.Node.Hostinfo.Valid() && who.Node.Hostinfo.ShareeNode() {
+	if isMullvadWhoIs(who) {
 		return false
 	}
 	peerUID := who.Node.User

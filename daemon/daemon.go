@@ -123,11 +123,12 @@ type Config struct {
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port) for tests
 	// and overrides. When empty, discovery dials Online peers owned by the
-	// current Tailscale user (untagged, same UserID as Self; excludes self,
-	// shared-in devices, other users, sharee-only and tagged nodes). When set,
-	// status discovery is skipped (test determinism), but host/tsnet handshakes
-	// still enforce WhoIs + same-user ownership. Soft dial failures and backoff
-	// handle nodes that are Online but not running tailsync.
+	// current Tailscale user (same UserID as Self; excludes self, shared-in
+	// devices, other users, sharee-only nodes, and Mullvad). Tags do not
+	// exclude same-owner peers. When set, status discovery is skipped (test
+	// determinism), but host/tsnet handshakes still enforce WhoIs + same-user
+	// ownership (and Mullvad skip). Soft dial failures and backoff handle
+	// nodes that are Online but not running tailsync.
 	Peers []string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
