@@ -102,22 +102,24 @@ func meshIdentityFromPeerStatus(p *ipnstate.PeerStatus) meshIdentity {
 }
 
 // meshIdentityFromWhoIs maps WhoIs Node fields into meshIdentity.
-// ok is false when Node is missing. UserProfile is ignored: LocalAPI WhoIs is
-// trusted, and peer ownership/tags come from Node (same facts as status peers).
+// ok is false when Node is missing or Hostinfo is invalid. Hostinfo is required
+// for ShareeNode: missing Hostinfo fails closed so unknown sharee state cannot
+// authenticate. UserProfile is ignored: LocalAPI WhoIs is trusted; peer
+// ownership/tags come from Node (same facts as status peers).
 func meshIdentityFromWhoIs(who *apitype.WhoIsResponse) (id meshIdentity, ok bool) {
 	if who == nil || who.Node == nil {
 		return meshIdentity{}, false
 	}
 	n := who.Node
-	id = meshIdentity{
-		user: n.User,
-		dns:  n.Name,
-		tags: slices.Clone(n.Tags),
+	if !n.Hostinfo.Valid() {
+		return meshIdentity{}, false
 	}
-	if n.Hostinfo.Valid() {
-		id.sharee = n.Hostinfo.ShareeNode()
-	}
-	return id, true
+	return meshIdentity{
+		user:   n.User,
+		dns:    n.Name,
+		tags:   slices.Clone(n.Tags),
+		sharee: n.Hostinfo.ShareeNode(),
+	}, true
 }
 
 // meshGate is a compiled mesh-trust policy for one Self snapshot.

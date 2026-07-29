@@ -588,15 +588,23 @@ func TestClaimedMatchesWhoIs(t *testing.T) {
 	}
 }
 
+// whoIsNode builds a WhoIs Node with valid Hostinfo (required for fail-closed
+// sharee detection). ShareeNode defaults to false unless set on hi.
+func whoIsNode(user tailcfg.UserID, name string, tags []string, hi *tailcfg.Hostinfo) *tailcfg.Node {
+	if hi == nil {
+		hi = &tailcfg.Hostinfo{}
+	}
+	n := &tailcfg.Node{User: user, Name: name, Tags: tags}
+	n.Hostinfo = hi.View()
+	return n
+}
+
 func TestMeshGateFromWhoIs(t *testing.T) {
 	// WhoIs path: compile gate from Self PeerStatus, allow via meshIdentityFromWhoIs.
 	self := &ipnstate.PeerStatus{UserID: testUserSelf}
 	g := mustMeshGate(t, self, "")
 	same := &apitype.WhoIsResponse{
-		Node: &tailcfg.Node{
-			Name: "peer.tailnet.ts.net.",
-			User: testUserSelf,
-		},
+		Node: whoIsNode(testUserSelf, "peer.tailnet.ts.net.", nil, nil),
 	}
 	pid, ok := meshIdentityFromWhoIs(same)
 	if !ok || !g.allows(pid) {
@@ -604,10 +612,7 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 	}
 
 	other := &apitype.WhoIsResponse{
-		Node: &tailcfg.Node{
-			Name: "other.tailnet.ts.net.",
-			User: testUserOther,
-		},
+		Node: whoIsNode(testUserOther, "other.tailnet.ts.net.", nil, nil),
 	}
 	pid, ok = meshIdentityFromWhoIs(other)
 	if !ok || g.allows(pid) {
@@ -615,7 +620,7 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 	}
 
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{Name: "peer.tailnet.ts.net.", User: 0},
+		Node: whoIsNode(0, "peer.tailnet.ts.net.", nil, nil),
 	})
 	if !ok || g.allows(pid) {
 		t.Fatal("zero peer User must fail closed")
@@ -628,10 +633,15 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 		t.Fatal("nil who")
 	}
 
+	// Missing Hostinfo: fail closed (unknown sharee must not authenticate).
+	if _, ok := meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: testUserSelf, Name: "peer.tailnet.ts.net."},
+	}); ok {
+		t.Fatal("missing Hostinfo want ok=false")
+	}
+
 	// ShareeNode must not authenticate.
-	hi := (&tailcfg.Hostinfo{ShareeNode: true}).View()
-	shareeNode := &tailcfg.Node{User: testUserSelf}
-	shareeNode.Hostinfo = hi
+	shareeNode := whoIsNode(testUserSelf, "", nil, &tailcfg.Hostinfo{ShareeNode: true})
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{Node: shareeNode})
 	if !ok || g.allows(pid) {
 		t.Fatal("sharee node")
@@ -639,7 +649,7 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 
 	// Untagged self allows same-user tagged peer.
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{User: testUserSelf, Tags: []string{"tag:server"}},
+		Node: whoIsNode(testUserSelf, "", []string{"tag:server"}, nil),
 	})
 	if !ok || !g.allows(pid) {
 		t.Fatal("untagged self + tagged peer same user")
@@ -655,13 +665,13 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 		t.Fatal("tagged self must not accept untagged peer via UserID")
 	}
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{User: 1, Tags: []string{mesh}},
+		Node: whoIsNode(1, "", []string{mesh}, nil),
 	})
 	if !ok || !tg.allows(pid) {
 		t.Fatal("tagged self + peer with mesh tag")
 	}
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{Tags: []string{"tag:server"}},
+		Node: whoIsNode(0, "", []string{"tag:server"}, nil),
 	})
 	if !ok || tg.allows(pid) {
 		t.Fatal("broad tag only must not match")
@@ -669,20 +679,13 @@ func TestMeshGateFromWhoIs(t *testing.T) {
 
 	// Explicit Mullvad markers on WhoIs path (tag and/or DNS).
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{
-			Name: "se.tailnet.ts.net.",
-			User: testUserSelf,
-			Tags: []string{mullvadExitNodeTag},
-		},
+		Node: whoIsNode(testUserSelf, "se.tailnet.ts.net.", []string{mullvadExitNodeTag}, nil),
 	})
 	if !ok || g.allows(pid) {
 		t.Fatal("mullvad tag")
 	}
 	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
-		Node: &tailcfg.Node{
-			Name: "se-mma-wg-001.mullvad.ts.net.",
-			User: testUserSelf,
-		},
+		Node: whoIsNode(testUserSelf, "se-mma-wg-001.mullvad.ts.net.", nil, nil),
 	})
 	if !ok || g.allows(pid) {
 		t.Fatal("mullvad dns")
