@@ -122,11 +122,19 @@ type Config struct {
 	// ListenHost is used when NetMode is NetModePlain (default 127.0.0.1).
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port) for tests
-	// and overrides. When empty, discovery uses Tailscale status Online peers
-	// (minus self and Mullvad exit nodes). When set, status discovery is skipped
-	// (test determinism). Soft dial failures and backoff handle nodes that are
-	// Online but not running tailsync.
+	// and overrides. When empty, discovery uses mesh trust on Online status
+	// peers: untagged Self → same UserID; tagged Self → peer must carry MeshTag
+	// (excludes self, sharees, Mullvad, and identity mismatches). When set,
+	// status discovery is skipped (test determinism), but host/tsnet handshakes
+	// still enforce WhoIs + the same trust policy. Soft dial failures and
+	// backoff handle nodes that are Online but not running tailsync.
 	Peers []string
+	// MeshTag is the ACL tag peers must share when this machine is tagged
+	// (for example "tag:tailsync"). Required at listen when Self is tagged
+	// and must appear on Self. Must be empty when Self is untagged. Non-empty
+	// values are trimmed, lowercased, and checked with Tailscale's tag rules
+	// at [New] (tag:<letter…>, letters/digits/dashes only).
+	MeshTag string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
 	// for listen success or a fast failure. Must not block indefinitely.
@@ -197,6 +205,13 @@ type Daemon struct {
 	// shutdown without observing a half-torn-down callback.
 	netMu           sync.Mutex
 	injectNetChange func() // NetModeTSNet: mon.InjectEvent after Up; nil otherwise
+
+	// meshGateMu guards the compiled mesh-trust policy (last Self snapshot).
+	// Set at listen and refreshed on status discovery; Hello reads it without
+	// re-fetching Self on every handshake.
+	meshGateMu  sync.RWMutex
+	meshGate    meshGate
+	hasMeshGate bool
 
 	// streamWG tracks in-flight handleStream goroutines so Run can drain them
 	// before closing root (avoids nil/use-after-close races on d.root).
@@ -318,6 +333,10 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	if cfg.TombstoneTTL <= 0 {
 		cfg.TombstoneTTL = DefaultTombstoneTTL
+	}
+	cfg.MeshTag, err = parseMeshTag(cfg.MeshTag)
+	if err != nil {
+		return nil, err
 	}
 	log := cfg.Logger
 	if log == nil {

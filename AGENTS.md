@@ -50,11 +50,20 @@ After changing dependencies or tools (for example `go get`, `go get -tool`), alw
 
 ## Agent guidelines
 
-1. **Git is read-only under all circumstances.** Never run write/mutating git commands. That includes (non-exhaustive): `commit`, `add`, `rm`, `mv`, `restore --staged`, `checkout`, `switch`, `branch` (create/delete), `merge`, `rebase`, `cherry-pick`, `stash`, `reset`, `clean`, `tag`, `push`, `pull` (when it updates refs), `am`, `revert`, `commit --amend`, or anything that modifies the index, working tree via git, or remote state. Read-only commands (`status`, `diff`, `log`, `show`, `blame`, `ls-files`, etc.) are fine. Leave all commits and branch management to the user.
-2. **Do not pin versions in this file** — refer to `go.mod` or unversioned names so these instructions stay valid as versions change.
-3. **Verify** with `go test -vet=all ./...`, `go tool modernize ./...`, and `go tool staticcheck ./...` before considering work done. Run `go mod tidy` after any dependency or tool change.
-4. **Secrets** — do not commit tokens, API keys, Tailscale auth keys, or machine-specific paths.
-5. **Tailscale boundary** — prefer networking over the tailnet only; do not introduce public Internet or bind-to-all behavior unless explicitly requested.
+1. **User-facing language (ASD-STE100).** Write all responses to the user in [ASD-STE100](https://www.asd-ste100.org/) Simplified Technical English unless the user explicitly says otherwise. Apply the STE writing rules in practice:
+   - Prefer short, clear sentences (aim for one main idea per sentence; keep sentences short).
+   - Use active voice and simple present/past when you can.
+   - Prefer concrete verbs and nouns; avoid vague wording, jargon, and figurative language.
+   - Use the same word for the same meaning; do not use synonyms for variety.
+   - Prefer approved/common technical terms; explain a term only when the user needs it.
+   - Use vertical lists for procedures and parallel items.
+   - Code identifiers, commands, paths, error strings, and quoted logs stay as-is (do not rewrite them into STE).
+   - This rule applies to chat replies and user-facing text you write (for example README or PR descriptions). It does not force STE style into product source code comments or Go identifiers unless the user asks for that.
+2. **Git is read-only under all circumstances.** Never run write/mutating git commands. That includes (non-exhaustive): `commit`, `add`, `rm`, `mv`, `restore --staged`, `checkout`, `switch`, `branch` (create/delete), `merge`, `rebase`, `cherry-pick`, `stash`, `reset`, `clean`, `tag`, `push`, `pull` (when it updates refs), `am`, `revert`, `commit --amend`, or anything that modifies the index, working tree via git, or remote state. Read-only commands (`status`, `diff`, `log`, `show`, `blame`, `ls-files`, etc.) are fine. Leave all commits and branch management to the user.
+3. **Do not pin versions in this file** — refer to `go.mod` or unversioned names so these instructions stay valid as versions change.
+4. **Verify** with `go test -vet=all ./...`, `go tool modernize ./...`, and `go tool staticcheck ./...` before considering work done. Run `go mod tidy` after any dependency or tool change.
+5. **Secrets** — do not commit tokens, API keys, Tailscale auth keys, or machine-specific paths.
+6. **Tailscale boundary** — prefer networking over the tailnet only; do not introduce public Internet or bind-to-all behavior unless explicitly requested.
 
 ## PR checklist
 

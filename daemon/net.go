@@ -75,52 +75,34 @@ func nodeIDFromSelf(self *ipnstate.PeerStatus) string {
 	return string(self.ID)
 }
 
-// mullvadExitNodeTag is the ACL tag Tailscale applies to Mullvad VPN exit-node
-// peers. Those peers are Online on the tailnet but never run tailsync; dialing
-// them only burns DialTimeout. Do not use ExitNodeOption alone — user-run exit
-// nodes may still run tailsync.
-const mullvadExitNodeTag = "tag:mullvad-exit-node"
-
-// isMullvadPeer reports whether p is a Tailscale Mullvad exit-node peer
-// (has tag:mullvad-exit-node).
-func isMullvadPeer(p *ipnstate.PeerStatus) bool {
-	if p == nil || p.Tags == nil {
-		return false
-	}
-	return p.Tags.ContainsFunc(func(tag string) bool {
-		return tag == mullvadExitNodeTag
-	})
-}
-
-// peersFromStatus returns dial addresses (host:port) for online peers excluding self.
-// Prefers the first Tailscale IP for reliable dialing with the host net stack
-// (does not depend on MagicDNS); falls back to MagicDNS when no IP is known.
-// Mullvad VPN exit nodes (tag:mullvad-exit-node) are always skipped.
+// peersFromStatus returns dial addresses (host:port) for online mesh peers
+// excluding self. Prefers the first Tailscale IP for reliable dialing with the
+// host net stack (does not depend on MagicDNS); falls back to MagicDNS when no
+// IP is known.
+//
+// Trust uses the compiled gate (same UserID or MeshTag; never sharees/Mullvad).
+// Callers build g with newMeshGate from the same Status Self. Missing Self
+// yields nil.
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
-func peersFromStatus(st *ipnstate.Status, port int) []string {
-	if st == nil {
+func peersFromStatus(st *ipnstate.Status, port int, g meshGate) []string {
+	if st == nil || st.Self == nil {
 		return nil
 	}
-	var (
-		selfID  string
-		selfDNS string
-	)
-	if st.Self != nil {
-		selfID = string(st.Self.ID)
-		selfDNS = strings.TrimSuffix(st.Self.DNSName, ".")
-	}
+	self := st.Self
+	selfStable := string(self.ID)
+	selfDNS := strings.TrimSuffix(self.DNSName, ".")
 	portStr := strconv.Itoa(port)
 	var addrs []string
 	for _, p := range st.Peer {
 		if p == nil || !p.Online {
 			continue
 		}
-		if selfID != "" && string(p.ID) == selfID {
+		if selfStable != "" && string(p.ID) == selfStable {
 			continue
 		}
-		if isMullvadPeer(p) {
+		if !g.allows(meshIdentityFromPeerStatus(p)) {
 			continue
 		}
 		dns := strings.TrimSuffix(p.DNSName, ".")
@@ -205,7 +187,13 @@ func (d *Daemon) newMesh() (*peer.Manager, error) {
 }
 
 // verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
-// remoteAddr. Prevents roster hijack under skip-verify TLS on the tailnet.
+// remoteAddr and that the peer passes the compiled mesh gate (same UserID or
+// MeshTag; rejects sharees and Mullvad). Prevents roster hijack under
+// skip-verify TLS and blocks wrong-identity nodes even when their Hello names
+// match wire identity.
+//
+// Uses the last mesh gate from listen / status discovery. If none is cached
+// yet, loads Self once via StatusWithoutPeers and stores the gate.
 func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
 	lc, err := d.localClient()
 	if err != nil {
@@ -221,7 +209,60 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	if !claimedMatchesWhoIs(claimed, who) {
 		return fmt.Errorf("hello node id %q does not match tailscale peer at %s", claimed, remoteAddr)
 	}
+	g, err := d.meshGateForHello(ctx, lc)
+	if err != nil {
+		return err
+	}
+	pid, ok := meshIdentityFromWhoIs(who)
+	if !ok || !g.allows(pid) {
+		return fmt.Errorf("peer at %s is not a trusted mesh peer", remoteAddr)
+	}
 	return nil
+}
+
+// meshGateForHello returns the cached mesh gate, or builds one from Self when
+// the cache is empty (first Hello before a discovery refresh, or pin-only
+// Peers with no listPeers). Does not re-fetch Self when a gate is already stored.
+func (d *Daemon) meshGateForHello(ctx context.Context, lc *local.Client) (meshGate, error) {
+	if g, ok := d.loadMeshGate(); ok {
+		return g, nil
+	}
+	st, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return meshGate{}, fmt.Errorf("status: %w", err)
+	}
+	if st == nil || st.Self == nil {
+		return meshGate{}, fmt.Errorf("cannot determine local tailscale identity")
+	}
+	g, err := newMeshGate(meshIdentityFromPeerStatus(st.Self), d.cfg.MeshTag)
+	if err != nil {
+		return meshGate{}, err
+	}
+	d.storeMeshGate(g)
+	return g, nil
+}
+
+func (d *Daemon) storeMeshGate(g meshGate) {
+	d.meshGateMu.Lock()
+	d.meshGate = g
+	d.hasMeshGate = true
+	d.meshGateMu.Unlock()
+}
+
+func (d *Daemon) clearMeshGate() {
+	d.meshGateMu.Lock()
+	d.hasMeshGate = false
+	d.meshGate = meshGate{}
+	d.meshGateMu.Unlock()
+}
+
+func (d *Daemon) loadMeshGate() (meshGate, bool) {
+	d.meshGateMu.RLock()
+	defer d.meshGateMu.RUnlock()
+	if !d.hasMeshGate {
+		return meshGate{}, false
+	}
+	return d.meshGate, true
 }
 
 // localClient returns the LocalAPI client for host or tsnet mode.
@@ -411,6 +452,15 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 		return fmt.Errorf("tsnet: no Tailscale IPs after up")
 	}
 
+	g, err := newMeshGate(meshIdentityFromPeerStatus(st.Self), d.cfg.MeshTag)
+	if err != nil {
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return err
+	}
+	d.storeMeshGate(g)
+
 	d.nodeID = d.cfg.Hostname
 
 	m, err := d.newMesh()
@@ -523,6 +573,12 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	d.nodeID = id
 	d.cfg.Hostname = id
 
+	g, err := newMeshGate(meshIdentityFromPeerStatus(st.Self), d.cfg.MeshTag)
+	if err != nil {
+		return err
+	}
+	d.storeMeshGate(g)
+
 	m, err := d.newMesh()
 	if err != nil {
 		return err
@@ -581,9 +637,25 @@ func (d *Daemon) closeNetworkBackend() {
 		d.server = nil
 	}
 	d.local = nil
+	d.clearMeshGate()
 }
 
-// listPeers returns online discovery peers from Tailscale status only.
+// refreshMeshGateFromSelf compiles and stores the mesh gate from Self.
+// On config/identity failure clears the cache so Hello fails closed until a
+// later successful refresh.
+func (d *Daemon) refreshMeshGateFromSelf(self *ipnstate.PeerStatus) (meshGate, error) {
+	g, err := newMeshGate(meshIdentityFromPeerStatus(self), d.cfg.MeshTag)
+	if err != nil {
+		d.clearMeshGate()
+		return meshGate{}, err
+	}
+	d.storeMeshGate(g)
+	return g, nil
+}
+
+// listPeers returns online discovery peers from Tailscale status that pass
+// mesh trust (see peersFromStatus / meshGate). Refreshes the stored mesh gate
+// from Self on each successful status so Hello tracks Self tag/UserID changes.
 func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 	switch d.cfg.NetMode {
 	case NetModePlain:
@@ -600,8 +672,12 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		g, err := d.refreshMeshGateFromSelf(st.Self)
+		if err != nil {
+			return nil, err
+		}
 		// Also skip by configured tsnet hostname (Self may use a different DNS form).
-		addrs := peersFromStatus(st, d.cfg.Port)
+		addrs := peersFromStatus(st, d.cfg.Port, g)
 		return filterSelfHostname(addrs, d.cfg.Hostname), nil
 	default: // host
 		lc := d.local
@@ -612,6 +688,10 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return peersFromStatus(st, d.cfg.Port), nil
+		g, err := d.refreshMeshGateFromSelf(st.Self)
+		if err != nil {
+			return nil, err
+		}
+		return peersFromStatus(st, d.cfg.Port, g), nil
 	}
 }

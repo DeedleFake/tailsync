@@ -26,6 +26,12 @@ import (
 	"deedles.dev/tailsync/internal/peer"
 )
 
+// test user IDs for PeerStatus / WhoIs ownership fixtures
+const (
+	testUserSelf  tailcfg.UserID = 1001
+	testUserOther tailcfg.UserID = 2002
+)
+
 func TestBindAddrsFromTailscaleIPs(t *testing.T) {
 	v4 := netip.MustParseAddr("100.64.0.1")
 	v6 := netip.MustParseAddr("fd7a:115c:a1e0::1")
@@ -65,6 +71,7 @@ func TestPeersFromStatus(t *testing.T) {
 			ID:       "self",
 			HostName: "me",
 			DNSName:  "me.tailnet.ts.net.",
+			UserID:   testUserSelf,
 		},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			key.NewNode().Public(): {
@@ -72,6 +79,7 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName:     "tailsync-a",
 				DNSName:      "tailsync-a.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 			},
 			key.NewNode().Public(): {
@@ -79,18 +87,21 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName: "other",
 				DNSName:  "other.tailnet.ts.net.",
 				Online:   false, // offline — skip
+				UserID:   testUserSelf,
 			},
 			key.NewNode().Public(): {
 				ID:       "peer3",
 				HostName: "laptop",
 				DNSName:  "laptop.tailnet.ts.net.",
 				Online:   true, // no IP → MagicDNS fallback
+				UserID:   testUserSelf,
 			},
 			key.NewNode().Public(): {
 				ID:       "self", // same StableID as Self — skip
 				HostName: "me",
 				DNSName:  "me.tailnet.ts.net.",
 				Online:   true,
+				UserID:   testUserSelf,
 			},
 			// Distinct node sharing Self HostName must still be discovered.
 			key.NewNode().Public(): {
@@ -98,12 +109,13 @@ func TestPeersFromStatus(t *testing.T) {
 				HostName:     "me",
 				DNSName:      "clone.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.9")},
 			},
 		},
 	}
 
-	got := peersFromStatus(st, 5960)
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, ""))
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":            true, // prefers IP over MagicDNS
 		"laptop.tailnet.ts.net:5960": true, // DNS fallback when no IP
@@ -119,64 +131,415 @@ func TestPeersFromStatus(t *testing.T) {
 	}
 }
 
-func TestPeersFromStatusSkipsMullvad(t *testing.T) {
+func TestPeersFromStatusUntaggedSelf(t *testing.T) {
+	// Realistic tagged node uses synthetic tagged-devices UserID, not Self.
+	const taggedDevicesUser tailcfg.UserID = 9999
+	tagServer := views.SliceOf([]string{"tag:server"})
 	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
 	st := &ipnstate.Status{
 		Self: &ipnstate.PeerStatus{
 			ID:      "self",
 			DNSName: "me.tailnet.ts.net.",
+			UserID:  testUserSelf,
 		},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			key.NewNode().Public(): {
-				ID:           "real",
+				ID:           "mine",
 				HostName:     "laptop",
 				DNSName:      "laptop.tailnet.ts.net.",
 				Online:       true,
+				UserID:       testUserSelf,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
 			},
-			// Tailscale Mullvad exit nodes carry tag:mullvad-exit-node.
+			// Same UserID + tags still allowed for untagged Self (policy is UserID).
 			key.NewNode().Public(): {
-				ID:             "mullvad-se",
-				HostName:       "se-mma-wg-001",
-				DNSName:        "se-mma-wg-001.mullvad.ts.net.",
-				Online:         true,
-				ExitNodeOption: true,
-				Tags:           &mullvadTags,
-				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
+				ID:           "tagged-same-uid",
+				HostName:     "server",
+				DNSName:      "server.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserSelf,
+				Tags:         &tagServer,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.8")},
 			},
-			// User-run exit node is still a candidate (may run tailsync).
+			// Typical tagged node: tagged-devices user — not same UserID.
+			key.NewNode().Public(): {
+				ID:           "tagged-devices",
+				HostName:     "nas",
+				DNSName:      "nas.tailnet.ts.net.",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagServer,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.80")},
+			},
+			// Other user's machine on the same multi-user tailnet.
+			key.NewNode().Public(): {
+				ID:           "coworker",
+				HostName:     "coworker-pc",
+				DNSName:      "coworker-pc.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
+			},
+			// Shared-in device (foreign owner).
+			key.NewNode().Public(): {
+				ID:           "shared-in",
+				HostName:     "friend-phone",
+				DNSName:      "friend-phone.other.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.4")},
+			},
+			// Sharee-only netmap entry (recipient of a share we made).
+			key.NewNode().Public(): {
+				ID:           "sharee",
+				HostName:     "sharee-laptop",
+				DNSName:      "sharee-laptop.other.ts.net.",
+				Online:       true,
+				UserID:       testUserOther,
+				ShareeNode:   true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.5")},
+			},
+			// Same user id but ShareeNode must still be excluded.
+			key.NewNode().Public(): {
+				ID:           "weird-sharee",
+				HostName:     "weird",
+				DNSName:      "weird.tailnet.ts.net.",
+				Online:       true,
+				UserID:       testUserSelf,
+				ShareeNode:   true,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.6")},
+			},
+			// Zero UserID on peer — fail closed.
+			key.NewNode().Public(): {
+				ID:           "unknown-owner",
+				HostName:     "unknown",
+				DNSName:      "unknown.tailnet.ts.net.",
+				Online:       true,
+				UserID:       0,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.7")},
+			},
+			// User-run exit node owned by self remains a candidate.
 			key.NewNode().Public(): {
 				ID:             "home-exit",
 				HostName:       "home-exit",
 				DNSName:        "home-exit.tailnet.ts.net.",
 				Online:         true,
+				UserID:         testUserSelf,
 				ExitNodeOption: true,
 				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.60")},
 			},
-			// mullvad.ts.net-looking DNS alone is not enough without the tag.
+			// Mullvad by tag (even if UserID matched — real shape uses tag).
 			key.NewNode().Public(): {
-				ID:           "not-mullvad",
-				HostName:     "named-like-mullvad",
-				DNSName:      "fake.mullvad.ts.net.",
-				Online:       true,
-				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.70")},
+				ID:             "mullvad-tag",
+				HostName:       "se-mma-wg-001",
+				DNSName:        "se-mma-wg-001.tailnet.ts.net.",
+				Online:         true,
+				UserID:         testUserSelf,
+				ExitNodeOption: true,
+				Tags:           &mullvadTags,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.50")},
+			},
+			// Mullvad by DNS suffix alone (without relying on other UserID).
+			key.NewNode().Public(): {
+				ID:             "mullvad-dns",
+				HostName:       "se-mma-wg-002",
+				DNSName:        "se-mma-wg-002.mullvad.ts.net.",
+				Online:         true,
+				UserID:         testUserSelf,
+				ExitNodeOption: true,
+				TailscaleIPs:   []netip.Addr{netip.MustParseAddr("100.64.0.51")},
 			},
 		},
 	}
 
-	got := peersFromStatus(st, 5960)
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, ""))
 	wantSet := map[string]bool{
 		"100.64.0.2:5960":  true,
-		"100.64.0.60:5960": true,
-		"100.64.0.70:5960": true,
+		"100.64.0.8:5960":  true, // same UserID even if tagged
+		"100.64.0.60:5960": true, // user-run exit node
 	}
 	if len(got) != len(wantSet) {
 		t.Fatalf("got %v", got)
 	}
 	for _, a := range got {
 		if !wantSet[a] {
-			t.Errorf("unexpected addr %q (Mullvad should be filtered)", a)
+			t.Errorf("unexpected addr %q", a)
 		}
+	}
+}
+
+func TestPeersFromStatusTaggedSelf(t *testing.T) {
+	const taggedDevicesUser tailcfg.UserID = 9999
+	const mesh = "tag:tailsync"
+	tagMesh := views.SliceOf([]string{mesh})
+	tagMeshServer := views.SliceOf([]string{mesh, "tag:server"})
+	tagServerOnly := views.SliceOf([]string{"tag:server"})
+	// Self has mesh + broad tag; only mesh membership should matter.
+	tagSelf := views.SliceOf([]string{mesh, "tag:server"})
+	st := &ipnstate.Status{
+		Self: &ipnstate.PeerStatus{
+			ID:      "self",
+			DNSName: "self.tailnet.ts.net.",
+			UserID:  taggedDevicesUser,
+			Tags:    &tagSelf,
+		},
+		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+			// Has mesh tag — allow.
+			key.NewNode().Public(): {
+				ID:           "peer-mesh",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagMesh,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.10")},
+			},
+			// Mesh + extra tags — allow (extra tags ignored).
+			key.NewNode().Public(): {
+				ID:           "peer-both",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagMeshServer,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.11")},
+			},
+			// Shared broad tag only — deny (would have been allowed under intersect).
+			key.NewNode().Public(): {
+				ID:           "peer-server-only",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				Tags:         &tagServerOnly,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.12")},
+			},
+			// Untagged same synthetic user — tagged Self ignores UserID.
+			key.NewNode().Public(): {
+				ID:           "untagged",
+				Online:       true,
+				UserID:       taggedDevicesUser,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.13")},
+			},
+			// Human user machine — not tagged.
+			key.NewNode().Public(): {
+				ID:           "laptop",
+				Online:       true,
+				UserID:       testUserSelf,
+				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.14")},
+			},
+		},
+	}
+
+	got := peersFromStatus(st, 5960, mustMeshGate(t, st.Self, mesh))
+	want := map[string]bool{
+		"100.64.0.10:5960": true,
+		"100.64.0.11:5960": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("mesh-tag: got %v", got)
+	}
+	for _, a := range got {
+		if !want[a] {
+			t.Errorf("mesh-tag unexpected %q", a)
+		}
+	}
+
+	// Missing mesh tag on config → gate construction fails (fail closed).
+	if _, err := newMeshGate(meshIdentityFromPeerStatus(st.Self), ""); err == nil {
+		t.Fatal("empty mesh tag want error")
+	}
+}
+
+func TestPeersFromStatusFailClosedNoSelfUser(t *testing.T) {
+	peer := map[key.NodePublic]*ipnstate.PeerStatus{
+		key.NewNode().Public(): {
+			ID:           "peer1",
+			Online:       true,
+			UserID:       testUserSelf,
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+		},
+	}
+	if got := peersFromStatus(nil, 5960, meshGate{}); len(got) != 0 {
+		t.Fatalf("nil status: %v", got)
+	}
+	if got := peersFromStatus(&ipnstate.Status{Peer: peer}, 5960, meshGate{}); len(got) != 0 {
+		t.Fatalf("nil self: %v", got)
+	}
+	zeroSelf := &ipnstate.PeerStatus{ID: "self", UserID: 0}
+	gZero, err := newMeshGate(meshIdentityFromPeerStatus(zeroSelf), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := peersFromStatus(&ipnstate.Status{
+		Self: zeroSelf,
+		Peer: peer,
+	}, 5960, gZero); len(got) != 0 {
+		t.Fatalf("zero self UserID: %v", got)
+	}
+	// Tagged Self does not use UserID; untagged peer is not a candidate.
+	tagServer := views.SliceOf([]string{"tag:server"})
+	tagSelf := &ipnstate.PeerStatus{ID: "self", UserID: testUserSelf, Tags: &tagServer}
+	got := peersFromStatus(&ipnstate.Status{
+		Self: tagSelf,
+		Peer: peer,
+	}, 5960, mustMeshGate(t, tagSelf, "tag:server"))
+	if len(got) != 0 {
+		t.Fatalf("tagged self must not discover untagged peers via UserID: %v", got)
+	}
+}
+
+func mustMeshGate(t *testing.T, self *ipnstate.PeerStatus, meshTag string) meshGate {
+	t.Helper()
+	g, err := newMeshGate(meshIdentityFromPeerStatus(self), meshTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func TestMeshGateAllows(t *testing.T) {
+	self := meshIdentity{user: testUserSelf}
+	g, err := newMeshGate(self, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.allows(meshIdentity{}) {
+		t.Fatal("zero peer user")
+	}
+	gZero, err := newMeshGate(meshIdentity{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gZero.allows(meshIdentity{user: testUserSelf}) {
+		t.Fatal("zero self user")
+	}
+	if g.allows(meshIdentity{user: testUserOther}) {
+		t.Fatal("other user")
+	}
+	if g.allows(meshIdentity{user: testUserSelf, sharee: true}) {
+		t.Fatal("sharee")
+	}
+	if !g.allows(meshIdentity{user: testUserSelf}) {
+		t.Fatal("same user")
+	}
+
+	// Untagged self: UserID match even if peer is tagged.
+	if !g.allows(meshIdentity{user: testUserSelf, tags: []string{"tag:server"}}) {
+		t.Fatal("untagged self + tagged peer same user")
+	}
+
+	// Tagged self: mesh tag only; UserID ignored.
+	const mesh = "tag:tailsync"
+	taggedSelf := meshIdentity{user: 9999, tags: []string{mesh, "tag:server"}}
+	tg, err := newMeshGate(taggedSelf, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tg.allows(meshIdentity{user: 9999}) {
+		t.Fatal("tagged self must not trust untagged peer")
+	}
+	if !tg.allows(meshIdentity{user: 1, tags: []string{mesh, "tag:web"}}) {
+		t.Fatal("peer with mesh tag")
+	}
+	if tg.allows(meshIdentity{tags: []string{"tag:server"}}) {
+		t.Fatal("shared broad tag only must not match")
+	}
+	if _, err := newMeshGate(taggedSelf, ""); err == nil {
+		t.Fatal("empty mesh tag fail closed")
+	}
+	// Self does not carry configured mesh tag.
+	if _, err := newMeshGate(meshIdentity{tags: []string{"tag:server"}}, mesh); err == nil {
+		t.Fatal("self missing mesh tag")
+	}
+
+	// Mullvad always denied.
+	if g.allows(meshIdentity{user: testUserSelf, tags: []string{mullvadExitNodeTag}}) {
+		t.Fatal("mullvad tag")
+	}
+	if g.allows(meshIdentity{user: testUserSelf, dns: "se.mullvad.ts.net."}) {
+		t.Fatal("mullvad dns")
+	}
+	if tg.allows(meshIdentity{tags: []string{mullvadExitNodeTag, mesh}}) {
+		t.Fatal("mullvad among tags")
+	}
+}
+
+func TestCheckSelfMeshTagConfig(t *testing.T) {
+	if err := checkSelfMeshTagConfig(meshIdentity{user: testUserSelf}, ""); err != nil {
+		t.Fatalf("untagged: %v", err)
+	}
+	if err := checkSelfMeshTagConfig(meshIdentity{user: testUserSelf}, "tag:tailsync"); err == nil {
+		t.Fatal("untagged with mesh tag want error")
+	}
+	if err := checkSelfMeshTagConfig(meshIdentity{tags: []string{"tag:tailsync"}}, ""); err == nil {
+		t.Fatal("tagged without mesh tag want error")
+	}
+	if err := checkSelfMeshTagConfig(meshIdentity{tags: []string{"tag:server"}}, "tag:tailsync"); err == nil {
+		t.Fatal("self missing mesh tag want error")
+	}
+	if err := checkSelfMeshTagConfig(meshIdentity{tags: []string{"tag:tailsync", "tag:server"}}, "tag:tailsync"); err != nil {
+		t.Fatalf("ok: %v", err)
+	}
+}
+
+func TestParseMeshTag(t *testing.T) {
+	got, err := parseMeshTag("")
+	if err != nil || got != "" {
+		t.Fatalf("empty: got %q, %v", got, err)
+	}
+	got, err = parseMeshTag("  tag:tailsync  ")
+	if err != nil || got != "tag:tailsync" {
+		t.Fatalf("trim: got %q, %v", got, err)
+	}
+	// Case is normalized so it matches control-plane tags at listen.
+	got, err = parseMeshTag("tag:TailSync")
+	if err != nil || got != "tag:tailsync" {
+		t.Fatalf("lower: got %q, %v", got, err)
+	}
+	if _, err := parseMeshTag("tailsync"); err == nil {
+		t.Fatal("want tag: prefix error")
+	}
+	if _, err := parseMeshTag("tag:"); err == nil {
+		t.Fatal("want empty name error")
+	}
+	if _, err := parseMeshTag("tag:1foo"); err == nil {
+		t.Fatal("want leading letter error")
+	}
+	if _, err := parseMeshTag("tag:foo@bar"); err == nil {
+		t.Fatal("want punctuation error")
+	}
+	if _, err := parseMeshTag("tag:foo bar"); err == nil {
+		t.Fatal("want space error")
+	}
+	got, err = parseMeshTag("tag:lab-1")
+	if err != nil || got != "tag:lab-1" {
+		t.Fatalf("dash digit: got %q, %v", got, err)
+	}
+}
+
+func TestIsMullvadIdentity(t *testing.T) {
+	if isMullvadIdentity(nil, "") {
+		t.Fatal("empty")
+	}
+	id := meshIdentityFromPeerStatus(&ipnstate.PeerStatus{DNSName: "laptop.tailnet.ts.net."})
+	if isMullvadIdentity(id.tags, id.dns) {
+		t.Fatal("normal peer")
+	}
+	mullvadTags := views.SliceOf([]string{mullvadExitNodeTag})
+	id = meshIdentityFromPeerStatus(&ipnstate.PeerStatus{
+		DNSName: "se.tailnet.ts.net.",
+		Tags:    &mullvadTags,
+	})
+	if !isMullvadIdentity(id.tags, id.dns) {
+		t.Fatal("tag")
+	}
+	if !isMullvadIdentity(nil, "se-mma-wg-001.mullvad.ts.net.") {
+		t.Fatal("dns with trailing dot")
+	}
+	if !isMullvadIdentity(nil, "se-mma-wg-001.mullvad.ts.net") {
+		t.Fatal("dns without trailing dot")
+	}
+	id = meshIdentityFromPeerStatus(&ipnstate.PeerStatus{
+		DNSName:        "home-exit.tailnet.ts.net.",
+		ExitNodeOption: true,
+	})
+	if isMullvadIdentity(id.tags, id.dns) {
+		t.Fatal("ExitNodeOption alone must not mark Mullvad")
 	}
 }
 
@@ -222,6 +585,110 @@ func TestClaimedMatchesWhoIs(t *testing.T) {
 	}
 	if claimedMatchesWhoIs("peer.extra", who) {
 		t.Fatal("claim longer than first label must not match")
+	}
+}
+
+// whoIsNode builds a WhoIs Node with valid Hostinfo (required for fail-closed
+// sharee detection). ShareeNode defaults to false unless set on hi.
+func whoIsNode(user tailcfg.UserID, name string, tags []string, hi *tailcfg.Hostinfo) *tailcfg.Node {
+	if hi == nil {
+		hi = &tailcfg.Hostinfo{}
+	}
+	n := &tailcfg.Node{User: user, Name: name, Tags: tags}
+	n.Hostinfo = hi.View()
+	return n
+}
+
+func TestMeshGateFromWhoIs(t *testing.T) {
+	// WhoIs path: compile gate from Self PeerStatus, allow via meshIdentityFromWhoIs.
+	self := &ipnstate.PeerStatus{UserID: testUserSelf}
+	g := mustMeshGate(t, self, "")
+	same := &apitype.WhoIsResponse{
+		Node: whoIsNode(testUserSelf, "peer.tailnet.ts.net.", nil, nil),
+	}
+	pid, ok := meshIdentityFromWhoIs(same)
+	if !ok || !g.allows(pid) {
+		t.Fatal("same user")
+	}
+
+	other := &apitype.WhoIsResponse{
+		Node: whoIsNode(testUserOther, "other.tailnet.ts.net.", nil, nil),
+	}
+	pid, ok = meshIdentityFromWhoIs(other)
+	if !ok || g.allows(pid) {
+		t.Fatal("other user")
+	}
+
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(0, "peer.tailnet.ts.net.", nil, nil),
+	})
+	if !ok || g.allows(pid) {
+		t.Fatal("zero peer User must fail closed")
+	}
+	gZero := mustMeshGate(t, &ipnstate.PeerStatus{UserID: 0}, "")
+	if gZero.allows(meshIdentity{user: testUserSelf}) {
+		t.Fatal("zero self UserID must fail closed")
+	}
+	if _, ok := meshIdentityFromWhoIs(nil); ok {
+		t.Fatal("nil who")
+	}
+
+	// Missing Hostinfo: fail closed (unknown sharee must not authenticate).
+	if _, ok := meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: &tailcfg.Node{User: testUserSelf, Name: "peer.tailnet.ts.net."},
+	}); ok {
+		t.Fatal("missing Hostinfo want ok=false")
+	}
+
+	// ShareeNode must not authenticate.
+	shareeNode := whoIsNode(testUserSelf, "", nil, &tailcfg.Hostinfo{ShareeNode: true})
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{Node: shareeNode})
+	if !ok || g.allows(pid) {
+		t.Fatal("sharee node")
+	}
+
+	// Untagged self allows same-user tagged peer.
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(testUserSelf, "", []string{"tag:server"}, nil),
+	})
+	if !ok || !g.allows(pid) {
+		t.Fatal("untagged self + tagged peer same user")
+	}
+
+	// Tagged self: mesh tag, not UserID.
+	const mesh = "tag:tailsync"
+	tagMesh := views.SliceOf([]string{mesh, "tag:server"})
+	taggedSelf := &ipnstate.PeerStatus{UserID: 9999, Tags: &tagMesh}
+	tg := mustMeshGate(t, taggedSelf, mesh)
+	pid, ok = meshIdentityFromWhoIs(same)
+	if !ok || tg.allows(pid) {
+		t.Fatal("tagged self must not accept untagged peer via UserID")
+	}
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(1, "", []string{mesh}, nil),
+	})
+	if !ok || !tg.allows(pid) {
+		t.Fatal("tagged self + peer with mesh tag")
+	}
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(0, "", []string{"tag:server"}, nil),
+	})
+	if !ok || tg.allows(pid) {
+		t.Fatal("broad tag only must not match")
+	}
+
+	// Explicit Mullvad markers on WhoIs path (tag and/or DNS).
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(testUserSelf, "se.tailnet.ts.net.", []string{mullvadExitNodeTag}, nil),
+	})
+	if !ok || g.allows(pid) {
+		t.Fatal("mullvad tag")
+	}
+	pid, ok = meshIdentityFromWhoIs(&apitype.WhoIsResponse{
+		Node: whoIsNode(testUserSelf, "se-mma-wg-001.mullvad.ts.net.", nil, nil),
+	})
+	if !ok || g.allows(pid) {
+		t.Fatal("mullvad dns")
 	}
 }
 
