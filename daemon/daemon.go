@@ -123,15 +123,16 @@ type Config struct {
 	ListenHost string
 	// Peers is an optional explicit list of peer addresses (host:port) for tests
 	// and overrides. When empty, discovery uses mesh trust on Online status
-	// peers: untagged Self → same UserID; tagged Self → TagMatch against peer
-	// tags (excludes self, sharees, Mullvad, and identity mismatches). When
-	// set, status discovery is skipped (test determinism), but host/tsnet
-	// handshakes still enforce WhoIs + the same trust policy. Soft dial
-	// failures and backoff handle nodes that are Online but not running tailsync.
+	// peers: untagged Self → same UserID; tagged Self → peer must carry MeshTag
+	// (excludes self, sharees, Mullvad, and identity mismatches). When set,
+	// status discovery is skipped (test determinism), but host/tsnet handshakes
+	// still enforce WhoIs + the same trust policy. Soft dial failures and
+	// backoff handle nodes that are Online but not running tailsync.
 	Peers []string
-	// TagMatch selects how tagged Self compares peer tags (intersect, equal,
-	// contains). Ignored when Self is untagged. Zero means TagMatchIntersection.
-	TagMatch TagMatchMode
+	// MeshTag is the ACL tag peers must share when this machine is tagged
+	// (for example "tag:tailsync"). Required at listen when Self is tagged;
+	// ignored when Self is untagged. Must look like tag:name when non-empty.
+	MeshTag string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
 	// for listen success or a fast failure. Must not block indefinitely.
@@ -324,8 +325,9 @@ func New(cfg Config) (*Daemon, error) {
 	if cfg.TombstoneTTL <= 0 {
 		cfg.TombstoneTTL = DefaultTombstoneTTL
 	}
-	if !cfg.TagMatch.valid() {
-		return nil, fmt.Errorf("invalid TagMatch mode %v", cfg.TagMatch)
+	cfg.MeshTag = normalizeMeshTag(cfg.MeshTag)
+	if err := validateMeshTagFormat(cfg.MeshTag); err != nil {
+		return nil, err
 	}
 	log := cfg.Logger
 	if log == nil {

@@ -28,7 +28,7 @@ func main() {
 		blockSize     = flag.Int("block-size", 0, "rsync-style block size for delta transfers (0 = daemon default)")
 		dialTimeout   = flag.Duration("dial-timeout", 0, fmt.Sprintf("timeout for outbound peer dials (0 = default %s); caps waits on nodes not running tailsync", daemon.DefaultDialTimeout))
 		peers         = flag.String("peers", "", "comma-separated host:port dial list; skips status discovery only (tests/overrides). On host/tsnet, Hello still requires mesh trust; use -plain to skip identity checks")
-		tagMatch      = flag.String("tag-match", "intersect", "when Self is tagged, how peer tags must relate: intersect (default), equal, or contains (peer has all of Self's tags); ignored when Self is untagged")
+		meshTag       = flag.String("mesh-tag", "", "when this machine is tagged, required ACL tag peers must share (e.g. tag:tailsync); ignored when untagged; listen fails if tagged without this")
 		useTSNet      = flag.Bool("tsnet", false, "use embedded tsnet node (registers a separate tailnet machine) instead of host tailscaled")
 		plain         = flag.Bool("plain", false, "use plain QUIC on 127.0.0.1 (requires TAILSYNC_TESTING=1)")
 		verbose       = flag.Bool("v", false, "verbose debug logging")
@@ -47,11 +47,6 @@ func main() {
 	}
 	if *plain && os.Getenv("TAILSYNC_TESTING") != "1" {
 		fmt.Fprintln(os.Stderr, "error: -plain requires TAILSYNC_TESTING=1 (testing only)")
-		os.Exit(2)
-	}
-	tagMode, err := daemon.ParseTagMatchMode(*tagMatch)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -99,7 +94,7 @@ func main() {
 		Logger:        log,
 		NetMode:       mode,
 		Peers:         peerList,
-		TagMatch:      tagMode,
+		MeshTag:       *meshTag,
 	}
 
 	d, err := daemon.New(cfg)

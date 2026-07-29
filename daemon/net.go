@@ -106,13 +106,13 @@ func isMullvadPeer(p *ipnstate.PeerStatus) bool {
 // IP is known.
 //
 // Trust policy (see trustedMeshPeer): untagged Self → same UserID; tagged Self
-// → TagMatchMode against peer tags. Sharees, Mullvad, and other users /
+// → peer must carry meshTag. Sharees, Mullvad, and other users /
 // untagged-vs-tagged mismatches are skipped. Fail closed when Self identity is
 // unusable (untagged with unknown UserID, or missing Self).
 //
 // Self exclusion uses StableID and MagicDNS equality only (not HostName), so
 // distinct nodes that share an OS hostname are still discovered.
-func peersFromStatus(st *ipnstate.Status, port int, mode TagMatchMode) []string {
+func peersFromStatus(st *ipnstate.Status, port int, meshTag string) []string {
 	if st == nil || st.Self == nil {
 		return nil
 	}
@@ -132,7 +132,7 @@ func peersFromStatus(st *ipnstate.Status, port int, mode TagMatchMode) []string 
 		if selfStable != "" && string(p.ID) == selfStable {
 			continue
 		}
-		if !trustedMeshPeer(selfID, meshIdentityFromPeerStatus(p), mode) {
+		if !trustedMeshPeer(selfID, meshIdentityFromPeerStatus(p), meshTag) {
 			continue
 		}
 		dns := strings.TrimSuffix(p.DNSName, ".")
@@ -218,7 +218,7 @@ func (d *Daemon) newMesh() (*peer.Manager, error) {
 
 // verifyPeerNodeID checks that claimed Hello NodeID matches Tailscale WhoIs for
 // remoteAddr and that the peer is a trusted mesh peer (same UserID when Self is
-// untagged; TagMatchMode when Self is tagged; rejects sharees and Mullvad).
+// untagged; MeshTag when Self is tagged; rejects sharees and Mullvad).
 // Prevents roster hijack under skip-verify TLS and blocks wrong-identity nodes
 // even when their Hello names match wire identity.
 func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed string) error {
@@ -248,7 +248,7 @@ func (d *Daemon) verifyPeerNodeID(ctx context.Context, remoteAddr, claimed strin
 	if !selfID.tagged() && selfID.user == 0 {
 		return fmt.Errorf("cannot determine local tailscale user")
 	}
-	if !meshPeerAllowed(st.Self, who, d.cfg.TagMatch) {
+	if !meshPeerAllowed(st.Self, who, d.cfg.MeshTag) {
 		return fmt.Errorf("peer at %s is not a trusted mesh peer", remoteAddr)
 	}
 	return nil
@@ -441,6 +441,13 @@ func (d *Daemon) listenTSNet(ctx context.Context) error {
 		return fmt.Errorf("tsnet: no Tailscale IPs after up")
 	}
 
+	if err := checkSelfMeshTagConfig(meshIdentityFromPeerStatus(st.Self), d.cfg.MeshTag); err != nil {
+		d.setInjectNetChange(nil)
+		_ = s.Close()
+		d.server = nil
+		return err
+	}
+
 	d.nodeID = d.cfg.Hostname
 
 	m, err := d.newMesh()
@@ -553,6 +560,10 @@ func (d *Daemon) listenHost(ctx context.Context) error {
 	d.nodeID = id
 	d.cfg.Hostname = id
 
+	if err := checkSelfMeshTagConfig(meshIdentityFromPeerStatus(st.Self), d.cfg.MeshTag); err != nil {
+		return err
+	}
+
 	m, err := d.newMesh()
 	if err != nil {
 		return err
@@ -632,7 +643,7 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		// Also skip by configured tsnet hostname (Self may use a different DNS form).
-		addrs := peersFromStatus(st, d.cfg.Port, d.cfg.TagMatch)
+		addrs := peersFromStatus(st, d.cfg.Port, d.cfg.MeshTag)
 		return filterSelfHostname(addrs, d.cfg.Hostname), nil
 	default: // host
 		lc := d.local
@@ -643,6 +654,6 @@ func (d *Daemon) listPeers(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return peersFromStatus(st, d.cfg.Port, d.cfg.TagMatch), nil
+		return peersFromStatus(st, d.cfg.Port, d.cfg.MeshTag), nil
 	}
 }

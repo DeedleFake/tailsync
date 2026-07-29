@@ -8,63 +8,39 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-
-	"deedles.dev/tailsync/internal/tagset"
 )
 
-// TagMatchMode selects how two tagged peers are compared when Self is tagged.
-// When Self is untagged, mesh trust uses same Tailscale UserID instead and
-// TagMatchMode is ignored.
-type TagMatchMode int
-
-const (
-	// TagMatchIntersection allows a peer when Self and peer share at least one
-	// ACL tag (default).
-	TagMatchIntersection TagMatchMode = iota
-	// TagMatchEqual allows a peer only when Self and peer have the same tag set
-	// (order-independent).
-	TagMatchEqual
-	// TagMatchContains allows a peer when the peer's tag set contains every tag
-	// on Self (peer may have extra tags).
-	TagMatchContains
-)
-
-// String returns the CLI/config name for m.
-func (m TagMatchMode) String() string {
-	switch m {
-	case TagMatchIntersection:
-		return "intersect"
-	case TagMatchEqual:
-		return "equal"
-	case TagMatchContains:
-		return "contains"
-	default:
-		return fmt.Sprintf("TagMatchMode(%d)", int(m))
-	}
+// normalizeMeshTag trims MeshTag / -mesh-tag values.
+func normalizeMeshTag(s string) string {
+	return strings.TrimSpace(s)
 }
 
-// ParseTagMatchMode parses a CLI/config value: intersect|intersection,
-// equal|exact, contains|subset (peer has all of self's tags).
-func ParseTagMatchMode(s string) (TagMatchMode, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "intersect", "intersection":
-		return TagMatchIntersection, nil
-	case "equal", "exact":
-		return TagMatchEqual, nil
-	case "contains", "subset":
-		return TagMatchContains, nil
-	default:
-		return 0, fmt.Errorf("unknown tag match mode %q (want intersect, equal, or contains)", s)
+// validateMeshTagFormat checks a non-empty mesh tag looks like a Tailscale ACL
+// tag (tag:name). Empty is allowed (untagged Self does not need a mesh tag).
+func validateMeshTagFormat(s string) error {
+	if s == "" {
+		return nil
 	}
+	if !strings.HasPrefix(s, "tag:") || len(s) <= len("tag:") {
+		return fmt.Errorf("mesh tag %q must look like tag:name", s)
+	}
+	return nil
 }
 
-func (m TagMatchMode) valid() bool {
-	switch m {
-	case TagMatchIntersection, TagMatchEqual, TagMatchContains:
-		return true
-	default:
-		return false
+// checkSelfMeshTagConfig fails closed when Self is tagged but MeshTag is
+// missing or not present on Self. Call after LocalAPI status is available
+// (host/tsnet listen). Untagged Self always passes.
+func checkSelfMeshTagConfig(self meshIdentity, meshTag string) error {
+	if !self.tagged() {
+		return nil
 	}
+	if meshTag == "" {
+		return fmt.Errorf("this machine is tagged; set -mesh-tag (or Config.MeshTag) to a tag this node has")
+	}
+	if !slices.Contains(self.tags, meshTag) {
+		return fmt.Errorf("this machine is tagged but does not have mesh tag %q (has %v)", meshTag, self.tags)
+	}
+	return nil
 }
 
 // meshIdentity is the control-plane facts used for mesh trust (ownership or
@@ -114,24 +90,26 @@ func meshIdentityFromWhoIs(who *apitype.WhoIsResponse) (id meshIdentity, ok bool
 	return id, true
 }
 
-// trustedMeshPeer reports whether peer may join the mesh with self under mode.
+// trustedMeshPeer reports whether peer may join the mesh with self under meshTag.
 //
 // Policy:
 //   - Product skips: sharee-only netmap entries and Mullvad are never trusted.
 //   - Untagged self: same Tailscale UserID (fail closed on unknown IDs). Peer
 //     tags do not matter; real tagged nodes usually use the synthetic
 //     tagged-devices user and therefore do not match.
-//   - Tagged self: peer must be tagged and match under TagMatchMode. UserID is
-//     ignored (tagged-devices is shared across all tagged nodes).
-func trustedMeshPeer(self, peer meshIdentity, mode TagMatchMode) bool {
+//   - Tagged self: peer must carry meshTag (Config.MeshTag / -mesh-tag).
+//     UserID is ignored (tagged-devices is shared across all tagged nodes).
+//     Fail closed if meshTag is empty or not on Self (listen should reject
+//     that config before serving).
+func trustedMeshPeer(self, peer meshIdentity, meshTag string) bool {
 	if peer.sharee || isMullvadIdentity(peer.tags, peer.dns) {
 		return false
 	}
 	if self.tagged() {
-		if !peer.tagged() {
+		if meshTag == "" || !slices.Contains(self.tags, meshTag) {
 			return false
 		}
-		return tagsMatch(self.tags, peer.tags, mode)
+		return slices.Contains(peer.tags, meshTag)
 	}
 	if self.user == 0 || peer.user == 0 {
 		return false
@@ -141,7 +119,7 @@ func trustedMeshPeer(self, peer meshIdentity, mode TagMatchMode) bool {
 
 // meshPeerAllowed is the WhoIs-path trust check: same policy as trustedMeshPeer,
 // plus UserProfile must not disagree with Self when Self is untagged.
-func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, mode TagMatchMode) bool {
+func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, meshTag string) bool {
 	if self == nil {
 		return false
 	}
@@ -155,7 +133,7 @@ func meshPeerAllowed(self *ipnstate.PeerStatus, who *apitype.WhoIsResponse, mode
 	if !sid.tagged() && who.UserProfile != nil && who.UserProfile.ID != 0 && who.UserProfile.ID != sid.user {
 		return false
 	}
-	return trustedMeshPeer(sid, pid, mode)
+	return trustedMeshPeer(sid, pid, meshTag)
 }
 
 func isMullvadIdentity(tags []string, dns string) bool {
@@ -163,18 +141,4 @@ func isMullvadIdentity(tags []string, dns string) bool {
 		return true
 	}
 	return isMullvadDNSName(dns)
-}
-
-func tagsMatch(selfTags, peerTags []string, mode TagMatchMode) bool {
-	if len(selfTags) == 0 || len(peerTags) == 0 {
-		return false
-	}
-	switch mode {
-	case TagMatchEqual:
-		return tagset.Equal(selfTags, peerTags)
-	case TagMatchContains:
-		return tagset.ContainsAll(peerTags, selfTags)
-	default:
-		return tagset.Intersect(selfTags, peerTags)
-	}
 }

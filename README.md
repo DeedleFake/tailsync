@@ -60,7 +60,7 @@ For regular files, permission bits and modification time are synchronized. Conte
 | `-port` | `5960` | UDP port for peer connections |
 | `-authkey` | `$TS_AUTHKEY` | Tailscale auth key for **`-tsnet`** only (optional if tsnet state already exists) |
 | `-peers` | (discover) | Comma-separated `host:port` dial list; skips status discovery only. On host/tsnet, mesh trust still applies at Hello. |
-| `-tag-match` | `intersect` | When **this** machine is tagged: how peer tags must relate (`intersect`, `equal`, or `contains`). Ignored when this machine is untagged. |
+| `-mesh-tag` | (none) | When **this** machine is tagged: required ACL tag peers must share (for example `tag:tailsync`). Listen fails if this machine is tagged and the flag is missing or not on Self. Ignored when untagged. |
 | `-scan-interval` | `30s` | Full rescan period (FS watch handles most local edits) |
 | `-sync-interval` | `45s` | Backup peer pull period if a notify was missed |
 | `-watch-debounce` | `1s` | Wait after filesystem events before reconciling |
@@ -76,24 +76,21 @@ For regular files, permission bits and modification time are synchronized. Conte
 On **host** and **tsnet**, mesh membership requires **mesh trust** for *this* machine. Trust applies both when selecting discovery dial targets and when accepting a Hello (WhoIs). A pin list does not relax that check.
 
 - **Untagged machine** (typical laptop or desktop): other machines owned by the **same Tailscale user**. Tagged devices usually do **not** match (they are not user-owned in Tailscale’s model).
-- **Tagged machine** (typical server): other **tagged** machines whose tags match `-tag-match`:
-  - `intersect` (default) — share at least one tag
-  - `equal` — same set of tags
-  - `contains` — peer has every tag this machine has
+- **Tagged machine** (typical server): other machines that carry the same **`-mesh-tag`** (for example `tag:tailsync`). Extra ACL tags on either side do not affect membership. If this machine is tagged, `-mesh-tag` is **required** and must appear on Self, or the daemon refuses to start.
 
 Always denied: devices shared into the tailnet as share-only entries, and [Mullvad](https://tailscale.com/kb/1258/mullvad-exit-nodes) exit nodes.
 
 **`-peers`** only sets which `host:port` addresses to dial and skips status-based discovery (useful for tests and fixed dial lists). On host/tsnet it does **not** bypass mesh trust: untrusted pins still fail Hello and will not join the mesh. To run without Tailscale identity checks, use **`-plain`** (localhost testing only; requires `TAILSYNC_TESTING=1`).
 
-**Laptop ↔ tagged server** is not supported under this policy. Run tailsync on a consistent class of machines (all your untagged devices under one user, or a set of tagged servers that match `-tag-match`, for example a dedicated `tag:tailsync`).
+**Laptop ↔ tagged server** is not supported under this policy. Run tailsync on a consistent class of machines (all your untagged devices under one user, or tagged servers that share a dedicated mesh tag such as `tag:tailsync`).
 
 ```bash
 # two untagged machines (same Tailscale user)
 tailsync -dir ~/shared   # machine a
 tailsync -dir ~/shared   # machine b
 
-# two servers sharing tag:tailsync (each machine must be tagged)
-tailsync -dir /data/shared -tag-match intersect
+# two servers with tag:tailsync (each machine must be tagged and pass -mesh-tag)
+tailsync -dir /data/shared -mesh-tag tag:tailsync
 ```
 
 Soft dial failures and retries are normal for online nodes that are not running tailsync; they do not block local writes.
@@ -136,12 +133,11 @@ The package [`deedles.dev/tailsync/daemon`](https://pkg.go.dev/deedles.dev/tails
 
 | Go | Role |
 |----|------|
-| `daemon.Config` | Settings (`Dir`, `StateDir`, `NetMode`, `TagMatch`, intervals, `OnReady`, `OnAuthURL`, …) |
+| `daemon.Config` | Settings (`Dir`, `StateDir`, `NetMode`, `MeshTag`, intervals, `OnReady`, `OnAuthURL`, …) |
 | `daemon.New(cfg)` | Validate config; returns a stopped `*Daemon` |
 | `(*Daemon).Run(ctx)` | Run until `ctx` is canceled or a fatal error |
 | `(*Daemon).InjectNetworkChange()` | After connectivity changes in **tsnet** mode (e.g. mobile networks) |
 | `daemon.NetModeHost` / `NetModeTSNet` / `NetModePlain` | Same modes as the CLI |
-| `daemon.TagMatchIntersection` / `Equal` / `Contains` | Same semantics as `-tag-match` |
 
 ```go
 cfg := daemon.Config{
