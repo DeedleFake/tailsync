@@ -477,18 +477,38 @@ func TestCheckSelfMeshTagConfig(t *testing.T) {
 	}
 }
 
-func TestValidateMeshTagFormat(t *testing.T) {
-	if err := validateMeshTagFormat(""); err != nil {
-		t.Fatal(err)
+func TestParseMeshTag(t *testing.T) {
+	got, err := parseMeshTag("")
+	if err != nil || got != "" {
+		t.Fatalf("empty: got %q, %v", got, err)
 	}
-	if err := validateMeshTagFormat("tag:tailsync"); err != nil {
-		t.Fatal(err)
+	got, err = parseMeshTag("  tag:tailsync  ")
+	if err != nil || got != "tag:tailsync" {
+		t.Fatalf("trim: got %q, %v", got, err)
 	}
-	if err := validateMeshTagFormat("tailsync"); err == nil {
-		t.Fatal("want prefix error")
+	// Case is normalized so it matches control-plane tags at listen.
+	got, err = parseMeshTag("tag:TailSync")
+	if err != nil || got != "tag:tailsync" {
+		t.Fatalf("lower: got %q, %v", got, err)
 	}
-	if err := validateMeshTagFormat("tag:"); err == nil {
+	if _, err := parseMeshTag("tailsync"); err == nil {
+		t.Fatal("want tag: prefix error")
+	}
+	if _, err := parseMeshTag("tag:"); err == nil {
 		t.Fatal("want empty name error")
+	}
+	if _, err := parseMeshTag("tag:1foo"); err == nil {
+		t.Fatal("want leading letter error")
+	}
+	if _, err := parseMeshTag("tag:foo@bar"); err == nil {
+		t.Fatal("want punctuation error")
+	}
+	if _, err := parseMeshTag("tag:foo bar"); err == nil {
+		t.Fatal("want space error")
+	}
+	got, err = parseMeshTag("tag:lab-1")
+	if err != nil || got != "tag:lab-1" {
+		t.Fatalf("dash digit: got %q, %v", got, err)
 	}
 }
 

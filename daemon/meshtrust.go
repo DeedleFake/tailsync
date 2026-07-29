@@ -34,21 +34,20 @@ func isMullvadIdentity(tags []string, dns string) bool {
 	return isMullvadDNSName(dns)
 }
 
-// normalizeMeshTag trims MeshTag / -mesh-tag values.
-func normalizeMeshTag(s string) string {
-	return strings.TrimSpace(s)
-}
-
-// validateMeshTagFormat checks a non-empty mesh tag looks like a Tailscale ACL
-// tag (tag:name). Empty is allowed (untagged Self does not need a mesh tag).
-func validateMeshTagFormat(s string) error {
+// parseMeshTag trims, lowercases, and validates MeshTag / -mesh-tag.
+// Empty is allowed (untagged Self does not need a mesh tag). Non-empty values
+// must be a Tailscale ACL tag (see [tailcfg.CheckTag]): tag:<letter…> with only
+// letters, digits, and dashes. Lowercasing matches control-plane tag form so
+// case typos fail early or still match Self rather than only at listen.
+func parseMeshTag(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
 	if s == "" {
-		return nil
+		return "", nil
 	}
-	if !strings.HasPrefix(s, "tag:") || len(s) <= len("tag:") {
-		return fmt.Errorf("mesh tag %q must look like tag:name", s)
+	if err := tailcfg.CheckTag(s); err != nil {
+		return "", fmt.Errorf("mesh tag %q: %w", s, err)
 	}
-	return nil
+	return s, nil
 }
 
 // checkSelfMeshTagConfig fails closed when MeshTag does not match Self:

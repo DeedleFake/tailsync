@@ -131,8 +131,9 @@ type Config struct {
 	Peers []string
 	// MeshTag is the ACL tag peers must share when this machine is tagged
 	// (for example "tag:tailsync"). Required at listen when Self is tagged
-	// and must appear on Self. Must be empty when Self is untagged. Must look
-	// like tag:name when non-empty.
+	// and must appear on Self. Must be empty when Self is untagged. Non-empty
+	// values are trimmed, lowercased, and checked with Tailscale's tag rules
+	// at [New] (tag:<letter…>, letters/digits/dashes only).
 	MeshTag string
 	// OnReady, if non-nil, is called once after the daemon is listening and before
 	// the main loop. Used by library hosts so Start/lifecycle wrappers can wait
@@ -333,8 +334,8 @@ func New(cfg Config) (*Daemon, error) {
 	if cfg.TombstoneTTL <= 0 {
 		cfg.TombstoneTTL = DefaultTombstoneTTL
 	}
-	cfg.MeshTag = normalizeMeshTag(cfg.MeshTag)
-	if err := validateMeshTagFormat(cfg.MeshTag); err != nil {
+	cfg.MeshTag, err = parseMeshTag(cfg.MeshTag)
+	if err != nil {
 		return nil, err
 	}
 	log := cfg.Logger
