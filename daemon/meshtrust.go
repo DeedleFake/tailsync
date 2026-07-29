@@ -8,6 +8,8 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+
+	"deedles.dev/tailsync/internal/tagset"
 )
 
 // TagMatchMode selects how two tagged peers are compared when Self is tagged.
@@ -169,67 +171,10 @@ func tagsMatch(selfTags, peerTags []string, mode TagMatchMode) bool {
 	}
 	switch mode {
 	case TagMatchEqual:
-		return tagSetsEqual(selfTags, peerTags)
+		return tagset.Equal(selfTags, peerTags)
 	case TagMatchContains:
-		return tagSetContainsAll(peerTags, selfTags)
+		return tagset.ContainsAll(peerTags, selfTags)
 	default:
-		return tagSetsIntersect(selfTags, peerTags)
+		return tagset.Intersect(selfTags, peerTags)
 	}
-}
-
-func tagSetsIntersect(a, b []string) bool {
-	if len(a) == 0 || len(b) == 0 {
-		return false
-	}
-	set := make(map[string]struct{}, len(a))
-	for _, t := range a {
-		if t != "" {
-			set[t] = struct{}{}
-		}
-	}
-	for _, t := range b {
-		if _, ok := set[t]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-func tagSetsEqual(a, b []string) bool {
-	setA := tagSet(a)
-	setB := tagSet(b)
-	if len(setA) != len(setB) {
-		return false
-	}
-	for t := range setA {
-		if _, ok := setB[t]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// tagSetContainsAll reports whether outer contains every tag in need.
-func tagSetContainsAll(outer, need []string) bool {
-	set := tagSet(outer)
-	for _, t := range need {
-		if t == "" {
-			continue
-		}
-		if _, ok := set[t]; !ok {
-			return false
-		}
-	}
-	// Empty need after filtering would vacuously match; callers require non-empty.
-	return len(tagSet(need)) > 0
-}
-
-func tagSet(tags []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(tags))
-	for _, t := range tags {
-		if t != "" {
-			set[t] = struct{}{}
-		}
-	}
-	return set
 }
