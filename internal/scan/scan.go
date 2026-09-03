@@ -178,6 +178,9 @@ func Scan(ctx context.Context, root *os.Root, idx *index.Index, opts *Options) (
 		if !d.Type().IsRegular() {
 			return nil
 		}
+		if pathutil.IsReservedComponent(filepath.Base(rel)) {
+			return nil
+		}
 
 		fi, err := d.Info()
 		if err != nil {
