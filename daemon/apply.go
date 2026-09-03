@@ -358,6 +358,19 @@ func (d *Daemon) pullAndVerify(ctx context.Context, sess *peer.Session, remote i
 // execDeleteLive removes a live local file for a winning remote tombstone.
 // Caller must hold syncMu.
 func (d *Daemon) execDeleteLive(re index.Entry) (bool, error) {
+	cur, ok := d.idx.Get(re.Path)
+	if ok && !index.Wins(cur, re) {
+		return false, nil
+	}
+	hasLive := ok && !cur.Deleted
+	unsynced, err := d.diskUnsynced(re.Path, cur, hasLive)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", re.Path, err)
+	}
+	if unsynced {
+		d.log.Info("skip peer delete; local disk changed since last scan", "path", re.Path)
+		return false, nil
+	}
 	if err := d.root.Remove(re.Path); err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("delete %s: %w", re.Path, err)
 	}
@@ -373,6 +386,14 @@ func (d *Daemon) execDeleteLive(re index.Entry) (bool, error) {
 // execMetaOnly adopts remote mode/mtime for same-hash content, with rollback
 // on partial failure. Caller must hold syncMu.
 func (d *Daemon) execMetaOnly(local, re index.Entry) (bool, error) {
+	unsynced, err := d.diskUnsynced(re.Path, local, true)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", re.Path, err)
+	}
+	if unsynced {
+		d.log.Info("skip metadata adopt; local disk changed since last scan", "path", re.Path)
+		return false, nil
+	}
 	mode := fileMode(re.Mode)
 	prevMode := fileMode(local.Mode)
 	prevMT := local.ModTime
@@ -415,7 +436,19 @@ func (d *Daemon) execMetaOnly(local, re index.Entry) (bool, error) {
 // Caller must hold syncMu. Hash must already match re.Hash.
 func (d *Daemon) commitContent(re index.Entry, data []byte, got string) (bool, error) {
 	// Final LWW check after transfer — index may have changed during the pull.
-	if cur, ok := d.idx.Get(re.Path); ok && !index.Wins(cur, re) {
+	cur, ok := d.idx.Get(re.Path)
+	if ok && !index.Wins(cur, re) {
+		return false, nil
+	}
+	// Index-only LWW is not enough: a local create/edit may not be scanned yet
+	// (watch debounce / scan interval). Overwriting that file is data loss.
+	hasLive := ok && !cur.Deleted
+	unsynced, err := d.diskUnsynced(re.Path, cur, hasLive)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", re.Path, err)
+	}
+	if unsynced {
+		d.log.Info("skip content commit; local disk changed since last scan", "path", re.Path)
 		return false, nil
 	}
 
@@ -532,6 +565,31 @@ func (d *Daemon) releasePullSlot() {
 	case <-d.pullSem:
 	default:
 	}
+}
+
+// diskUnsynced reports whether a live file at rel has drifted from the index
+// entry used for LWW. Peer apply must not overwrite or delete such files:
+// reconcile has not yet stamped a local UpdatedAt, so an index-only LWW check
+// would treat a stale index entry as authoritative and drop user data.
+//
+// A missing path is not unsynced (create or recorded delete may proceed). A
+// path that exists when the index has no live entry is unsynced (local create
+// not yet scanned). Size and mtime matching follows the scan fast path.
+func (d *Daemon) diskUnsynced(rel string, cur index.Entry, hasLive bool) (bool, error) {
+	fi, err := d.root.Stat(rel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !hasLive {
+		return true, nil
+	}
+	if fi.Size() != cur.Size || !fi.ModTime().Equal(cur.ModTime) {
+		return true, nil
+	}
+	return false, nil
 }
 
 // diskMeta returns mode and mtime actually present on disk after a metadata or
