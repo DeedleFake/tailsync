@@ -314,3 +314,178 @@ func TestPostPullLWWDropLeavesDisk(t *testing.T) {
 		t.Fatalf("disk changed: %q", data)
 	}
 }
+
+// TestCommitContentDoesNotClobberUnindexedFile: a local file not yet in the
+// index (scan still pending) must not be overwritten by a winning remote pull.
+func TestCommitContentDoesNotClobberUnindexedFile(t *testing.T) {
+	d := testDaemon(t)
+	path := "new-local.txt"
+	localData := []byte("user-created-this-file-before-scan")
+	if err := os.WriteFile(filepath.Join(d.cfg.Dir, path), localData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteData := []byte("peer-bytes")
+	now := time.Now().UTC()
+	re := index.Entry{
+		Path: path, Hash: sha256Hex(remoteData), Size: int64(len(remoteData)),
+		UpdatedAt: now, Mode: 0o644, ModTime: now,
+	}
+	d.syncMu.Lock()
+	did, err := d.commitContent(re, remoteData, re.Hash)
+	d.syncMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did {
+		t.Fatal("commit should skip unsynced local create")
+	}
+	got, err := os.ReadFile(filepath.Join(d.cfg.Dir, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(localData) {
+		t.Fatalf("local file overwritten: %q", got)
+	}
+	if _, ok := d.idx.Get(path); ok {
+		t.Fatal("index should not record skipped commit")
+	}
+}
+
+// TestCommitContentDoesNotClobberUnsyncedEdit: index has a live entry but the
+// user edited the file (size drift) before scan. Remote must not overwrite.
+func TestCommitContentDoesNotClobberUnsyncedEdit(t *testing.T) {
+	d := testDaemon(t)
+	path := "edited.txt"
+	seed := []byte("seed")
+	seedHash := sha256Hex(seed)
+	older := time.Now().Add(-time.Hour).UTC()
+	d.syncMu.Lock()
+	if _, err := d.commitContent(index.Entry{
+		Path: path, Hash: seedHash, Size: int64(len(seed)),
+		UpdatedAt: older, Mode: 0o644, ModTime: older,
+	}, seed, seedHash); err != nil {
+		d.syncMu.Unlock()
+		t.Fatal(err)
+	}
+	d.syncMu.Unlock()
+
+	localData := []byte("much-longer-local-edit-so-size-drifts")
+	if err := os.WriteFile(filepath.Join(d.cfg.Dir, path), localData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := d.root.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := d.idx.Get(path)
+	if fi.Size() == e.Size && fi.ModTime().Equal(e.ModTime) {
+		t.Fatal("test setup: edit did not drift from index")
+	}
+
+	remoteData := []byte("peer-newer")
+	newer := time.Now().UTC()
+	re := index.Entry{
+		Path: path, Hash: sha256Hex(remoteData), Size: int64(len(remoteData)),
+		UpdatedAt: newer, Mode: 0o644, ModTime: newer,
+	}
+	d.syncMu.Lock()
+	did, err := d.commitContent(re, remoteData, re.Hash)
+	d.syncMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did {
+		t.Fatal("commit should skip unsynced local edit")
+	}
+	got, err := os.ReadFile(filepath.Join(d.cfg.Dir, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(localData) {
+		t.Fatalf("local edit overwritten: %q", got)
+	}
+	e2, _ := d.idx.Get(path)
+	if e2.Hash != seedHash {
+		t.Fatalf("index hash moved to %s", e2.Hash)
+	}
+}
+
+// TestDeleteLiveDoesNotRemoveUnsyncedEdit: a winning remote tombstone must not
+// delete a local file that has drifted from the index.
+func TestDeleteLiveDoesNotRemoveUnsyncedEdit(t *testing.T) {
+	d := testDaemon(t)
+	path := "keep-me.txt"
+	seed := []byte("seed")
+	seedHash := sha256Hex(seed)
+	older := time.Now().Add(-time.Hour).UTC()
+	d.syncMu.Lock()
+	if _, err := d.commitContent(index.Entry{
+		Path: path, Hash: seedHash, Size: int64(len(seed)),
+		UpdatedAt: older, Mode: 0o644, ModTime: older,
+	}, seed, seedHash); err != nil {
+		d.syncMu.Unlock()
+		t.Fatal(err)
+	}
+	d.syncMu.Unlock()
+
+	localData := []byte("edited-after-index-snapshot")
+	if err := os.WriteFile(filepath.Join(d.cfg.Dir, path), localData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	newer := time.Now().UTC()
+	tomb := index.Entry{Path: path, Deleted: true, UpdatedAt: newer, DeletedAt: newer}
+	d.syncMu.Lock()
+	did, err := d.execDeleteLive(tomb)
+	d.syncMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if did {
+		t.Fatal("delete should skip unsynced local edit")
+	}
+	got, err := os.ReadFile(filepath.Join(d.cfg.Dir, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(localData) {
+		t.Fatalf("file removed or changed: %q", got)
+	}
+	e, ok := d.idx.Get(path)
+	if !ok || e.Deleted {
+		t.Fatalf("index should stay live, got ok=%v %+v", ok, e)
+	}
+}
+
+func TestDiskUnsynced(t *testing.T) {
+	d := testDaemon(t)
+	path := "x.txt"
+	unsynced, err := d.diskUnsynced(path, index.Entry{}, false)
+	if err != nil || unsynced {
+		t.Fatalf("missing path: unsynced=%v err=%v", unsynced, err)
+	}
+	if err := os.WriteFile(filepath.Join(d.cfg.Dir, path), []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unsynced, err = d.diskUnsynced(path, index.Entry{}, false)
+	if err != nil || !unsynced {
+		t.Fatalf("unindexed file: unsynced=%v err=%v", unsynced, err)
+	}
+	fi, err := d.root.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := index.Entry{Path: path, Size: fi.Size(), ModTime: fi.ModTime()}
+	unsynced, err = d.diskUnsynced(path, cur, true)
+	if err != nil || unsynced {
+		t.Fatalf("matching live: unsynced=%v err=%v", unsynced, err)
+	}
+	if err := os.WriteFile(filepath.Join(d.cfg.Dir, path), []byte("abcd"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unsynced, err = d.diskUnsynced(path, cur, true)
+	if err != nil || !unsynced {
+		t.Fatalf("size drift: unsynced=%v err=%v", unsynced, err)
+	}
+}

@@ -58,7 +58,7 @@ func TestScanDetectsAddModifyDelete(t *testing.T) {
 	scan.Apply(idx, res)
 
 	// Modify change.txt and delete gone.txt on disk.
-	writeFile(t, root, "change.txt", "v2")
+	writeFile(t, root, "change.txt", "v2-longer")
 	if err := os.Remove(filepath.Join(root, "gone.txt")); err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +132,7 @@ func TestSkipsTailsyncStateDir(t *testing.T) {
 	writeFile(t, root, "ok.txt", "ok")
 	writeFile(t, root, ".tailsync/index.json", `{}`)
 	writeFile(t, root, ".tailsync-tmp/x", "x")
+	writeFile(t, root, ".tailsync-write-deadbeef.tmp", "tmp")
 
 	idx := index.New()
 	res, err := scan.Scan(context.Background(), openRoot(t, root), idx, nil)

@@ -288,8 +288,11 @@ func Apply(basis []byte, d *Delta) ([]byte, error) {
 		default:
 			return nil, fmt.Errorf("unknown op kind %d", op.Kind)
 		}
+		if int64(len(out)) > d.OutputSize {
+			return nil, fmt.Errorf("delta output exceeds declared size %d", d.OutputSize)
+		}
 	}
-	if d.OutputSize > 0 && int64(len(out)) != d.OutputSize {
+	if int64(len(out)) != d.OutputSize {
 		return nil, fmt.Errorf("delta output size mismatch: got %d want %d", len(out), d.OutputSize)
 	}
 	return out, nil
