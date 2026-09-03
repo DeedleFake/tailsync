@@ -226,3 +226,23 @@ func TestApplyRejectsHugeOutputSize(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestApplyOutputSizeZeroRejectsData(t *testing.T) {
+	_, err := delta.Apply(nil, &delta.Delta{
+		OutputSize: 0,
+		Ops:        []delta.Op{{Kind: delta.OpLiteral, Data: []byte("x")}},
+	})
+	if err == nil {
+		t.Fatal("expected error when OutputSize is 0 but ops produce bytes")
+	}
+}
+
+func TestApplyEmptyFile(t *testing.T) {
+	out, err := delta.Apply(nil, &delta.Delta{OutputSize: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("got %d bytes", len(out))
+	}
+}
